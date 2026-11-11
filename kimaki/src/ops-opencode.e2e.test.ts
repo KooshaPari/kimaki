@@ -4,6 +4,7 @@ import { promisify } from 'node:util'
 import { afterAll, beforeAll, expect, test } from 'vitest'
 import { resolveOpencode } from './opencode-server.js'
 import { createOpenCodeObserver, type OpenCodeObservedEvent } from './ops/runtime/opencode.js'
+import { createProjection, fromOpenCodeObservedEvent, projectEvent } from './ops/projection.js'
 import { startOpencodeTestServer, type OpencodeTestServer } from './test/harness.js'
 
 function value<T>(result: T): Exclude<T, Error> {
@@ -51,6 +52,14 @@ test('native external session discover/read/observe/detach leaves session usable
     const event = seen.find(({ raw }) => raw.type === 'session.renamed')
     expect(event).toMatchObject({ key, source: { hostId: key.hostId, endpointId: key.endpointId, backendKind: 'opencode', version: endpoint.version } })
     expect(event?.raw).toMatchObject({ id: expect.any(String), created: expect.any(Number), durable: { aggregateID: created.id, seq: expect.any(Number) } })
+    if (!event) throw new Error('Native rename event was not observed')
+    const projected = fromOpenCodeObservedEvent(event)
+    expect(projected.kind).toBe('converted')
+    if (projected.kind !== 'converted') throw new Error('Native durable event was not converted')
+    const projection = projectEvent(createProjection(key), projected.event)
+    expect(projection.kind).toBe('applied')
+    expect(projection.state.sources).toEqual([{ sourceId: 'opencode', aggregateId: created.id, sequence: projected.event.sequence }])
+    expect(JSON.stringify(projection)).not.toContain('Native owner rename')
     first.detach()
     expect(await first.done).toBeNull()
     const detachedCount = seen.length
