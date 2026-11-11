@@ -21,6 +21,8 @@ export default defineConfig({
       KIMAKI_VITEST: '1',
     },
     pool: 'forks',
+    // libSQL native statements can retain Windows file handles until GC finalizes them.
+    poolOptions: { forks: { execArgv: process.platform === 'win32' ? ['--expose-gc'] : [] } },
     maxWorkers: workers,
     minWorkers: 1,
   },

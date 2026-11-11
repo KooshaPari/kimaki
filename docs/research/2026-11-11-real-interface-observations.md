@@ -2,6 +2,12 @@
 
 Date: 2026-11-11 (Pacific), follow-up to local research commit `168dbc82`.
 
+## Implementation-stage update, November 11
+
+The sections below preserve the earlier research checkpoint, not the current checkout state. Dependencies and the production TypeScript build now succeed. A fresh Node stdio client drove the same installed Codex 0.167.1 executable using an empty isolated `CODEX_HOME` on E:. Actual `initialize` returned its platform and user agent, and `thread/list` returned an empty list. A repeat at 09:13 UTC succeeded with zero stderr bytes, zero model calls and confirmed owned-child exit 0. The script is `E:\koosh\Agents\kimaki-research-20261111\codex-node-canary.mjs`.
+
+This narrows the earlier PowerShell timeout to that probe path rather than a universal Codex initialization blocker. It does not qualify independently running TUI session attachment, streaming, controls or Jcode transport. The new metadata-only association CLI has real subprocess/database acceptance coverage, but no runtime adapter or Discord publication is enabled. See `2026-11-11-passive-slice-implementation.md` for current validation and remaining gates.
+
 ## What was exercised
 
 These checks used the actual hosted fork and installed command-line programs. The PowerShell client probe drove the real Codex executable, not a mock, copied server, synthetic backend or protocol fixture. This is a narrower integration qualification than the desired end-to-end product workflow.

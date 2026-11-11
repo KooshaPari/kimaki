@@ -27,6 +27,27 @@ const datetime = s.customType<{
   },
 })
 
+// Metadata only. These rows never authorize runtime control or transcript publication.
+export const ops_surface_bindings = s.sqliteTable('ops_surface_bindings', {
+  id: s.text('id').primaryKey().notNull(),
+  host_id: s.text('host_id').notNull(),
+  endpoint_id: s.text('endpoint_id').notNull(),
+  backend_kind: s.text('backend_kind').notNull(),
+  native_session_id: s.text('native_session_id').notNull(),
+  service_kind: s.text('service_kind').notNull(),
+  tenant_id: s.text('tenant_id').notNull(),
+  surface_id: s.text('surface_id').notNull(),
+  mode: s.text('mode', { enum: ['observe'] }).notNull().default('observe'),
+  publication_policy: s.text('publication_policy', { enum: ['none'] }).notNull().default('none'),
+  state: s.text('state', { enum: ['active', 'detached'] }).notNull().default('active'),
+  generation: s.integer('generation').notNull(),
+  idempotency_key: s.text('idempotency_key').notNull(),
+  created_at: s.integer('created_at').notNull(),
+}, (table) => [
+  s.uniqueIndex('ops_binding_request').on(table.service_kind, table.tenant_id, table.idempotency_key),
+  s.uniqueIndex('ops_binding_active_surface').on(table.service_kind, table.tenant_id, table.surface_id).where(orm.sql`${table.state} = 'active'`),
+])
+
 export const thread_sessions = s.sqliteTable('thread_sessions', {
   thread_id: s.text('thread_id').primaryKey().notNull(),
   session_id: s.text('session_id').notNull(),
@@ -172,6 +193,7 @@ export const session_sleeps = s.sqliteTable('session_sleeps', {
 ])
 
 export const relations = defineRelations({
+  ops_surface_bindings,
   thread_sessions,
   bot_tokens,
   bot_api_keys,
@@ -188,6 +210,7 @@ export const relations = defineRelations({
   scheduled_tasks,
   session_sleeps,
 }, (r) => ({
+  ops_surface_bindings: {},
   thread_sessions: {
     scheduled_tasks: r.many.scheduled_tasks(),
   },

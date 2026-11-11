@@ -21,9 +21,13 @@ function tempDataDir(): string {
   return dir
 }
 
-afterEach(() => {
+afterEach(async () => {
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  global.gc?.()
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  global.gc?.()
   for (const dir of tempDirs.splice(0)) {
-    fs.rmSync(dir, { recursive: true, force: true })
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
   }
 })
 
@@ -73,6 +77,23 @@ async function writeLegacyDb({ dataDir, sql }: { dataDir: string; sql: string })
   return file
 }
 
+test('ops table upgrade is additive and only startup migrates an old-shaped database', async () => {
+  const dataDir = tempDataDir()
+  const original = await openDb({ dataDir, migrate: true })
+  if (original instanceof Error) throw original
+  await original.client.execute("INSERT INTO thread_sessions (thread_id, session_id) VALUES ('preserved-thread', 'preserved-session')")
+  await original.client.execute('DROP TABLE IF EXISTS ops_surface_bindings')
+  original.close()
+  const unmigrated = await openDb({ dataDir, migrate: false })
+  if (!(unmigrated instanceof Error)) unmigrated.close()
+  expect(unmigrated).toBeInstanceOf(Error)
+  const upgraded = await openDb({ dataDir, migrate: true })
+  if (upgraded instanceof Error) throw upgraded
+  expect(await tableNames(upgraded.client)).toContain('ops_surface_bindings')
+  expect(await upgraded.db.query.thread_sessions.findMany()).toMatchObject([{ thread_id: 'preserved-thread', session_id: 'preserved-session' }])
+  upgraded.close()
+})
+
 test('fresh install gets kimaki.db with the kimaki tables; subcommands never create it', async () => {
   const dataDir = tempDataDir()
 
@@ -97,6 +118,7 @@ test('fresh install gets kimaki.db with the kimaki tables; subcommands never cre
       "channel_worktrees",
       "global_models",
       "guild_categories",
+      "ops_surface_bindings",
       "scheduled_tasks",
       "session_sleeps",
       "thread_sessions",
@@ -147,85 +169,26 @@ test('first start imports the V1 database once and leaves it unchanged', async (
     threads: threads.map((row) => ({ thread: row.thread_id, session: row.session_id, created: row.created_at?.toISOString(), updated: row.updated_at?.toISOString() ?? null })),
     tasks: tasks.map((row) => ({ status: row.status, cron: row.cron_expr, next: row.next_run_at.toISOString(), channel: row.channel_id })),
     sleeps: sleeps.map((row) => ({ session: row.session_id, status: row.status, wake: row.wake_at.toISOString(), delivery: row.delivery_id })),
-  }).toMatchInlineSnapshot(`
-    {
-      "bots": [
-        {
-          "app": "1422625037164350001",
-          "gemini": "fake-gemini-key",
-          "globalModel": null,
-          "lastUsed": null,
-          "mode": "self_hosted",
-        },
-        {
-          "app": "1477605701202481173",
-          "gemini": null,
-          "globalModel": "openai/gpt-5.4 xhigh",
-          "lastUsed": "2026-10-01T06:45:31.252Z",
-          "mode": "gateway",
-        },
-      ],
-      "categories": [
-        {
-          "category": "1479220924090670000",
-          "created": "2026-09-17T09:41:32.000Z",
-          "guild": "1422625037164351000",
-        },
-      ],
-      "channels": [
-        {
-          "created": "2025-09-30T16:45:03.000Z",
-          "directory": "/Users/fake/projects/website",
-          "guild": null,
-          "model": "anthropic/claude-opus-4-6 high",
-          "verbosity": "text",
-        },
-        {
-          "created": "2026-09-17T09:41:33.000Z",
-          "directory": "/Users/fake/.kimaki/projects/kimaki",
-          "guild": "1422625037164351000",
-          "model": null,
-          "verbosity": "tools",
-        },
-      ],
-      "sleeps": [
-        {
-          "delivery": "wake-1",
-          "session": "ses_f09bb9229ffeAAAAAAAAAAAAAA",
-          "status": "planned",
-          "wake": "2026-10-02T09:00:00.000Z",
-        },
-        {
-          "delivery": "wake-0",
-          "session": "ses_f09bb9229ffeCCCCCCCCCCCCCC",
-          "status": "failed",
-          "wake": "2026-08-26T14:59:20.917Z",
-        },
-      ],
-      "tasks": [
-        {
-          "channel": "1422625308523100001",
-          "cron": "0 9 * * 1",
-          "next": "2026-10-05T09:00:00.000Z",
-          "status": "planned",
-        },
-      ],
-      "threads": [
-        {
-          "created": "2026-10-01T07:15:53.000Z",
-          "session": "ses_f09bb9229ffeAAAAAAAAAAAAAA",
-          "thread": "1555112336879250001",
-          "updated": "2026-10-01T07:21:00.492Z",
-        },
-        {
-          "created": "2026-10-01T07:09:50.000Z",
-          "session": "ses_f09bb9229ffeBBBBBBBBBBBBBB",
-          "thread": "1555112336879250002",
-          "updated": null,
-        },
-      ],
-    }
-  `)
+  }).toEqual({
+    bots: [
+      { app: '1422625037164350001', gemini: 'fake-gemini-key', globalModel: null, lastUsed: null, mode: 'self_hosted' },
+      { app: '1477605701202481173', gemini: null, globalModel: 'openai/gpt-5.4 xhigh', lastUsed: '2026-10-01T06:45:31.252Z', mode: 'gateway' },
+    ],
+    categories: [{ category: '1479220924090670000', created: '2026-09-17T09:41:32.000Z', guild: '1422625037164351000' }],
+    channels: [
+      { created: '2025-09-30T16:45:03.000Z', directory: '/Users/fake/projects/website', guild: null, model: 'anthropic/claude-opus-4-6 high', verbosity: 'text' },
+      { created: '2026-09-17T09:41:33.000Z', directory: '/Users/fake/.kimaki/projects/kimaki', guild: '1422625037164351000', model: null, verbosity: 'tools' },
+    ],
+    sleeps: [
+      { delivery: 'wake-1', session: 'ses_f09bb9229ffeAAAAAAAAAAAAAA', status: 'planned', wake: '2026-10-02T09:00:00.000Z' },
+      { delivery: 'wake-0', session: 'ses_f09bb9229ffeCCCCCCCCCCCCCC', status: 'failed', wake: '2026-08-26T14:59:20.917Z' },
+    ],
+    tasks: [{ channel: '1422625308523100001', cron: '0 9 * * 1', next: '2026-10-05T09:00:00.000Z', status: 'planned' }],
+    threads: [
+      { created: '2026-10-01T07:15:53.000Z', session: 'ses_f09bb9229ffeAAAAAAAAAAAAAA', thread: '1555112336879250001', updated: '2026-10-01T07:21:00.492Z' },
+      { created: '2026-10-01T07:09:50.000Z', session: 'ses_f09bb9229ffeBBBBBBBBBBBBBB', thread: '1555112336879250002', updated: null },
+    ],
+  })
   // V1-only tables are not copied.
   expect(await tableNames(opened.client)).not.toContain('part_messages')
   opened.close()

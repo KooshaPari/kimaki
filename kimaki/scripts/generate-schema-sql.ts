@@ -2,6 +2,7 @@
 // of src/schema.ts as a string constant, so the built package needs no .sql file.
 // Run: pnpm generate (inside kimaki).
 
+import { createRequire } from 'node:module'
 import { execFile } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -25,7 +26,8 @@ function makeIdempotent(sql: string) {
 
 async function main() {
   console.log('Exporting Drizzle schema SQL...')
-  const { stdout } = await execFileAsync('pnpm', ['drizzle-kit', 'export'], { cwd: root })
+  const drizzleKitBin = path.join(path.dirname(createRequire(import.meta.url).resolve('drizzle-kit')), 'bin.cjs')
+  const { stdout } = await execFileAsync(process.execPath, [drizzleKitBin, 'export'], { cwd: root, timeout: 60_000 })
   const rawSql = stdout.trim()
   const firstLine = rawSql.split('\n').find((line) => line.trim() !== '')
   if (!firstLine || !/^CREATE\s+(TABLE|INDEX|UNIQUE\s+INDEX)\b/i.test(firstLine)) {
