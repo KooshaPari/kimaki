@@ -10,7 +10,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-11-11-unified-agent-ops-design.md`
 
-**Status:** Research-stage plan for approval, not permission to execute product changes. Backend transport qualification gates must resolve before dependent tasks. Companion `docs/research/2026-11-11-*.md` documents contain detailed source mappings and contract qualifications.
+**Status:** Implementation in progress after the user's November 11 `go` and continuation. Commit `e318374b` provides the identity/metadata foundation and local bind/list/detach CLI, not complete Tasks 1-3 or supported live backends. Its 52 focused tests, 2 migration checks, production build and compiled CLI workflow passed. Full regression and native/Discord E2E remain unqualified. Continue Task 2's read-only OpenCode boundary and actual acceptance diagnosis before dependent streaming/control changes. Companion `docs/research/2026-11-11-*.md` documents contain source mappings and observed qualification limits. No production rollout, shared daemon changes or legacy retirement is authorized by local implementation approval.
 
 ## Global Constraints
 
@@ -124,7 +124,7 @@ Tests live beside each new module as `*.test.ts`. Real workflow tests live in `k
 
 **Consumes:** Tasks 1-5 contracts. **Produces:** `createCodexAdapter(config: CodexEndpointConfig): Promise<RuntimeAdapter>` using app-server protocol schemas pinned to the tested binary version.
 
-- [ ] Qualify initialize, listing/read/resume, subscriptions, turns and approval behavior using official protocol/schema and the installed binary. A follow-up real-interface canary generated schemas successfully from codex-cli 0.167.1 but timed out awaiting initialize in two isolated stdio app-server processes, including an explicit-flush 30-second retry. Diagnose that initialization blocker before depending on this transport. See `docs/research/2026-11-11-real-interface-observations.md`. Explicitly distinguish historical resume from live attach to an existing CLI. Do not attach a second app-server and claim it owns an unrelated running CLI.
+- [ ] Qualify initialize, listing/read/resume, subscriptions, turns and approval behavior using official protocol/schema and the installed binary. Earlier PowerShell probes timed out, but repeated actual Node stdio probes now pass initialize and empty thread/list against codex-cli 0.167.1, with isolated homes, zero model calls and confirmed child exit. Read/resume, subscriptions, turns and approvals remain unqualified. See `docs/research/2026-11-11-real-interface-observations.md`. Explicitly distinguish historical resume from live attach to an existing CLI. Do not attach a second app-server and claim it owns an unrelated running CLI.
 - [ ] Write failing tests for protocol initialization, thread/turn IDs, streamed deltas/tools, approvals, interrupted/failed vs completed status, child agents, reconnect, unsupported attachment and native UI conflict.
 - [ ] Run targeted tests, implement the qualified app-server mapping and version checks, rerun tests and build.
 - [ ] Run isolated external Codex discovery and observe workflow. Only mark live control supported if the same running session has been proven safe, otherwise document the presence-only/observe-only limitation. Commit.
