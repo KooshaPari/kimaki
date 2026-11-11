@@ -35,6 +35,19 @@ test('ops help discloses metadata-only scope without starting a bot', async () =
   expect(result.stdout).toContain('ops detach')
 })
 
+test('native discovery help exposes explicit source and endpoint without starting a bot', async () => {
+  const result = await cli(['ops', 'discover', '--help'])
+  expect(result.stdout).toContain('--source')
+  expect(result.stdout).toContain('--service-file')
+  expect(result.stdout).toContain('opencode')
+})
+
+test('native discovery refuses implicit endpoint selection before any runtime access', async () => {
+  const result = await cli(['ops', 'discover', '--source', 'opencode']).catch((error: Error & { stderr: string }) => error)
+  expect(result).toBeInstanceOf(Error)
+  expect('stderr' in result && result.stderr).toContain('--service-file')
+})
+
 test('CLI bind/list/detach persists metadata across processes and never adopts legacy sessions', async () => {
   const dataDir = tempDir()
   const opened = await openDb({ dataDir, migrate: true })

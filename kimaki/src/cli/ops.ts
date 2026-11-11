@@ -9,11 +9,34 @@ function required(value: string | undefined, flag: string): string {
 }
 
 export function registerOpsCommands(cli: Goke) {
-  cli.command('ops discover', 'Read metadata-only herdr inventory, never transcripts or terminal input')
+  cli.command('ops discover', 'Read metadata-only herdr or opencode inventory, never transcripts or terminal input')
+    .option('--source <kind>', 'Inventory source: herdr (default) or opencode')
+    .option('--service-file <path>', 'Explicit running OpenCode service file, never start a service')
+    .option('--host <id>', 'Explicit native runtime host identity')
+    .option('--endpoint <id>', 'Explicit native runtime endpoint identity')
     .option('--binary <path>', 'Explicit herdr executable (default: herdr on PATH)')
     .option('--herdr-session <name>', 'Explicit herdr session scope')
     .option('--timeout <ms>', 'Bounded inventory timeout in milliseconds (default: 5000)')
     .action(async (options) => {
+      const source = options.source ?? 'herdr'
+      if (!['herdr', 'opencode'].includes(source)) fail(new ConfigError({ reason: 'Supply --source herdr or opencode' }))
+      if (source === 'opencode') {
+        const serviceFile = required(options.serviceFile, 'service-file')
+        const hostId = required(options.host, 'host')
+        const endpointId = required(options.endpoint, 'endpoint')
+        if (options.binary !== undefined || options.herdrSession !== undefined || options.timeout !== undefined) fail(new ConfigError({ reason: '--binary, --herdr-session and --timeout apply only to herdr. Native requests have a fixed bounded timeout' }))
+        const { resolveOpencode } = await import('../opencode-server.ts')
+        const { createOpenCodeObserver } = await import('../ops/runtime/opencode.ts')
+        const endpoint = await resolveOpencode({ serviceFile, ensure: false })
+        if (endpoint instanceof Error) fail(endpoint)
+        const observer = createOpenCodeObserver({ endpoint, hostId, endpointId })
+        if (observer instanceof Error) fail(observer)
+        const page = await observer.discover()
+        if (page instanceof Error) fail(page)
+        printJson({ source: 'opencode', observedAt: new Date().toISOString(), coverage: 'explicit-native-endpoint-page', endpoint: page.source, sessions: page.sessions.map(({ key, native }) => ({ key, title: native.title })), cursor: page.cursor })
+        return
+      }
+      if (options.serviceFile !== undefined || options.host !== undefined || options.endpoint !== undefined) fail(new ConfigError({ reason: '--service-file, --host and --endpoint apply only to opencode' }))
       const { discoverHerdr } = await import('../ops/discovery/herdr.ts')
       const result = await discoverHerdr({ binary: options.binary, session: options.herdrSession, timeoutMs: options.timeout === undefined ? undefined : Number(options.timeout) })
       if (result instanceof Error) fail(result)
