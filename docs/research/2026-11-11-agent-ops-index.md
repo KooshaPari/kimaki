@@ -14,6 +14,7 @@ Use Kimaki as the first Discord service bridge, not the owner of every agent. Es
 4. [herdr discovery and dynamic binding](2026-11-11-herdr-session-binding.md)
 5. [Paperclip integration](2026-11-11-paperclip-integration.md)
 6. [Existing project consolidation inventory](2026-11-11-existing-projects.md)
+7. [Real public-interface observations and acceptance blockers](2026-11-11-real-interface-observations.md)
 
 ## Key correction
 
@@ -29,7 +30,7 @@ Current Kimaki is native OpenCode V2, not an existing generic ACP layer. It can 
 
 ## Validation boundary
 
-Four worker deliverables were reviewed and synthesized by the coordinator. Seven Markdown documents passed existence, headings, fenced-block, local-link and bounded credential-pattern checks. Key Kimaki, PhenoBot, AgentAPI++, herdr and Paperclip claims were checked against source. Git whitespace/write-scope checks accompany the local commit. No product build or live acceptance suite was run for documentation-only changes. Backend support remains unimplemented and unqualified.
+Four worker deliverables were reviewed and synthesized by the coordinator. Initial structural checks covered seven documents and eight local links. The follow-up [real-interface observations](2026-11-11-real-interface-observations.md) exercised hosted GitHub/Git, installed Jcode/herdr CLIs, installed Codex schema generation, and two actual isolated Codex stdio initialize probes. Schema generation passed, but both initialize probes timed out, so live Codex connectivity is not qualified. The panel is registered, but visual rendering/navigation was not inspectable. No product build or complete external-agent -> Discord -> detach workflow passed. Backend support remains unimplemented and the overall product acceptance loop is blocked, not closed.
 
 ## Approval and qualification
 
