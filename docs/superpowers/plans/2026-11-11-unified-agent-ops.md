@@ -12,6 +12,12 @@
 
 **Status:** Implementation in progress after the user's November 11 `go` and continuation. Commit `e318374b` provides identity/metadata foundations and local bind/list/detach. Commit `b7cb7fbd` adds a read-only OpenCode observer and explicit native discovery CLI. Production build and 24 observer tests passed, including an isolated native session created outside Kimaki, public discovery, independent detach and unchanged native permissions/instructions. These commits do not complete Tasks 1-3 or qualify Discord publication, Jcode/Codex live adapters, Paperclip execution or durable delivery. Full regression and native/Discord E2E remain unqualified, with startup timeouts observed. Paperclip and service-neutral projection foundations are being developed separately. Companion `docs/research/2026-11-11-*.md` documents contain source mappings and observed qualification limits. No production rollout, shared daemon changes or legacy retirement is authorized by local implementation approval.
 
+## Additional Pro research handoff
+
+The user supplied `E:\koosh\Downloads\kimaki-agent-ops-zipset-2026-11-11.zip`. All seven included Markdown files matched the archive's SHA-256 manifest when checked in place. The archive is source research and a proposal, not proof of current deployment or acceptance. Reconcile its source pins against this checkout before adopting version-specific claims.
+
+Before committing to a primary Discord transport or broad extraction, compare the available Paperclip connector and Kimaki against the same pilot behaviors. Do not probe or change a production connector without appropriate coordination. Two distinct end-to-end journeys are required: (A) discover and observe an externally started native session, project it to Paperclip without manufacturing a task or run, and preserve the native client through detach/rebind; (B) dispatch one explicitly authorized Paperclip task to one managed native attempt, retain durable identity and evidence, and reconcile retries without duplicate execution. Both require real backend and service evidence, not synthetic fixtures alone. Engineering acceptance remains separate from native run completion. Existing local OpenCode tests cover only part of Journey A, not Paperclip or Discord delivery.
+
 ## Global Constraints
 
 - Discovery is not consent to publish transcripts, inject prompts, change permissions, or take control.
