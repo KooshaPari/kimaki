@@ -17,6 +17,21 @@ Adapt the Kimaki fork into a unified agent operations and observability layer. A
 - [ ] **M7: Existing project consolidation.** Map each candidate's capabilities, owners, state, integrations and operational dependencies. Compare migration, coexistence and reverse-merge options. Prove capability parity, data preservation, rollback and owner approval before any cutover or retirement. No existing service is retired by this ledger.
 - [ ] **M8: Release and operations.** Run real end-to-end pilots, authorization and isolation checks, fault/recovery and restart tests, full relevant build/test gates, documentation, deployment and rollback rehearsal. Record versions, commands, results, known limitations and explicitly accepted exceptions. Obtain appropriate signoff before production changes.
 
+## Milestone status on 2026-11-12
+
+No milestone is closed. Nothing below is a completion claim; each row names the evidence that exists and the gate that is still unmet.
+
+| Milestone | State | Verified evidence | Unmet closure gate |
+| --- | --- | --- | --- |
+| M1 Baseline and architecture | Partly evidenced | Fork/upstream provenance recorded, capability and migration inventory committed, connector comparison documented | Remaining source-pin reconciliation |
+| M2 Runtime adapters | Partly implemented | OpenCode native discover/snapshot/observe/detach passed against a real isolated session; Codex discovery and nonempty snapshot read passed through the public CLI against a real isolated app-server; Jcode committed as an explicitly unsupported boundary | Codex historical thread enumeration returns empty; Jcode discovery has no nonempty schema; no live attach for any runtime |
+| M3 Dynamic session binding | Partly verified | Real herdr 0.9.3 discovery listed live panes; one identity bound, idempotent repeat, tenant isolation, wrong-tenant refusal, owning-tenant detach, and unchanged pane state after detach | Restart and reconnect continuity for a live external session |
+| M4 Discord outward bridge | Partly delivered | Consent-gated publisher and `ops publish` verified through the public CLI against the real DigitalDiscord twin, including denial without consent and mid-flight revocation | Not wired into the live bot event loop; no retry, dedup or disconnect-recovery proof |
+| M5 Paperclip external observation | Not started | Only local correlation and fail-closed Runner identity comparison exist | Any real Paperclip instance, plugin entity or projection |
+| M6 Paperclip managed execution | Not started | None | Authorized task to exactly one managed attempt with idempotency and lifecycle evidence |
+| M7 Legacy consolidation | Evidence only | Capability and preservation inventory with explicit prototype/missing/native-wake status | Owner approvals, capability-parity proof and rollback rehearsal |
+| M8 Release | Not started | Focused suites and typecheck pass on the fork branch | End-to-end pilots, fault paths, docs, deployment and rollback rehearsal |
+
 ## Closure discipline
 
 Each milestone needs a named owner, concrete evidence links or reproducible commands, observed results, and a dated status. Unit tests, mocks and source inspection supplement but do not substitute for real public-interface acceptance. A blocked or unsupported capability stays open with its specific constraint. Do not silently mark a capability complete because a type, plan or placeholder exists. Closure of the whole initiative requires all applicable milestones and both Paperclip pilots, or a clearly documented and explicitly approved scope change.
