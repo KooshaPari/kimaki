@@ -1,6 +1,8 @@
 // A caller-owned, ephemeral opt-in. This does not alter or grant authority to
 // metadata-only ops bindings, and is not connected to the CLI or bot lifecycle.
 // It publishes no native payload and makes no delivery or replay guarantees.
+// Delivery is deliberately at-most-once per call: a failed POST is reported, not
+// retried, because a POST that may have succeeded would duplicate on retry.
 import { ChannelType, REST, Routes } from 'discord.js'
 import { DiscordError } from '../../errors.js'
 import type { SessionKey } from '../contracts.js'
