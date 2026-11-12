@@ -9,6 +9,67 @@ function required(value: string | undefined, flag: string): string {
 }
 
 export function registerOpsCommands(cli: Goke) {
+  cli.command('ops follow', 'Follow one explicitly authorized OpenCode session and publish fixed metadata')
+    .option('--service-file <path>', 'Explicit running OpenCode service file')
+    .option('--host <id>', 'Explicit runtime host identity')
+    .option('--endpoint <id>', 'Explicit runtime endpoint identity')
+    .option('--native-session <id>', 'Explicit OpenCode session ID')
+    .option('--tenant <id>', 'Explicit Discord guild ID')
+    .option('--surface <id>', 'Explicit Discord channel ID')
+    .option('--token <token>', 'Discord bot token (or KIMAKI_BOT_TOKEN)')
+    .option('--consent', 'Explicitly authorize metadata publication')
+    .option('--timeout <ms>', 'Maximum follow duration in milliseconds (default: 60000)')
+    .action(async (options) => {
+      if (options.consent !== true) fail(new ConfigError({ reason: 'Supply --consent to authorize this publication' }))
+      const serviceFile = required(options.serviceFile, 'service-file')
+      const target = {
+        tenantId: required(options.tenant, 'tenant'),
+        surfaceId: required(options.surface, 'surface'),
+        session: { hostId: required(options.host, 'host'), endpointId: required(options.endpoint, 'endpoint'), backendKind: 'opencode', nativeSessionId: required(options.nativeSession, 'native-session') },
+      }
+      const token = required(options.token ?? process.env['KIMAKI_BOT_TOKEN'], 'token')
+      const timeout = options.timeout === undefined ? 60_000 : Number(options.timeout)
+      if (!Number.isSafeInteger(timeout) || timeout < 1 || timeout > 2_147_483_647) fail(new ConfigError({ reason: '--timeout must be a positive integer in milliseconds' }))
+      const { resolveOpencode } = await import('../opencode-server.ts')
+      const { createOpenCodeObserver } = await import('../ops/runtime/opencode.ts')
+      const { publishObservedMetadata } = await import('../ops/discord/publication.ts')
+      const { REST } = await import('discord.js')
+      const controller = new AbortController()
+      // The deadline stops observation and new publications. A Discord request
+      // already in flight cannot be cancelled and may still complete.
+      const timer = setTimeout(() => controller.abort(), timeout)
+      try {
+        const endpoint = await resolveOpencode({ serviceFile, ensure: false })
+        if (endpoint instanceof Error) fail(endpoint)
+        if (controller.signal.aborted) fail(new ConfigError({ reason: 'Follow timed out before subscription' }))
+        const observer = createOpenCodeObserver({ endpoint, hostId: target.session.hostId, endpointId: target.session.endpointId })
+        if (observer instanceof Error) fail(observer)
+        const rest = new REST({ ...(process.env['KIMAKI_DISCORD_REST_URL'] ? { api: process.env['KIMAKI_DISCORD_REST_URL'] } : {}), version: '10' }).setToken(token)
+        const counts = { sent: 0, denied: 0, ignored: 0 }
+        const grant = { ...target, publication: 'metadata' as const, consent: true }
+        let pending: Promise<void> | undefined
+        const observation = await observer.observe({ key: target.session, signal: controller.signal, onEvent: (observed) => {
+          if (observed.raw.type !== 'session.renamed') { counts.ignored++; return }
+          pending = (async () => {
+            const result = await publishObservedMetadata({ rest, target, observed, grant })
+            if (result instanceof Error) throw result
+            counts[result.kind]++
+          })()
+          return pending
+        } })
+        if (observation instanceof Error) fail(observation)
+        const { createLogger } = await import('../logger.ts')
+        createLogger('OPS').info('Follow subscription ready')
+        const result = await observation.done
+        await pending
+        if (result instanceof Error) fail(result)
+        printJson(counts)
+      } finally {
+        clearTimeout(timer)
+        controller.abort()
+      }
+    })
+
   cli.command('ops publish', 'Publish one explicitly authorized OpenCode metadata event to Discord')
     .option('--tenant <id>', 'Explicit Discord guild ID')
     .option('--surface <id>', 'Explicit Discord channel ID')

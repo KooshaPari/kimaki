@@ -35,6 +35,7 @@ import { openDb, verbosityToV1, type Verbosity } from '../db.ts'
 import type { ToolInput } from '../format-parts.ts'
 import * as schema from '../schema.ts'
 import { startLockServer } from '../lock-server.ts'
+import { removeTempDirs } from './cleanup.ts'
 import { startBot, type BotHandle } from '../main.ts'
 import type { LockRouteInput, LockRouteName } from '../lock-routes.ts'
 import { listTasks, type Clock } from '../scheduler.ts'
@@ -242,7 +243,7 @@ export async function startOpencodeTestServer({
     stop: async () => {
       await kill()
       await testModel.stop()
-      fs.rmSync(root, { recursive: true, force: true })
+      await removeTempDirs([root])
     },
   }
 }
@@ -502,7 +503,7 @@ export async function startTwin({
     stop: async () => {
       await discord.stop()
       await discord.prisma.$disconnect()
-      fs.rmSync(root, { recursive: true, force: true })
+      await removeTempDirs([root])
     },
   }
 }
