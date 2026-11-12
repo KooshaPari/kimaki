@@ -9,17 +9,39 @@ function required(value: string | undefined, flag: string): string {
 }
 
 export function registerOpsCommands(cli: Goke) {
-  cli.command('ops discover', 'Read metadata-only herdr or opencode inventory, never transcripts or terminal input')
-    .option('--source <kind>', 'Inventory source: herdr (default) or opencode')
+  cli.command('ops discover', 'Read metadata-only herdr, opencode or codex inventory, never transcripts or terminal input')
+    .option('--source <kind>', 'Inventory source: herdr (default), opencode or codex')
     .option('--service-file <path>', 'Explicit running OpenCode service file, never start a service')
+    .option('--codex-home <path>', 'Explicit Codex state directory for the app-server, never the default home')
     .option('--host <id>', 'Explicit native runtime host identity')
     .option('--endpoint <id>', 'Explicit native runtime endpoint identity')
-    .option('--binary <path>', 'Explicit herdr executable (default: herdr on PATH)')
+    .option('--binary <path>', 'Explicit herdr or Codex executable (default: herdr on PATH)')
     .option('--herdr-session <name>', 'Explicit herdr session scope')
     .option('--timeout <ms>', 'Bounded inventory timeout in milliseconds (default: 5000)')
     .action(async (options) => {
       const source = options.source ?? 'herdr'
-      if (!['herdr', 'opencode'].includes(source)) fail(new ConfigError({ reason: 'Supply --source herdr or opencode' }))
+      if (!['herdr', 'opencode', 'codex'].includes(source)) fail(new ConfigError({ reason: 'Supply --source herdr, opencode or codex' }))
+      if (source === 'codex') {
+        const binary = required(options.binary, 'binary')
+        const codexHome = required(options.codexHome, 'codex-home')
+        const hostId = required(options.host, 'host')
+        const endpointId = required(options.endpoint, 'endpoint')
+        if (options.serviceFile !== undefined || options.herdrSession !== undefined) fail(new ConfigError({ reason: '--service-file and --herdr-session do not apply to codex' }))
+        const { startCodexAppServer } = await import('../ops/runtime/codex-app-server.ts')
+        const { createCodexObserver } = await import('../ops/runtime/codex.ts')
+        const server = await startCodexAppServer({ binary, codexHome, timeoutMs: options.timeout === undefined ? undefined : Number(options.timeout) })
+        if (server instanceof Error) fail(server)
+        try {
+          const observer = createCodexObserver({ hostId, endpointId, request: server.request })
+          if (observer instanceof Error) fail(observer)
+          const page = await observer.discover()
+          if (page instanceof Error) fail(page)
+          printJson({ source: 'codex', observedAt: new Date().toISOString(), coverage: 'explicit-app-server-state-db-page', endpoint: page.source, sessions: page.sessions.map(({ key }) => key), cursor: page.cursor })
+        } finally {
+          await server.close()
+        }
+        return
+      }
       if (source === 'opencode') {
         const serviceFile = required(options.serviceFile, 'service-file')
         const hostId = required(options.host, 'host')
@@ -36,7 +58,7 @@ export function registerOpsCommands(cli: Goke) {
         printJson({ source: 'opencode', observedAt: new Date().toISOString(), coverage: 'explicit-native-endpoint-page', endpoint: page.source, sessions: page.sessions.map(({ key, native }) => ({ key, title: native.title })), cursor: page.cursor })
         return
       }
-      if (options.serviceFile !== undefined || options.host !== undefined || options.endpoint !== undefined) fail(new ConfigError({ reason: '--service-file, --host and --endpoint apply only to opencode' }))
+      if (options.serviceFile !== undefined || options.host !== undefined || options.endpoint !== undefined || options.codexHome !== undefined) fail(new ConfigError({ reason: '--service-file, --host, --endpoint and --codex-home apply only to opencode or codex' }))
       const { discoverHerdr } = await import('../ops/discovery/herdr.ts')
       const result = await discoverHerdr({ binary: options.binary, session: options.herdrSession, timeoutMs: options.timeout === undefined ? undefined : Number(options.timeout) })
       if (result instanceof Error) fail(result)
