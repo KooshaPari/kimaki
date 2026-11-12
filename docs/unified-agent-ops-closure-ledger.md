@@ -30,7 +30,7 @@ No milestone is closed. Nothing below is a completion claim; each row names the 
 | M5 Paperclip external observation | Not started | Only local correlation and fail-closed Runner identity comparison exist | Any real Paperclip instance, plugin entity or projection |
 | M6 Paperclip managed execution | Not started | None | Authorized task to exactly one managed attempt with idempotency and lifecycle evidence |
 | M7 Legacy consolidation | Evidence and provisional matrix | Capability and preservation inventory with explicit prototype/missing/native-wake status, plus `docs/research/2026-11-12-consolidation-decision-matrix.md` giving coexist/migrate/reverse-merge per candidate with unverified claims marked | Named owners, approvals, capability-parity proof and rollback rehearsal |
-| M8 Release | Not started | Focused suites and typecheck pass on the fork branch | End-to-end pilots, fault paths, docs, deployment and rollback rehearsal |
+| M8 Release | Partly evidenced | `corepack pnpm build` passes; 81 focused ops tests pass; a single end-to-end pilot (`kimaki/src/ops-lifecycle.e2e.test.ts`) discovers a real external OpenCode session, binds it with publication disabled, follows it with consent, delivers exactly one fixed metadata line to the real Discord twin, detaches, and confirms the native session still reads with its renamed title and that a missing token refuses while posting nothing | Fault-injection and restart paths beyond that single pilot, docs, deployment and rollback rehearsal, and signoff |
 
 ## Closure discipline
 
