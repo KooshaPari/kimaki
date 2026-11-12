@@ -51,3 +51,32 @@ export function correlatePaperclipRun(input: unknown):
   return { ok: true, value: { ownership: 'paperclip-owned', session, paperclipInstanceId,
     companyId, issueId, agentId, runId, attemptId, runnerSessionId } }
 }
+
+/**
+ * Compare an explicit local correlation with a NativeRunIdentity read from the
+ * pinned Runner contract. This is a local comparison, not authentication,
+ * remote lookup, task association, or permission to operate on the run.
+ * Instance scope must come from the caller's independently selected source.
+ */
+export function matchRunnerIdentity(input: {
+  correlation: unknown
+  paperclipInstanceId: unknown
+  identity: unknown
+}): { ok: true } | { ok: false; reason: 'invalid-identity' | 'external-observe' | 'mismatch' } {
+  const correlation = correlatePaperclipRun(input.correlation)
+  if (!correlation.ok || !nonempty(input.paperclipInstanceId)) return { ok: false, reason: 'invalid-identity' }
+  if (correlation.value.ownership !== 'paperclip-owned') return { ok: false, reason: 'external-observe' }
+  if (typeof input.identity !== 'object' || input.identity === null || Array.isArray(input.identity)) {
+    return { ok: false, reason: 'invalid-identity' }
+  }
+  const identity = input.identity as Record<string, unknown>
+  const { runId, sessionId, companyId, issueId, agentId } = identity
+  if (!nonempty(runId) || !nonempty(sessionId) || !nonempty(companyId) || !nonempty(issueId) || !nonempty(agentId)) {
+    return { ok: false, reason: 'invalid-identity' }
+  }
+  const expected = correlation.value
+  if (input.paperclipInstanceId !== expected.paperclipInstanceId || runId !== expected.runId ||
+      sessionId !== expected.runnerSessionId || companyId !== expected.companyId ||
+      issueId !== expected.issueId || agentId !== expected.agentId) return { ok: false, reason: 'mismatch' }
+  return { ok: true }
+}
