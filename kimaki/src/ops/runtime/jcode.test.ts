@@ -79,14 +79,55 @@ describe('Jcode passive discovery', () => {
     expect(await target.readSnapshot({ key: { hostId: 'host', endpointId: 'endpoint', backendKind: 'jcode', nativeSessionId: 'session_missing' } })).toBeInstanceOf(Error)
   })
 
-  it('declares live observation and replay unsupported and refuses an implicit home', () => {
+  it('declares supported and unsupported capabilities and refuses an implicit home', () => {
     const supported = observer({})
     expect(supported.capabilities.discovery.kind).toBe('supported')
     expect(supported.capabilities.snapshot.kind).toBe('supported')
-    expect(supported.capabilities.observe.kind).toBe('unsupported')
+    expect(supported.capabilities.observe.kind).toBe('supported')
     expect(supported.capabilities.replay.kind).toBe('unsupported')
     expect(supported.capabilities.exclusiveControl.kind).toBe('unsupported')
     expect(createJcodeObserver({ jcodeHome: '  ', hostId: 'h', endpointId: 'e', readFile: async () => '', readDir: async () => [] })).toBeInstanceOf(Error)
     expect(createJcodeObserver({ jcodeHome: 'C:/home', hostId: '', endpointId: 'e', readFile: async () => '', readDir: async () => [] })).toBeInstanceOf(Error)
+  })
+})
+
+describe('Jcode passive observation', () => {
+  it('emits title and message-count changes without any content', async () => {
+    let record: Record<string, unknown> = session('session_live', 'before', '2026-01-01T00:00:00Z')
+    const live = createJcodeObserver({
+      jcodeHome: 'C:/jcode-home', hostId: 'host', endpointId: 'endpoint', intervalMs: 10,
+      readDir: async () => ['session_live.json'],
+      readFile: async () => JSON.stringify(record),
+    })
+    if (live instanceof Error) throw live
+    const events: unknown[] = []
+    const controller = new AbortController()
+    const observation = await live.observe({
+      key: { hostId: 'host', endpointId: 'endpoint', backendKind: 'jcode', nativeSessionId: 'session_live' },
+      signal: controller.signal,
+      onEvent: (event) => { events.push(event) },
+    })
+    if (observation instanceof Error) throw observation
+    record = {
+      ...session('session_live', 'after', '2026-01-01T00:00:01Z'),
+      messages: [
+        { role: 'user', content: 'SECRET TRANSCRIPT TEXT' },
+        { role: 'assistant', content: 'more secret text' },
+      ],
+    }
+    await expect.poll(() => events.length, { timeout: 5_000 }).toBe(2)
+    observation.detach()
+    expect(await observation.done).toBeNull()
+    expect(events).toEqual([
+      { schemaVersion: 1, key: { hostId: 'host', endpointId: 'endpoint', backendKind: 'jcode', nativeSessionId: 'session_live' }, seq: 1, type: 'session.renamed', title: 'after' },
+      { schemaVersion: 1, key: { hostId: 'host', endpointId: 'endpoint', backendKind: 'jcode', nativeSessionId: 'session_live' }, seq: 2, type: 'session.appended', messageCount: 2 },
+    ])
+    expect(JSON.stringify(events)).not.toContain('SECRET')
+  })
+
+  it('rejects observation of a mismatched or missing session', async () => {
+    const live = observer({})
+    expect(await live.observe({ key: { hostId: 'host', endpointId: 'other', backendKind: 'jcode', nativeSessionId: 'session_x' }, onEvent: () => {} })).toBeInstanceOf(Error)
+    expect(await live.observe({ key: { hostId: 'host', endpointId: 'endpoint', backendKind: 'jcode', nativeSessionId: 'session_missing' }, onEvent: () => {} })).toBeInstanceOf(Error)
   })
 })
