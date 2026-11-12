@@ -78,3 +78,23 @@ test('revoked consent during real twin channel lookup posts nothing', async () =
     expect(result).toEqual({ kind: 'denied' })
   } finally { await second.stop() }
 })
+
+test('malformed and mismatched event files are refused before any Discord call', async () => {
+  const before = (await discord.channel(channelId).getMessages()).length
+  const invalid = path.join(dir, 'invalid.json')
+  fs.writeFileSync(invalid, '{"not": "an event"')
+  await expect(cli([...args(), '--consent', '--event-file', invalid])).rejects.toMatchObject({ code: 1 })
+  const other = path.join(dir, 'other-session.json')
+  fs.writeFileSync(other, JSON.stringify({ ...observed, key: { ...key, nativeSessionId: 'other' } }))
+  await expect(cli([...args(), '--consent', '--event-file', other])).rejects.toMatchObject({ code: 1 })
+  expect((await discord.channel(channelId).getMessages()).length).toBe(before)
+}, 300_000)
+
+test('an unreachable Discord endpoint fails without reporting success', async () => {
+  const unreachable = await exec(process.execPath, ['--import', 'tsx', path.resolve('src/cli.ts'), 'ops', 'publish', ...args(), '--consent'], {
+    timeout: 120_000,
+    env: { ...process.env, KIMAKI_BOT_TOKEN: 'unused', KIMAKI_DISCORD_REST_URL: 'http://127.0.0.1:1' },
+  }).then(() => null, (error: Error) => error)
+  expect(unreachable).toBeInstanceOf(Error)
+  expect(JSON.stringify(unreachable)).not.toContain('"kind":"sent"')
+}, 300_000)
