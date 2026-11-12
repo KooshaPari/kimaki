@@ -11,6 +11,20 @@ const dataDir = tempDataDir()
 let server: OpencodeTestServer
 let twin: TestTwin
 
+// A restarted follow process must not replay events that were already delivered.
+function startFollow(args: string[], env: NodeJS.ProcessEnv) {
+  const child = spawn(process.execPath, ['--import', 'tsx', path.join(import.meta.dirname, 'cli.ts'), 'ops', 'follow', ...args], { env, stdio: ['ignore', 'pipe', 'pipe'] })
+  let stdout = ''
+  let stderr = ''
+  child.stdout.on('data', (chunk) => { stdout += chunk })
+  child.stderr.on('data', (chunk) => { stderr += chunk })
+  const done = new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+    child.once('error', reject)
+    child.once('close', (code) => resolve({ code, stdout, stderr }))
+  })
+  return { child, done, stderr: () => stderr, stdout: () => stdout }
+}
+
 beforeAll(async () => {
   ;[server, twin] = await Promise.all([startOpencodeTestServer(), startTwin()])
   const opened = await openDb({ dataDir, migrate: true })
@@ -72,3 +86,37 @@ test('public ops lifecycle observes an external session without controlling it',
     await done
   }
 }, 300_000)
+
+test('a restarted follow process republishes nothing it already delivered', async () => {
+  const native = await server.client()
+  const created = await native.session.create({ location: { directory: server.projectDirectory }, title: 'Restart session' })
+  const identity = ['--service-file', server.serviceFile, '--host', 'restart-host', '--endpoint', 'restart-endpoint', '--native-session', created.id, '--tenant', twin.discord.guildId, '--surface', twin.channelId, '--consent', '--timeout', '15000']
+  const env: NodeJS.ProcessEnv = { ...process.env, KIMAKI_VITEST: '1', KIMAKI_TEST_LOGS: '1', KIMAKI_STRADA_ENABLED: '0', KIMAKI_DISCORD_REST_URL: twin.discord.restUrl, KIMAKI_BOT_TOKEN: twin.discord.botToken }
+  const count = async () => (await twin.discord.channel(twin.channelId).getMessages()).length
+  const before = await count()
+  const first = startFollow(identity, env)
+  try {
+    await expect.poll(() => first.stderr(), { timeout: 180_000 }).toContain('Follow subscription ready')
+    await native.session.update({ sessionID: created.id, title: 'First rename' })
+    await expect.poll(count, { timeout: 60_000 }).toBe(before + 1)
+    // Simulate a crash and restart while the same native session keeps living.
+    first.child.kill()
+    await first.done
+    const second = startFollow(identity, env)
+    try {
+      await expect.poll(() => second.stderr(), { timeout: 180_000 }).toContain('Follow subscription ready')
+      await new Promise((resolve) => setTimeout(resolve, 3_000))
+      expect(await count()).toBe(before + 1)
+      await native.session.update({ sessionID: created.id, title: 'Second rename' })
+      await expect.poll(count, { timeout: 60_000 }).toBe(before + 2)
+      const finished = await second.done
+      expect(finished.code, finished.stderr).toBe(0)
+      expect(JSON.parse(finished.stdout)).toMatchObject({ sent: 1, denied: 0 })
+    } finally {
+      second.child.kill()
+      await second.done
+    }
+  } finally {
+    first.child.kill()
+  }
+}, 600_000)
