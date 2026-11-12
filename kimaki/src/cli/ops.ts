@@ -104,10 +104,13 @@ export function registerOpsCommands(cli: Goke) {
       printJson(result)
     })
 
-  cli.command('ops discover', 'Read metadata-only herdr, opencode or codex inventory, never transcripts or terminal input')
-    .option('--source <kind>', 'Inventory source: herdr (default), opencode or codex')
+  cli.command('ops discover', 'Read metadata-only herdr, opencode, codex or jcode inventory, never transcripts or terminal input')
+    .option('--source <kind>', 'Inventory source: herdr (default), opencode, codex or jcode')
     .option('--service-file <path>', 'Explicit running OpenCode service file, never start a service')
     .option('--codex-home <path>', 'Explicit Codex state directory for the app-server, never the default home')
+    .option('--jcode-home <path>', 'Explicit Jcode home directory, never the default home')
+    .option('--limit <n>', 'Page size for jcode discovery (default: 50)')
+    .option('--cursor <offset>', 'Opaque cursor from a previous jcode page')
     .option('--host <id>', 'Explicit native runtime host identity')
     .option('--endpoint <id>', 'Explicit native runtime endpoint identity')
     .option('--binary <path>', 'Explicit herdr or Codex executable (default: herdr on PATH)')
@@ -115,7 +118,29 @@ export function registerOpsCommands(cli: Goke) {
     .option('--timeout <ms>', 'Bounded inventory timeout in milliseconds (default: 5000)')
     .action(async (options) => {
       const source = options.source ?? 'herdr'
-      if (!['herdr', 'opencode', 'codex'].includes(source)) fail(new ConfigError({ reason: 'Supply --source herdr, opencode or codex' }))
+      if (!['herdr', 'opencode', 'codex', 'jcode'].includes(source)) fail(new ConfigError({ reason: 'Supply --source herdr, opencode, codex or jcode' }))
+      if (source === 'jcode') {
+        const jcodeHome = required(options.jcodeHome, 'jcode-home')
+        const hostId = required(options.host, 'host')
+        const endpointId = required(options.endpoint, 'endpoint')
+        if (options.serviceFile !== undefined || options.herdrSession !== undefined || options.codexHome !== undefined) fail(new ConfigError({ reason: '--service-file, --herdr-session and --codex-home do not apply to jcode' }))
+        const fs = await import('node:fs/promises')
+        const { createJcodeObserver } = await import('../ops/runtime/jcode.ts')
+        const observer = createJcodeObserver({
+          jcodeHome,
+          hostId,
+          endpointId,
+          readDir: (path) => fs.readdir(path),
+          readFile: (path) => fs.readFile(path, 'utf8'),
+        })
+        if (observer instanceof Error) fail(observer)
+        const limit = options.limit === undefined ? undefined : Number(options.limit)
+        if (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 1)) fail(new ConfigError({ reason: '--limit must be a positive integer' }))
+        const page = await observer.discover({ limit, cursor: options.cursor })
+        if (page instanceof Error) fail(page)
+        printJson({ source: 'jcode', observedAt: new Date().toISOString(), coverage: 'explicit-jcode-home-metadata-page', endpoint: page.source, sessions: page.sessions.map(({ key, title }) => ({ key, title })), cursor: page.cursor })
+        return
+      }
       if (source === 'codex') {
         const binary = required(options.binary, 'binary')
         const codexHome = required(options.codexHome, 'codex-home')
@@ -153,7 +178,7 @@ export function registerOpsCommands(cli: Goke) {
         printJson({ source: 'opencode', observedAt: new Date().toISOString(), coverage: 'explicit-native-endpoint-page', endpoint: page.source, sessions: page.sessions.map(({ key, native }) => ({ key, title: native.title })), cursor: page.cursor })
         return
       }
-      if (options.serviceFile !== undefined || options.host !== undefined || options.endpoint !== undefined || options.codexHome !== undefined) fail(new ConfigError({ reason: '--service-file, --host, --endpoint and --codex-home apply only to opencode or codex' }))
+      if (options.serviceFile !== undefined || options.host !== undefined || options.endpoint !== undefined || options.codexHome !== undefined || options.jcodeHome !== undefined) fail(new ConfigError({ reason: '--service-file, --host, --endpoint, --codex-home and --jcode-home apply only to opencode, codex or jcode' }))
       const { discoverHerdr } = await import('../ops/discovery/herdr.ts')
       const result = await discoverHerdr({ binary: options.binary, session: options.herdrSession, timeoutMs: options.timeout === undefined ? undefined : Number(options.timeout) })
       if (result instanceof Error) fail(result)
