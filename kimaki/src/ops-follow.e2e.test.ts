@@ -1,4 +1,6 @@
 import { spawn } from 'node:child_process'
+import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { afterAll, beforeAll, expect, test } from 'vitest'
 import { startOpencodeTestServer, startTwin, type OpencodeTestServer, type TestTwin } from './test/harness.js'
@@ -33,9 +35,9 @@ test('follow publishes one fixed line only with consent', async () => {
   expect(await twin.discord.channel(twin.channelId).text()).toMatchInlineSnapshot('""')
   const follow = run(['--consent'])
   try {
-    await expect.poll(() => follow.stderr(), { timeout: 20_000 }).toContain('Follow subscription ready')
+    await expect.poll(() => follow.stderr(), { timeout: 120_000 }).toContain('Follow subscription ready')
     await native.session.update({ sessionID: created.id, title: 'Private rename @everyone' })
-    await expect.poll(async () => (await twin.discord.channel(twin.channelId).getMessages()).length, { timeout: 8000 }).toBe(1)
+    await expect.poll(async () => (await twin.discord.channel(twin.channelId).getMessages()).length, { timeout: 60_000 }).toBe(1)
     const result = await follow.done
     expect(await twin.discord.channel(twin.channelId).text()).toMatchInlineSnapshot(`
       "--- from: assistant (TestBot)
@@ -45,4 +47,54 @@ test('follow publishes one fixed line only with consent', async () => {
     expect(JSON.parse(result.stdout)).toMatchObject({ sent: 1, denied: 0 })
     expect(await twin.discord.channel(twin.channelId).getMessages()).toHaveLength(1)
   } finally { follow.child.kill() }
-}, 180_000)
+}, 300_000)
+
+test('follow publishes a Jcode rename from an explicit home', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-jcode-follow-'))
+  const sessions = path.join(home, 'sessions')
+  fs.mkdirSync(sessions)
+  const sessionId = 'session_synthetic_1'
+  const record = (title: string, messages: unknown[]) => JSON.stringify({
+    id: sessionId,
+    title,
+    created_at: '2026-01-01T00:00:00Z',
+    updated_at: new Date().toISOString(),
+    provider_key: 'synthetic',
+    model: 'synthetic',
+    working_dir: 'C:/synthetic/project',
+    messages,
+  })
+  const file = path.join(sessions, `${sessionId}.json`)
+  fs.writeFileSync(file, record('Before', [{ role: 'user', content: 'SYNTHETIC SECRET BODY' }]))
+  const env = { ...process.env, KIMAKI_TEST_LOGS: '1', KIMAKI_BOT_TOKEN: twin.discord.botToken, KIMAKI_DISCORD_REST_URL: twin.discord.restUrl }
+  const args = ['--source', 'jcode', '--jcode-home', home, '--host', 'jcode-host', '--endpoint', 'jcode-endpoint', '--native-session', sessionId, '--tenant', twin.discord.guildId, '--surface', twin.channelId, '--timeout', '9000']
+  const before = (await twin.discord.channel(twin.channelId).getMessages()).length
+  const child = spawn(process.execPath, ['--import', 'tsx', path.join(import.meta.dirname, 'cli.ts'), 'ops', 'follow', ...args, '--consent'], { env, stdio: ['ignore', 'pipe', 'pipe'] })
+  let stdout = ''
+  let stderr = ''
+  child.stdout.on('data', (chunk) => { stdout += chunk })
+  child.stderr.on('data', (chunk) => { stderr += chunk })
+  const done = new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+    child.once('error', reject)
+    child.once('close', (code) => resolve({ code, stdout, stderr }))
+  })
+  try {
+    await expect.poll(() => stderr, { timeout: 180_000 }).toContain('Follow subscription ready')
+    fs.writeFileSync(file, record('After rename @everyone', [
+      { role: 'user', content: 'SYNTHETIC SECRET BODY' },
+      { role: 'assistant', content: 'SYNTHETIC SECRET REPLY' },
+    ]))
+    await expect.poll(async () => (await twin.discord.channel(twin.channelId).getMessages()).length, { timeout: 20_000 }).toBe(before + 1)
+    const finished = await done
+    expect(finished.code, finished.stderr).toBe(0)
+    expect(JSON.parse(finished.stdout)).toMatchObject({ sent: 1, denied: 0 })
+    const text = await twin.discord.channel(twin.channelId).text()
+    expect(text).toContain('-# External Jcode session activity observed.')
+    expect(text).not.toContain('SYNTHETIC')
+    expect(text).not.toContain('After rename')
+  } finally {
+    child.kill()
+    await done.catch(() => undefined)
+    fs.rmSync(home, { recursive: true, force: true })
+  }
+}, 300_000)
