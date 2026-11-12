@@ -48,6 +48,15 @@ it.skipIf(!process.env.KIMAKI_CODEX_ACCEPTANCE)('discovers through an isolated i
     if (observer instanceof Error) throw observer
     expect(await observer.discover({ limit: 5 })).toEqual({ source: { hostId: 'isolated', endpointId: 'isolated', backendKind: 'codex' }, sessions: [], cursor: null })
     expect(await observer.readSnapshot({ key: { hostId: 'isolated', endpointId: 'isolated', backendKind: 'codex', nativeSessionId: '01900000-0000-7000-8000-000000000000' } })).toBeInstanceOf(Error)
+    // A thread created by this app-server is readable. Only its ID is returned;
+    // the native record also carries cwd, preview and provider fields.
+    const started = await request('thread/start', { cwd: root }) as { thread?: { id?: string } }
+    const threadId = started.thread?.id
+    if (!threadId) throw new Error('app-server returned no thread id')
+    const key = { hostId: 'isolated', endpointId: 'isolated', backendKind: 'codex' as const, nativeSessionId: threadId }
+    expect(await observer.readSnapshot({ key })).toEqual({ key, source: { hostId: 'isolated', endpointId: 'isolated', backendKind: 'codex' }, session: { id: threadId } })
+    expect(await observer.readSnapshot({ key: { ...key, endpointId: 'other' } })).toBeInstanceOf(Error)
+    expect(await observer.readSnapshot({ key: { ...key, extra: 'secret' } as never })).toEqual({ key, source: { hostId: 'isolated', endpointId: 'isolated', backendKind: 'codex' }, session: { id: threadId } })
   } finally {
     clearTimeout(deadline)
     child.kill()
