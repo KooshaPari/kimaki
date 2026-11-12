@@ -9,6 +9,40 @@ function required(value: string | undefined, flag: string): string {
 }
 
 export function registerOpsCommands(cli: Goke) {
+  cli.command('ops publish', 'Publish one explicitly authorized OpenCode metadata event to Discord')
+    .option('--tenant <id>', 'Explicit Discord guild ID')
+    .option('--surface <id>', 'Explicit Discord channel ID')
+    .option('--host <id>', 'Explicit runtime host identity')
+    .option('--endpoint <id>', 'Explicit runtime endpoint identity')
+    .option('--native-session <id>', 'Explicit OpenCode session ID')
+    .option('--event-file <path>', 'JSON file containing one OpenCodeObservedEvent')
+    .option('--token <token>', 'Discord bot token (or KIMAKI_BOT_TOKEN)')
+    .option('--consent', 'Explicitly authorize this one metadata publication')
+    .action(async (options) => {
+      if (options.consent !== true) fail(new ConfigError({ reason: 'Supply --consent to authorize this publication' }))
+      const target = {
+        tenantId: required(options.tenant, 'tenant'),
+        surfaceId: required(options.surface, 'surface'),
+        session: { hostId: required(options.host, 'host'), endpointId: required(options.endpoint, 'endpoint'), backendKind: 'opencode', nativeSessionId: required(options.nativeSession, 'native-session') },
+      }
+      const eventFile = required(options.eventFile, 'event-file')
+      const token = required(options.token ?? process.env['KIMAKI_BOT_TOKEN'], 'token')
+      const fs = await import('node:fs/promises')
+      const errore = await import('errore')
+      const text = await fs.readFile(eventFile, 'utf8').catch((cause) => new ConfigError({ reason: 'Cannot read --event-file', cause }))
+      if (text instanceof Error) fail(text)
+      const observed = errore.try(() => JSON.parse(text) as import('../ops/runtime/opencode.ts').OpenCodeObservedEvent, (cause) => new ConfigError({ reason: 'Invalid JSON in --event-file', cause }))
+      if (observed instanceof Error) fail(observed)
+      if (!observed || typeof observed !== 'object' || !observed.key || typeof observed.key !== 'object' || !observed.source || typeof observed.source !== 'object' || !observed.raw || typeof observed.raw !== 'object' || !observed.raw.data || typeof observed.raw.data !== 'object' || Array.isArray(observed.raw.data)) fail(new ConfigError({ reason: 'Invalid OpenCode observed event in --event-file' }))
+      const { REST } = await import('discord.js')
+      const { publishObservedMetadata } = await import('../ops/discord/publication.ts')
+      const rest = new REST({ ...(process.env['KIMAKI_DISCORD_REST_URL'] ? { api: process.env['KIMAKI_DISCORD_REST_URL'] } : {}), version: '10' }).setToken(token)
+      const result = await publishObservedMetadata({ rest, target, observed, grant: { ...target, publication: 'metadata', consent: true } })
+      if (result instanceof Error) fail(result)
+      if (result.kind === 'denied') fail(new ConfigError({ reason: 'Publication denied: event and Discord surface must match the explicit scope' }))
+      printJson(result)
+    })
+
   cli.command('ops discover', 'Read metadata-only herdr, opencode or codex inventory, never transcripts or terminal input')
     .option('--source <kind>', 'Inventory source: herdr (default), opencode or codex')
     .option('--service-file <path>', 'Explicit running OpenCode service file, never start a service')
