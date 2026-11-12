@@ -6,6 +6,7 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { afterEach, expect, test } from 'vitest'
 import { openDb } from './db.ts'
+import { removeTempDirs } from './test/cleanup.ts'
 
 const exec = promisify(execFile)
 const dirs: string[] = []
@@ -14,7 +15,7 @@ afterEach(async () => {
   global.gc?.()
   await new Promise((resolve) => setTimeout(resolve, 50))
   global.gc?.()
-  for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+  await removeTempDirs(dirs)
 })
 function tempDir() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-ops-cli-'))

@@ -4,6 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { afterEach, expect, test } from 'vitest'
 import { openDb, type OpenedDb } from '../db.ts'
+import { removeTempDirs } from '../test/cleanup.ts'
 import { bindSurface, detachBinding, listBindings } from './bindings.ts'
 
 const opened: OpenedDb[] = []
@@ -15,7 +16,7 @@ afterEach(async () => {
   global.gc?.()
   await new Promise((resolve) => setTimeout(resolve, 50))
   global.gc?.()
-  for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+  await removeTempDirs(dirs)
 })
 async function database() {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-ops-'))
