@@ -222,6 +222,28 @@ export function registerOpsCommands(cli: Goke) {
       printJson(result)
     })
 
+  cli.command('ops paperclip run', 'Read one Paperclip run as metadata only, never transcript, logs or control')
+    .option('--base-url <url>', 'Explicit Paperclip instance base URL, for example http://127.0.0.1:3199')
+    .option('--run-id <id>', 'Explicit Paperclip heartbeat run ID')
+    .option('--company <id>', 'Expected company scope; a different company is refused')
+    .option('--agent <id>', 'Expected agent scope; a different agent is refused')
+    .option('--timeout <ms>', 'Bounded read timeout in milliseconds (default: 10000)')
+    .action(async (options) => {
+      const baseUrl = required(options.baseUrl, 'base-url')
+      const runId = required(options.runId, 'run-id')
+      const timeout = options.timeout === undefined ? undefined : Number(options.timeout)
+      if (timeout !== undefined && (!Number.isSafeInteger(timeout) || timeout < 1)) fail(new ConfigError({ reason: '--timeout must be a positive integer in milliseconds' }))
+      const { readPaperclipRun } = await import('../ops/paperclip/observe.ts')
+      const result = await readPaperclipRun({
+        baseUrl,
+        runId,
+        expected: { companyId: options.company, agentId: options.agent },
+        timeoutMs: timeout,
+      })
+      if (result instanceof Error) fail(result)
+      printJson(result)
+    })
+
   cli.command('ops bind', 'Register metadata-only observe association. No transcript publishing or runtime control')
     .option('--data-dir <path>', DATA_DIR_HELP)
     .option('--host <id>', 'Explicit runtime host identity')
