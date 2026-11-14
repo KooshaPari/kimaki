@@ -12,7 +12,7 @@
 import childProcess from 'node:child_process'
 import readline from 'node:readline'
 import { ConfigError } from '../../errors.ts'
-import type { AcpClient, AcpClientOptions, AcpFrame, AcpInitializeResult, AcpPromptResult, CreateAcpClient } from './contracts.ts'
+import type { AcpClient, AcpClientOptions, AcpFrame, AcpInitializeResult, AcpLoadResult, AcpPromptResult, CreateAcpClient } from './contracts.ts'
 
 const DEFAULT_TIMEOUT_MS = 30_000
 /** How long close() waits for a graceful exit before killing hard. */
@@ -23,6 +23,8 @@ type PromptState = {
   text: string
   updateCount: number
   onChunk?: (text: string) => void
+  /** Replayed messages, used by session/load to recover native history. */
+  history?: Array<{ role: 'user' | 'agent'; text: string }>
 }
 
 type Pending = {
@@ -96,9 +98,15 @@ export const createAcpClient: CreateAcpClient = (options: AcpClientOptions): Acp
     const update = record(params.update)
     if (!update) return
     prompt.updateCount += 1
+    if (update.sessionUpdate === 'user_message_chunk') {
+      const text = record(update.content)?.text
+      if (typeof text === 'string' && prompt.history) prompt.history.push({ role: 'user', text })
+      return
+    }
     if (update.sessionUpdate !== 'agent_message_chunk') return
     const text = record(update.content)?.text
     if (typeof text !== 'string') return
+    if (prompt.history) prompt.history.push({ role: 'agent', text })
     prompt.text += text
     try {
       prompt.onChunk?.(text)
@@ -248,6 +256,33 @@ export const createAcpClient: CreateAcpClient = (options: AcpClientOptions): Acp
         if (typeof entry.currentValue === 'string' && entry.currentValue) return { model: entry.currentValue }
       }
       return new ConfigError({ reason: 'The ACP agent did not confirm the selected model' })
+    },
+
+    async loadSession(input: { sessionId: string; cwd: string }): Promise<AcpLoadResult | Error> {
+      if (typeof input.sessionId !== 'string' || !input.sessionId) {
+        return new ConfigError({ reason: 'ACP session/load needs a session ID' })
+      }
+      if (typeof input.cwd !== 'string' || !input.cwd.trim()) {
+        return new ConfigError({ reason: 'ACP session/load needs a working directory' })
+      }
+      const state: PromptState = { sessionId: input.sessionId, text: '', updateCount: 0, history: [] }
+      const frame = await request(
+        'session/load',
+        { sessionId: input.sessionId, cwd: input.cwd, mcpServers: [] },
+        defaultTimeoutMs,
+        state,
+      )
+      if (frame instanceof Error) return frame
+      // Replayed chunks arrive before the response, so nothing is still in flight.
+      const history = state.history ?? []
+      const options = Array.isArray(frame.result?.configOptions) ? frame.result.configOptions : []
+      const modelOption = options.find((option) => record(option)?.category === 'model')
+      const current = modelOption === undefined ? undefined : record(modelOption)?.currentValue
+      return {
+        sessionId: typeof frame.result?.sessionId === 'string' ? frame.result.sessionId : input.sessionId,
+        history,
+        model: typeof current === 'string' && current.trim() ? current : null,
+      }
     },
 
     async prompt(input: {

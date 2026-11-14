@@ -531,6 +531,97 @@ export function registerOpsCommands(cli: Goke) {
       if (outcome.error !== undefined) fail(new ConfigError({ reason: outcome.error }))
     })
 
+  cli.command('ops jcode watch', 'Follow a live native Jcode session by polling session/load and emitting new messages')
+    .option('--session <id>', 'ACP session id to follow')
+    .option('--cwd <path>', 'Working directory the session belongs to')
+    .option('--binary <path>', 'Jcode executable (default: jcode)')
+    .option('--interval <ms>', 'Polling interval in milliseconds (default: 2000)')
+    .option('--iterations <n>', 'Stop after this many polls; 0 keeps polling (default: 0)')
+    .option('--emit-existing', 'Emit history already present at attach time')
+    .action(async (options) => {
+      const session = required(options.session, 'session')
+      const cwd = required(options.cwd, 'cwd')
+      const interval = options.interval === undefined ? 2000 : Number(options.interval)
+      if (!Number.isSafeInteger(interval) || interval < 100) fail(new ConfigError({ reason: '--interval must be an integer of at least 100ms' }))
+      const iterations = options.iterations === undefined ? 0 : Number(options.iterations)
+      if (!Number.isSafeInteger(iterations) || iterations < 0) fail(new ConfigError({ reason: '--iterations must be zero or a positive integer' }))
+      const { createAcpClient } = await import('../backend/acp/client.ts')
+      // jcode 0.99.1 does not stream another client's turn into an attached ACP
+      // session (observed: zero updates while `jcode run --resume` wrote to the
+      // same session), and a second `session/load` on the same connection returns
+      // the history it replays at first load. A fresh ACP connection per poll
+      // therefore replays the current history, and only unseen messages are
+      // emitted, which is the honest way to follow native input.
+      let watermark = options.emitExisting === true ? 0 : null as number | null
+      let seen = 0
+      let polls = 0
+      let failure: Error | undefined
+      for (;;) {
+        const client = createAcpClient({ command: options.binary ?? 'jcode', args: ['acp'], cwd })
+        const initialized = await client.initialize()
+        if (initialized instanceof Error) {
+          await client.close()
+          failure = initialized
+          break
+        }
+        const loaded = await client.loadSession({ sessionId: session, cwd })
+        await client.close()
+        if (loaded instanceof Error) {
+          failure = loaded
+          break
+        }
+        if (watermark === null) {
+          // First poll establishes the baseline unless --emit-existing is set.
+          watermark = options.emitExisting === true ? 0 : loaded.history.length
+        }
+        if (loaded.history.length < watermark) {
+          // The native client truncated or forked the history; restart from zero
+          // rather than inventing continuity.
+          watermark = 0
+        }
+        for (const message of loaded.history.slice(watermark)) {
+          printJson({ kind: 'native', role: message.role, text: message.text, index: seen })
+          seen += 1
+        }
+        watermark = loaded.history.length
+        polls += 1
+        if (iterations !== 0 && polls >= iterations) break
+        await new Promise((resolve) => setTimeout(resolve, interval))
+      }
+      if (failure) fail(failure)
+      printJson({ kind: 'stopped', polls, messages: seen })
+    })
+
+  cli.command('ops jcode history', 'Load an existing Jcode session over ACP and print its replayed native history')
+    .option('--session <id>', 'ACP session id to load')
+    .option('--cwd <path>', 'Working directory the session belongs to')
+    .option('--binary <path>', 'Jcode executable (default: jcode)')
+    .option('--timeout <ms>', 'Per-request ACP deadline in milliseconds')
+    .option('--json', 'Print one JSON document instead of one line per message')
+    .action(async (options) => {
+      const session = required(options.session, 'session')
+      const cwd = required(options.cwd, 'cwd')
+      const timeoutMs = options.timeout === undefined ? undefined : Number(options.timeout)
+      if (timeoutMs !== undefined && (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1)) fail(new ConfigError({ reason: '--timeout must be a positive integer in milliseconds' }))
+      const { createAcpClient } = await import('../backend/acp/client.ts')
+      const client = createAcpClient({ command: options.binary ?? 'jcode', args: ['acp'], cwd, timeoutMs })
+      const initialized = await client.initialize()
+      if (initialized instanceof Error) {
+        await client.close()
+        fail(initialized)
+      }
+      const loaded = await client.loadSession({ sessionId: session, cwd })
+      await client.close()
+      if (loaded instanceof Error) fail(loaded)
+      // Replayed input is what the native client sent, so it is the only proof
+      // that a session outside kimaki is being observed rather than invented.
+      if (options.json) printJson({ sessionId: loaded.sessionId, model: loaded.model, history: loaded.history })
+      else {
+        for (const message of loaded.history) process.stdout.write(`${message.role}: ${message.text}\n`)
+        process.stdout.write(`\n${loaded.history.length} messages, model ${loaded.model ?? 'unknown'}\n`)
+      }
+    })
+
   cli.command('ops discord view', 'Mirror one hub session into a Discord channel, resuming from a durable cursor')
     .option('--url <url>', 'Explicit hub URL, as printed by ops jcode serve')
     .option('--tenant <id>', 'Guild id the channel must belong to')

@@ -69,6 +69,17 @@ rl.on('line', (line) => {
   if (message.method === 'session/cancel') {
     return
   }
+  if (message.method === 'session/load') {
+    const sid = message.params.sessionId
+    update(sid, { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'native-typed' } })
+    update(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'native-reply' } })
+    send({
+      jsonrpc: '2.0',
+      id: message.id,
+      result: { sessionId: sid, configOptions: [{ category: 'model', currentValue: 'deepseek-v4-pro', id: 'model', type: 'select' }] },
+    })
+    return
+  }
   if (message.method !== 'session/prompt') return
 
   const sid = message.params.sessionId
@@ -168,6 +179,27 @@ test('initializes and opens a session', async () => {
   expect(initialized).toEqual({ protocolVersion: 1, agentName: 'jcode' })
   const session = ok(await client.newSession({ cwd: process.cwd() }))
   expect(session).toEqual({ sessionId: 'session_fox_1' })
+})
+
+test('loads an existing session and recovers the native history, including user input', async () => {
+  const client = await startAgent()
+  ok(await client.initialize())
+  const loaded = ok(await client.loadSession({ sessionId: 'session_fox_1', cwd: process.cwd() }))
+  // The agent replays the user's own prompt first: this is the only ACP path
+  // that surfaces input typed outside kimaki.
+  expect(loaded.history).toEqual([
+    { role: 'user', text: 'native-typed' },
+    { role: 'agent', text: 'native-reply' },
+  ])
+  expect(loaded.model).toBe('deepseek-v4-pro')
+  expect(loaded.sessionId).toBe('session_fox_1')
+})
+
+test('rejects a load without a session id or working directory', async () => {
+  const client = await startAgent()
+  ok(await client.initialize())
+  expect(await client.loadSession({ sessionId: '', cwd: process.cwd() })).toBeInstanceOf(ConfigError)
+  expect(await client.loadSession({ sessionId: 'session_fox_1', cwd: ' ' })).toBeInstanceOf(ConfigError)
 })
 
 test('selects a model from the echoed config options', async () => {

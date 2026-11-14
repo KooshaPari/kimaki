@@ -54,6 +54,23 @@ export type AcpPromptResult = {
 }
 
 /**
+ * One message replayed by `session/load`. jcode 0.99.1 emits
+ * `user_message_chunk` for what the user typed in the native client and
+ * `agent_message_chunk` for its reply, before the load response arrives.
+ */
+export type AcpHistoryMessage = {
+  role: 'user' | 'agent'
+  text: string
+}
+
+export type AcpLoadResult = {
+  sessionId: string
+  history: AcpHistoryMessage[]
+  /** Model the loaded session is using, when the agent reports config options. */
+  model: string | null
+}
+
+/**
  * Transport-level ACP client. Every method resolves an Error instead of
  * throwing, so callers can fail closed without try/catch.
  */
@@ -67,6 +84,14 @@ export type AcpClient = {
    * Without this the session keeps the model from the agent's own config.
    */
   setModel(input: { sessionId: string; model: string }): Promise<{ model: string } | Error>
+  /**
+   * Attach to an existing native session and receive its replayed history.
+   * Verified against jcode 0.99.1: the agent replays the user's own prompts as
+   * `user_message_chunk` and the replies as `agent_message_chunk` before it
+   * answers `session/load`, which is the only native read path for input typed
+   * outside kimaki.
+   */
+  loadSession(input: { sessionId: string; cwd: string }): Promise<AcpLoadResult | Error>
   prompt(input: {
     sessionId: string
     text: string

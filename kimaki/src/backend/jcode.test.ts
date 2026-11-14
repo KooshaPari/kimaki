@@ -34,6 +34,9 @@ function fakeAcp(overrides: Partial<AcpClient> = {}) {
       calls.setModel.push(input)
       return { model: input.model }
     },
+    async loadSession(input) {
+      return { sessionId: input.sessionId, history: [], model: null }
+    },
     async prompt(input) {
       calls.prompt.push({ sessionId: input.sessionId, text: input.text })
       input.onChunk?.('hel')
