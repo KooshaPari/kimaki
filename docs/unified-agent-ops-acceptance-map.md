@@ -13,11 +13,11 @@ Checksums from the bundle's own `SHA256SUMS.txt`: 7 of 7 documents match.
 | Status | Cases |
 | --- | --- |
 | Closed at the plan's standard | 11 |
-| Partial | 18 |
-| Not started | 11 |
+| Partial | 19 |
+| Not started | 10 |
 | Total | 40 |
 
-AC03, AC04, AC06, AC07, AC11, AC13, AC14, AC17, AC18, AC23 and AC25 are closed. Every other case still lacks both a real native surface and a live service path in the same piece of evidence, which is the standard the plan sets. AC18 closed when a real Codex 0.169 app-server raised an approval request and the client's answer changed what the runtime executed. AC19 is partial: a payload digest pins an answer to the artifact the caller read, but fileChange content is not covered and no real-binary digest witness exists. AC20 is partial: a stub 401 and an emptied token fail closed, but no live Discord credential was revoked. AC33 is partial: a local JSON backup restores binding ids, generations, state and route ownership, but not an external store or a live cutover. AC38 is partial: the view guard is proven against a live session change from a fake hub, not a real `createSessionHub` rebind path. AC15 is partial: a throwing backend before ACK fails closed, but the crash is a fake throw. AC27 is partial: a cold inbox backlog replays once, but against the fixture hub. AC21 is partial: the view posts an injected turn as inert text with no mentions, but only the view path is covered.
+AC03, AC04, AC06, AC07, AC11, AC13, AC14, AC17, AC18, AC23 and AC25 are closed. Every other case still lacks both a real native surface and a live service path in the same piece of evidence, which is the standard the plan sets. AC18 closed when a real Codex 0.169 app-server raised an approval request and the client's answer changed what the runtime executed. AC19 is partial: a payload digest pins an answer to the artifact the caller read, but fileChange content is not covered and no real-binary digest witness exists. AC20 is partial: a stub 401 and an emptied token fail closed, but no live Discord credential was revoked. AC33 is partial: a local JSON backup restores binding ids, generations, state and route ownership, but not an external store or a live cutover. AC38 is partial: the view guard is proven against a live session change from a fake hub, not a real `createSessionHub` rebind path. AC15 is partial: a throwing backend before ACK fails closed, but the crash is a fake throw. AC27 is partial: a cold inbox backlog replays once, but against the fixture hub. AC21 is partial: the view posts an injected turn as inert text with no mentions, but only the view path is covered. AC26 is partial: a second view on the same channel is refused, but no general bot-to-bot echo test exists.
 
 ## Acceptance cases
 
@@ -48,7 +48,7 @@ AC03, AC04, AC06, AC07, AC11, AC13, AC14, AC17, AC18, AC23 and AC25 are closed. 
 | AC23 | Failed HERDR wait/read | closed | real CLI run with a binary that cannot exist: exit 1, no JSON inventory on stdout, and a message naming the failed Herdr inventory command. Unit tests also cover a missing binary and unsafe timeouts before spawning |
 | AC24 | Synthetic engine backend | partial | identity comparison fails closed; no synthetic-engine oracle test |
 | AC25 | Output send failure/429 | closed | a local REST stub answers the channel lookup 200 and the send 429: the CLI exits non-zero after exactly one POST, never prints `sent`, and emits a non-empty failure. The same stub with a 500 exposed a second defect: discord.js retried the send three times, so one call made four delivery attempts. Both clients now set `rejectOnRateLimit: () => true` and `retries: 0`, and the 500 case is pinned by its own test (one attempt, non-zero exit). `ops follow` has a dedicated 429 witness as well |
-| AC26 | Echo between bots/services | not started | no echo suppression case |
+| AC26 | Echo between bots/services | partial | `ops discord view` now defaults its hub client id to `discord-view-<surface>`, not a per-process id. Two views on the same channel claim the same id and the hub refuses the second (400), so the channel receives each turn once; views on different channels keep distinct ids. 19 view tests pass, `tsc` clean, commit `6101c3d0`. This suppresses same-channel duplicate delivery; it is not a general bot-to-bot echo test |
 | AC27 | Cold inbox backlog | partial | A hub that already holds a finished turn when the view starts with a fresh state file: the view posts the backlog exactly once in order, then follows a live turn once and persists the live cursor. 14 view tests pass, `tsc` clean, commit `79c7b42b`. The hub is the test fixture, not a live service |
 | AC28 | Usage across reattach/retry | partial | ACP token usage is surfaced per turn; no accounting across reattach or retry |
 | AC29 | Observed session in Paperclip | partial | `ops paperclip run` reads one real run as metadata; no Paperclip entity or projection exists |
@@ -76,7 +76,7 @@ AC03, AC04, AC06, AC07, AC11, AC13, AC14, AC17, AC18, AC23 and AC25 are closed. 
 | WP5 | JCode/KCode adapters | partial | ACP backend, CLI, hub, durable stream, presence, ack and a Discord view of a live session verified; KCode identity absent and Jcode exposes no retraction or correction surface |
 | WP6 | Paperclip plugin and runtime adapter | partial | run metadata read and a local-command managed run; no entity projection or enrollment, model-backed run blocked |
 | WP7 | Discord comparison and route ownership | partial | consent-gated metadata publication, a live channel view of a hub session (`ops discord view`) with durable resume, and a native-session mirror (`ops jcode watch --tenant/--surface/--state`) that posted four real messages from a terminal session it did not start, with a durable index; no in-bot wiring, route ownership or cutover |
-| WP8 | Reliability and acceptance witnesses | partial | 61 backend tests plus 33 hub, 16 ACP client, 43 Codex control, 5 Codex transport, 4 Codex hub, 9 publication, 16 Discord view, 7 native mirror and 17 binding tests; three real witnesses (three clients on one jcode hub, native terminal mirrored into a channel, real Codex thread served and mirrored); test-suite gate baseline recorded in `docs/release-gate-2026-11-14.md` |
+| WP8 | Reliability and acceptance witnesses | partial | 61 backend tests plus 33 hub, 16 ACP client, 43 Codex control, 5 Codex transport, 4 Codex hub, 9 publication, 19 Discord view, 7 native mirror and 17 binding tests; three real witnesses (three clients on one jcode hub, native terminal mirrored into a channel, real Codex thread served and mirrored); test-suite gate baseline recorded in `docs/release-gate-2026-11-14.md` |
 | WP9 | Migration and retirement | not started | decision matrix and rollback rehearsal only; nothing drained or retired |
 
 ## What would move the most cases
@@ -84,7 +84,7 @@ AC03, AC04, AC06, AC07, AC11, AC13, AC14, AC17, AC18, AC23 and AC25 are closed. 
 1. A Paperclip external-session entity closes AC29 and unblocks AC30 and AC22. This is now the single largest lever.
 2. A live route change between two running sessions closes AC05; today rebind is proven only as a fail-closed guard.
 3. Native process oracles close AC08, AC09, AC10 and AC24: PID reuse, a wrong backend, and a synthetic engine are all identity questions with no evidence yet.
-4. Remaining failure paths that need no new environment: AC26 (echo suppression). AC11 is closed; AC15, AC19, AC20, AC21 and AC27 now have partial witnesses.
+4. No cheap failure paths remain; AC26 now has a same-channel duplicate-suppression witness. The next levers are AC05, AC29 and AC39.
 5. AC12 stays blocked on an agent-side correction surface; jcode 0.99.1 exposes none.
 
 ## Mutation validation (2026-11-14)
@@ -360,3 +360,9 @@ Injection output safety, 2026-11-14:
 | Case | Evidence |
 | --- | --- |
 | AC21 | A model turn with a prompt-injection instruction, `@everyone` and a raw user mention is posted verbatim as inert content; `allowed_mentions` is parse-empty, the stub records no mention delivery, no side effect or second message occurs, and the cursor advances once. Ordinary text follows the same policy. 16 view tests, commit `59dbce14`. View path only; no agent-side execution or bot-ingest test |
+
+Echo/duplicate suppression, 2026-11-14:
+
+| Case | Evidence |
+| --- | --- |
+| AC26 | The default view client id is `discord-view-<surface>`. Two views on the same channel claim the same id; the hub refuses the second with 400, so the channel receives each turn once. Views on different channels keep distinct ids and both post once. 19 view tests, commit `6101c3d0`. Same-channel duplicate suppression only; no general bot-to-bot echo test |
