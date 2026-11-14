@@ -12,12 +12,12 @@ Checksums from the bundle's own `SHA256SUMS.txt`: 7 of 7 documents match.
 
 | Status | Cases |
 | --- | --- |
-| Closed at the plan's standard | 0 |
-| Partial | 21 |
+| Closed at the plan's standard | 1 |
+| Partial | 20 |
 | Not started | 19 |
 | Total | 40 |
 
-"No closed cases" is the honest reading: the plan requires independent native and host evidence per case, and no case has both a real native surface and a live service path yet.
+Only AC14 is closed. Every other case still lacks both a real native surface and a live service path in the same piece of evidence, which is the standard the plan sets.
 
 ## Acceptance cases
 
@@ -36,7 +36,7 @@ Checksums from the bundle's own `SHA256SUMS.txt`: 7 of 7 documents match.
 | AC11 | Unsupported capability | partial | capabilities declare unsupported operations and the CLI refuses them; no per-operation pre-dispatch test |
 | AC12 | JCode text correction | not started | no Jcode retraction or correction handling |
 | AC13 | Stream gap/overflow | partial | the hub reports clipped replay and replays from the log; no overflow or backpressure case |
-| AC14 | Duplicate incoming event | partial | the hub keeps a receipt per request id: a repeat with the same text returns `duplicate: true` without starting a turn, and the same id with different text is refused. Unit and server tests cover it. A standalone real-process run did not finish because the host kept interrupting and ran out of paging space, so real-path evidence is still owed |
+| AC14 | Duplicate incoming event | closed | real run through the public CLI and HTTP API: first submit admitted with `duplicate: false`, the same request id returned `duplicate: true` without a second turn, the sequence advanced exactly once (4), the same id with different text was refused with 409, and a fresh id was admitted |
 | AC15 | Crash after launch before ACK | not started | no crash-after-launch-before-ack case |
 | AC16 | Competing managed launch paths | partial | the hub lease refuses a second writer; no Paperclip launcher fencing |
 | AC17 | Cancel request | partial | hub cancel is accepted and inert when idle; no native terminal-state oracle |
