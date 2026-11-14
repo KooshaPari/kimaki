@@ -209,6 +209,10 @@ Real-binary approval witness, all through the shipped CLI:
 | `--approval accept --approval-policy untrusted` | `{"kind":"approval-request","requestId":0,"method":"item/commandExecution/requestApproval","command":"...pwsh.exe -Command 'echo approval-ok'","decision":"accept"}`, then the turn completed and the model saw `Process exited with code 0 ... Output: approval-ok` |
 | `--approval decline` | the same request with `"decision":"decline"`; the model saw `exec_command failed: Rejected("rejected by user")` and nothing ran |
 | no `--approval` | no approval line at all; the model saw `exec_command failed: Rejected("approval request failed")`, so the default is fail-closed |
+| `--approval cancel` | the request was answered, then the whole turn settled as `"status": "interrupted"` with the text produced so far; no further model turn happened, so cancel aborts the turn rather than just the one command |
+| `--approval accept`, two commands in one turn | two separate approval requests, one per command, each answered `accept`; both commands ran |
+| `--approval acceptForSession`, two different commands | two requests again, so the session grant is not a blanket pass for the turn |
+| `--approval acceptForSession`, the identical command twice | exactly one request; both invocations ran (`exit code 0`, `approval-ok` twice), so codex keys the session grant on the command |
 | `ops codex serve --approval accept --approval-policy untrusted` | the hub surfaced the same request on stdout and the command ran (`exit code 0`, `approval-ok`) |
 
 The witness model is a local stub that speaks the Responses API, so no account credential is involved; every other element is the shipped program and the real codex 0.169 binary.
