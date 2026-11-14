@@ -1,10 +1,38 @@
+import childProcess from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
+import { createAcpClient } from './acp/client.ts'
 import { createSessionHub, type HubBackend, type HubEvent } from './hub.ts'
 
 const wait = (ms = 0) => new Promise((resolve) => setTimeout(resolve, ms))
+
+// A managed child that records its own pid and dies non-zero before it can answer
+// any handshake. No stdout means no ACK frame ever arrives.
+const CRASH_SOURCE = String.raw`
+const fs = require('node:fs')
+fs.writeFileSync(process.argv[2], String(process.pid))
+process.exit(7)
+`
+
+const isAlive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
+const waitForDead = async (pid: number, timeoutMs = 3_000): Promise<boolean> => {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (!isAlive(pid)) return true
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+  return !isAlive(pid)
+}
 
 // Default backend completes a turn immediately. `blocking: true` holds the turn
 // open so tests can observe the busy state and cancellation.
@@ -192,6 +220,7 @@ describe('createSessionHub', () => {
     expect(hub.subscribe({ cursor: -1, onEvent: () => {} })).toBeInstanceOf(Error)
     expect(hub.subscribe({ cursor: 99, onEvent: () => {} })).toBeInstanceOf(Error)
     expect(createSessionHub({ backend, bufferLimit: 0 })).toBeInstanceOf(Error)
+    expect(createSessionHub({ backend, launchTimeoutMs: 0 })).toBeInstanceOf(Error)
   })
 
   it('drops a subscriber that throws without stopping the turn', async () => {
@@ -784,6 +813,149 @@ describe('createSessionHub', () => {
       expect(hub.snapshot()).toMatchObject({ sessionId: null, model: null, busy: false, seq: 0 })
       expect(events).toEqual([])
       expect(calls.prompts).toEqual([])
+    })
+
+    // The production surface: a real node process is the managed child, spoken to
+    // through the real ACP transport. It dies non-zero before it can answer
+    // session/new, so the ACK never arrives. Nothing here is a mock.
+    it('fails closed when a real managed child dies before the ACK over ACP', async () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-hub-real-crash-'))
+      const logFile = path.join(dir, 'events.jsonl')
+      const leaseFile = `${logFile}.lock`
+      const script = path.join(dir, 'crash.cjs')
+      const pidFile = path.join(dir, 'crash.pid')
+      fs.writeFileSync(script, CRASH_SOURCE)
+      let acp: ReturnType<typeof createAcpClient> | null = null
+      const backend: HubBackend = {
+        async start() {
+          acp ??= createAcpClient({ command: process.execPath, args: [script, pidFile], cwd: dir })
+          const initialized = await acp.initialize()
+          if (initialized instanceof Error) return initialized
+          const session = await acp.newSession({ cwd: dir })
+          if (session instanceof Error) return session
+          return { sessionId: session.sessionId, model: null }
+        },
+        async prompt() {
+          return new Error('a crashed launch must never reach a prompt')
+        },
+        async cancel() {
+          return undefined
+        },
+        async close() {
+          await acp?.close()
+        },
+      }
+      try {
+        const hub = createSessionHub({ backend, logFile })
+        if (hub instanceof Error) throw hub
+        const events: HubEvent[] = []
+        hub.subscribe({ onEvent: (event) => events.push(event) })
+
+        const started = await hub.start()
+        expect(started).toBeInstanceOf(Error)
+        // The crash is reported as the launch failure itself, naming the death.
+        expect((started as Error).message).toMatch(/exited before responding/i)
+        // No session is invented from a process that never acknowledged one.
+        expect(hub.snapshot()).toMatchObject({ sessionId: null, model: null, busy: false, seq: 0 })
+        expect(events.map((event) => event.type)).not.toContain('session.started')
+
+        // The real child is gone, not left running behind the hub.
+        const firstPid = Number(fs.readFileSync(pidFile, 'utf8'))
+        expect(Number.isInteger(firstPid) && firstPid > 0).toBe(true)
+        expect(await waitForDead(firstPid)).toBe(true)
+
+        // A later submit fails closed: same dead launch, no turn, no advance.
+        const submitted = await hub.submit('hello')
+        expect(submitted).toBeInstanceOf(Error)
+        expect(hub.snapshot()).toMatchObject({ sessionId: null, busy: false, seq: 0 })
+        expect(events.map((event) => event.type)).not.toContain('prompt.started')
+        const secondPid = Number(fs.readFileSync(pidFile, 'utf8'))
+        expect(await waitForDead(secondPid)).toBe(true)
+
+        // The lease still names the live hub, so no other hub can steal it.
+        expect(JSON.parse(fs.readFileSync(leaseFile, 'utf8'))).toMatchObject({ pid: process.pid })
+        expect(createSessionHub({ backend: fakeBackend().backend, logFile })).toBeInstanceOf(Error)
+
+        // Releasing the crashed hub frees the lease. A replacement takes the same
+        // log, starts at seq 0 and finds no session the crash never wrote.
+        await hub.close()
+        const replacement = createSessionHub({ backend: fakeBackend().backend, logFile })
+        expect(replacement).not.toBeInstanceOf(Error)
+        if (replacement instanceof Error) throw replacement
+        expect(replacement.snapshot()).toMatchObject({ seq: 0, sessionId: null })
+        const log = fs.existsSync(logFile) ? fs.readFileSync(logFile, 'utf8') : ''
+        expect(log).not.toContain('session.started')
+        await replacement.close()
+
+        // A holder file left by the dead managed pid is recoverable because that
+        // pid is dead: the next hub takes it over and rewrites it to itself.
+        fs.writeFileSync(leaseFile, JSON.stringify({ pid: firstPid, startedAt: new Date().toISOString() }))
+        const recovered = createSessionHub({ backend: fakeBackend().backend, logFile })
+        expect(recovered).not.toBeInstanceOf(Error)
+        if (recovered instanceof Error) throw recovered
+        expect(JSON.parse(fs.readFileSync(leaseFile, 'utf8'))).toMatchObject({ pid: process.pid })
+        await recovered.close()
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true })
+      }
+    })
+
+    // A managed child can die without its transport ever observing the exit (a
+    // trust-the-ACK read, or a descendant still holding the pipe). The hub must
+    // bound that wait instead of hanging the whole supervisor forever.
+    it('bounds a launch whose real child died without the exit being observed', async () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-hub-deaf-launch-'))
+      const script = path.join(dir, 'crash.cjs')
+      const pidFile = path.join(dir, 'crash.pid')
+      fs.writeFileSync(script, CRASH_SOURCE)
+      const backend: HubBackend = {
+        async start() {
+          const child = childProcess.spawn(process.execPath, [script, pidFile], {
+            cwd: dir,
+            stdio: ['ignore', 'pipe', 'ignore'],
+          })
+          // Wait only for an ACK line. The child exits, but this transport keeps
+          // waiting: that is the pre-ACK death the hub has to bound.
+          return await new Promise((resolve) => {
+            let seen = ''
+            child.stdout?.on('data', (chunk) => {
+              seen += String(chunk)
+              if (seen.includes('\n')) resolve({ sessionId: 'never-acked', model: null })
+            })
+          })
+        },
+        async prompt() {
+          return new Error('a crashed launch must never reach a prompt')
+        },
+        async cancel() {
+          return undefined
+        },
+        async close() {
+          // The child is already gone; nothing to stop.
+        },
+      }
+      try {
+        const hub = createSessionHub({ backend, launchTimeoutMs: 250 })
+        if (hub instanceof Error) throw hub
+        const events: HubEvent[] = []
+        hub.subscribe({ onEvent: (event) => events.push(event) })
+
+        const began = Date.now()
+        const started = await hub.start()
+        expect(Date.now() - began).toBeLessThan(5_000)
+        expect(started).toBeInstanceOf(Error)
+        expect((started as Error).message).toMatch(/did not acknowledge the session within 250ms/i)
+        expect(hub.snapshot()).toMatchObject({ sessionId: null, busy: false, seq: 0 })
+        expect(events.map((event) => event.type)).not.toContain('session.started')
+
+        const pid = Number(fs.readFileSync(pidFile, 'utf8'))
+        expect(await waitForDead(pid)).toBe(true)
+
+        expect(await hub.submit('hello')).toBeInstanceOf(Error)
+        expect(hub.snapshot()).toMatchObject({ sessionId: null, busy: false, seq: 0 })
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true })
+      }
     })
   })
 })

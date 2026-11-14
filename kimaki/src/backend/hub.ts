@@ -170,6 +170,7 @@ export function createSessionHub({
   model,
   logFile,
   leaseFile,
+  launchTimeoutMs = 30_000,
 }: {
   backend: HubBackend
   bufferLimit?: number
@@ -178,9 +179,14 @@ export function createSessionHub({
   logFile?: string
   /** Advisory writer lease. Defaults to `<logFile>.lock` when a log is configured. */
   leaseFile?: string
+  /** Bound on a managed launch that never acknowledges the session. */
+  launchTimeoutMs?: number
 }): SessionHub | ConfigError {
   if (!Number.isSafeInteger(bufferLimit) || bufferLimit < 1) {
     return new ConfigError({ reason: 'Hub bufferLimit must be a positive integer' })
+  }
+  if (!Number.isSafeInteger(launchTimeoutMs) || launchTimeoutMs < 1) {
+    return new ConfigError({ reason: 'Hub launchTimeoutMs must be a positive integer' })
   }
   const leasePath = leaseFile ?? (logFile === undefined ? undefined : `${logFile}.lock`)
   if (leasePath !== undefined) {
@@ -250,15 +256,32 @@ export function createSessionHub({
   }
 
   // A managed launch can die after the process is spawned but before the session
-  // is acknowledged. That arrives as a throw rather than an Error result, so it is
-  // normalised here: a crash before the ACK is a failed start, never a session.
-  // The original error is preserved so callers see the launch failure itself.
+  // is acknowledged. Two shapes have to be turned into a failed start:
+  // - a throw/rejection from the backend, preserved so callers see the crash itself
+  // - a wait that never resolves because the exit was not observed (a transport
+  //   still waiting for an ACK from a process that is already gone), bounded here
+  // A launch that never produced a session ID is never a session.
   const launch = async (): Promise<{ sessionId: string; model: string | null } | Error> => {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const deadline = new Promise<Error>((resolve) => {
+      timer = setTimeout(() => {
+        resolve(new ConfigError({ reason: `Backend launch did not acknowledge the session within ${launchTimeoutMs}ms` }))
+      }, launchTimeoutMs)
+      timer.unref?.()
+    })
     try {
-      return await backend.start(model === undefined ? undefined : { model })
+      const outcome = await Promise.race([backend.start(model === undefined ? undefined : { model }), deadline])
+      if (outcome instanceof Error) return outcome
+      const started = outcome as { sessionId?: unknown; model?: unknown }
+      if (typeof started.sessionId !== 'string' || !started.sessionId.trim()) {
+        return new ConfigError({ reason: 'Backend launch returned no session ID before acknowledging the session' })
+      }
+      return { sessionId: started.sessionId, model: typeof started.model === 'string' ? started.model : null }
     } catch (cause) {
       if (cause instanceof Error) return cause
       return new ConfigError({ reason: 'Backend launch crashed before acknowledging the session', cause })
+    } finally {
+      if (timer !== undefined) clearTimeout(timer)
     }
   }
 
