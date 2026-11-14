@@ -35,8 +35,10 @@ const thread = (value: unknown): value is NativeThread => record(value) && typeo
 //   item/agentMessage/delta -> { threadId, turnId, itemId, delta }
 //   turn/completed          -> { threadId, turn: { id, status, items, error } }
 // Server-initiated approval requests (item/commandExecution/requestApproval,
-// item/fileChange/requestApproval, item/tool/requestUserInput, ...) are NOT
-// answered by this client, so `answerApproval` stays unsupported.
+// item/fileChange/requestApproval) are held for an approval channel when one is
+// configured; otherwise they are refused with -32601. `answerApproval` is
+// therefore unsupported unless the controller was started with `approvals`.
+// Other server requests, such as item/tool/requestUserInput, remain refused.
 export type CodexControlMethod = 'thread/start' | 'thread/resume' | 'thread/read' | 'turn/start' | 'turn/interrupt'
 // `AskForApproval` in the generated schema, minus the granular variant this
 // client does not configure.
