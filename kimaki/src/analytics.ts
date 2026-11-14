@@ -10,8 +10,12 @@
 //   turn_completed      root session execution.succeeded    │ fed by the event
 //   tokens_used         every execution end, root and child ┘ loop
 //
-// tokens_used sums the durable session.step.ended usage of one execution, so
-// a bot restart never double counts. session.usage.updated is cumulative and
+// tokens_used sums the durable session.step.ended usage of one execution. Each
+// step is keyed by its durable log position (aggregateID:seq), so a reattach
+// that replays history replaces the same entries instead of adding to them, and
+// a retried attempt is counted once, for the attempt that billed it. A finished
+// execution stays in state with the positions it already reported, so a replay
+// of a completed turn emits nothing. session.usage.updated is cumulative and
 // live-only, so a delta needs a baseline the bot does not have after a restart.
 //
 // Off with --no-analytics or KIMAKI_STRADA_ENABLED=0, and under vitest unless
@@ -49,24 +53,55 @@ export type AnalyticsEvent = { name: AnalyticsEventName; properties: AnalyticsPr
 
 // --- pure fold over OpenCode events of Kimaki sessions ---
 
-type ExecutionUsage = {
-  startedAt: number
-  steps: number
+// One billed step, keyed by the durable position of its terminal event.
+type StepUsage = {
   input: number
   output: number
   reasoning: number
   cacheRead: number
   cacheWrite: number
   cost: number
+}
+
+type ExecutionUsage = {
+  // Durable position of session.execution.started (null for an execution seen
+  // only through its steps). Identical when a reattach replays the entry.
+  executionId: string | null
+  startedAt: number
+  // false once the execution ended: later step events of it are history.
+  active: boolean
+  // Executions whose tokens_used was already reported, kept after they end so
+  // a replayed turn stays silent.
+  reported: readonly string[]
+  steps: ReadonlyMap<string, StepUsage>
   model: string | null
   provider: string | null
 }
 
 export type UsageState = Readonly<Record<string, ExecutionUsage>>
 
-function without(state: UsageState, sessionId: string): UsageState {
-  const { [sessionId]: _removed, ...rest } = state
-  return rest
+// The durable position of an event. A replayed history entry keeps its
+// aggregate and sequence, so this is what makes the fold idempotent.
+function eventKey(event: Extract<V2Event, { durable: { aggregateID: string } }>): string {
+  return `${event.durable.aggregateID}:${event.durable.seq}`
+}
+
+function totals(steps: ReadonlyMap<string, StepUsage>) {
+  let input = 0
+  let output = 0
+  let reasoning = 0
+  let cacheRead = 0
+  let cacheWrite = 0
+  let cost = 0
+  for (const step of steps.values()) {
+    input += step.input
+    output += step.output
+    reasoning += step.reasoning
+    cacheRead += step.cacheRead
+    cacheWrite += step.cacheWrite
+    cost += step.cost
+  }
+  return { input, output, reasoning, cacheRead, cacheWrite, cost }
 }
 
 export function foldAnalytics({
@@ -81,54 +116,82 @@ export function foldAnalytics({
 }): { state: UsageState; events: AnalyticsEvent[] } {
   switch (event.type) {
     case 'session.execution.started': {
-      const usage: ExecutionUsage = { startedAt: event.created, steps: 0, input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0, model: null, provider: null }
-      const next = { ...state, [event.data.sessionID]: usage }
-      return { state: next, events: isRoot ? [{ name: 'turn_started', properties: {} }] : [] }
+      const sessionID = event.data.sessionID
+      const executionId = eventKey(event)
+      const previous = state[sessionID]
+      // A reattach replays this entry. Rebuild over what is already folded so
+      // the accumulation survives, and do not announce the turn twice.
+      if (previous && previous.executionId === executionId) {
+        const usage: ExecutionUsage = { ...previous, active: true }
+        return { state: { ...state, [sessionID]: usage }, events: [] }
+      }
+      const usage: ExecutionUsage = {
+        executionId,
+        startedAt: event.created,
+        active: true,
+        reported: previous?.reported ?? [],
+        steps: new Map(),
+        model: null,
+        provider: null,
+      }
+      return { state: { ...state, [sessionID]: usage }, events: isRoot ? [{ name: 'turn_started', properties: {} }] : [] }
     }
     case 'session.step.started': {
       const current = state[event.data.sessionID]
-      if (!current) return { state, events: [] }
+      if (!current || !current.active) return { state, events: [] }
       const usage = { ...current, model: event.data.model.id, provider: event.data.model.providerID }
       return { state: { ...state, [event.data.sessionID]: usage }, events: [] }
     }
     // A failed step (abort, provider error) is billed too.
     case 'session.step.ended':
     case 'session.step.failed': {
-      const current = state[event.data.sessionID]
+      const sessionID = event.data.sessionID
+      const current = state[sessionID]
       const { tokens, cost = 0 } = event.data
-      if (!current || !tokens) return { state, events: [] }
+      if (!current || !current.active || !tokens) return { state, events: [] }
+      // Same durable step replayed: overwrite it, do not add it again. A retry
+      // is a new step at a new sequence, so it lands as its own entry.
+      const steps = new Map(current.steps)
+      steps.set(eventKey(event), {
+        input: tokens.input,
+        output: tokens.output,
+        reasoning: tokens.reasoning,
+        cacheRead: tokens.cache.read,
+        cacheWrite: tokens.cache.write,
+        cost,
+      })
       const usage: ExecutionUsage = {
         ...current,
-        steps: current.steps + 1,
-        input: current.input + tokens.input,
-        output: current.output + tokens.output,
-        reasoning: current.reasoning + tokens.reasoning,
-        cacheRead: current.cacheRead + tokens.cache.read,
-        cacheWrite: current.cacheWrite + tokens.cache.write,
-        cost: current.cost + cost,
+        steps,
       }
-      return { state: { ...state, [event.data.sessionID]: usage }, events: [] }
+      return { state: { ...state, [sessionID]: usage }, events: [] }
     }
     case 'session.execution.succeeded':
     case 'session.execution.failed':
     case 'session.execution.interrupted': {
-      const usage = state[event.data.sessionID]
-      const next = without(state, event.data.sessionID)
+      const sessionID = event.data.sessionID
+      const usage = state[sessionID]
+      if (!usage) return { state, events: [] }
+      const idle: ExecutionUsage = { ...usage, active: false }
+      const next = { ...state, [sessionID]: idle }
+      // Replay of a turn already reported: history, not new usage.
+      if (usage.executionId !== null && usage.reported.includes(usage.executionId)) return { state: next, events: [] }
       // Not seen from the start (bot restarted mid-run), or no model step (compaction).
-      if (!usage || usage.steps === 0) return { state: next, events: [] }
+      if (!usage.active || usage.steps.size === 0) return { state: next, events: [] }
+      const { input, output, reasoning, cacheRead, cacheWrite, cost } = totals(usage.steps)
       // OpenCode reports output without reasoning, but bills both.
-      const total = usage.input + usage.output + usage.reasoning + usage.cacheRead + usage.cacheWrite
+      const total = input + output + reasoning + cacheRead + cacheWrite
       const tokensUsed: AnalyticsEvent = {
         name: 'tokens_used',
         properties: {
-          tokens_input: usage.input,
-          tokens_output: usage.output,
-          tokens_reasoning: usage.reasoning,
-          tokens_cache_read: usage.cacheRead,
-          tokens_cache_write: usage.cacheWrite,
+          tokens_input: input,
+          tokens_output: output,
+          tokens_reasoning: reasoning,
+          tokens_cache_read: cacheRead,
+          tokens_cache_write: cacheWrite,
           tokens_total: total,
-          cost: usage.cost,
-          assistant_message_count: usage.steps,
+          cost,
+          assistant_message_count: usage.steps.size,
           is_subagent: !isRoot,
           ...(usage.model && { model: usage.model }),
           ...(usage.provider && { provider: usage.provider }),
@@ -139,7 +202,11 @@ export function foldAnalytics({
           ? [{ name: 'turn_completed', properties: { duration_sec: Math.round((event.created - usage.startedAt) / 1000) } }]
           : []
       // Zero-token executions are skipped, like V1.
-      return { state: next, events: [...(total > 0 || usage.cost > 0 ? [tokensUsed] : []), ...completed] }
+      const reported = usage.executionId === null ? usage.reported : [...usage.reported, usage.executionId]
+      return {
+        state: { ...state, [sessionID]: { ...idle, reported } },
+        events: [...(total > 0 || cost > 0 ? [tokensUsed] : []), ...completed],
+      }
     }
     default:
       return { state, events: [] }
