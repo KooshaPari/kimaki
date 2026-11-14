@@ -12,12 +12,12 @@ Checksums from the bundle's own `SHA256SUMS.txt`: 7 of 7 documents match.
 
 | Status | Cases |
 | --- | --- |
-| Closed at the plan's standard | 10 |
-| Partial | 16 |
+| Closed at the plan's standard | 11 |
+| Partial | 15 |
 | Not started | 14 |
 | Total | 40 |
 
-AC03, AC04, AC06, AC07, AC13, AC14, AC17, AC18, AC23 and AC25 are closed. Every other case still lacks both a real native surface and a live service path in the same piece of evidence, which is the standard the plan sets. AC18 closed when a real Codex 0.169 app-server raised an approval request and the client's answer changed what the runtime executed. AC19 is partial: a payload digest pins an answer to the artifact the caller read, but fileChange content is not covered and no real-binary digest witness exists. AC20 is partial: a stub 401 and an emptied token fail closed, but no live Discord credential was revoked. AC33 is partial: a local JSON backup restores binding ids, generations, state and route ownership, but not an external store or a live cutover. AC38 is partial: the view guard is proven against a live session change from a fake hub, not a real `createSessionHub` rebind path.
+AC03, AC04, AC06, AC07, AC11, AC13, AC14, AC17, AC18, AC23 and AC25 are closed. Every other case still lacks both a real native surface and a live service path in the same piece of evidence, which is the standard the plan sets. AC18 closed when a real Codex 0.169 app-server raised an approval request and the client's answer changed what the runtime executed. AC19 is partial: a payload digest pins an answer to the artifact the caller read, but fileChange content is not covered and no real-binary digest witness exists. AC20 is partial: a stub 401 and an emptied token fail closed, but no live Discord credential was revoked. AC33 is partial: a local JSON backup restores binding ids, generations, state and route ownership, but not an external store or a live cutover. AC38 is partial: the view guard is proven against a live session change from a fake hub, not a real `createSessionHub` rebind path.
 
 ## Acceptance cases
 
@@ -33,9 +33,9 @@ AC03, AC04, AC06, AC07, AC13, AC14, AC17, AC18, AC23 and AC25 are closed. Every 
 | AC08 | Unknown process | partial | herdr unknown identities are surfaced without invention; no PID-reuse case |
 | AC09 | PID reuse/runtime restart | not started | no PID-reuse or runtime-restart separation case |
 | AC10 | Wrong backend fallback | not started | no wrong-binary, wrong-profile or wrong-provider negative case |
-| AC11 | Unsupported capability | partial | capabilities declare unsupported operations and the CLI refuses them; no per-operation pre-dispatch test |
+| AC11 | Unsupported capability | closed | each refusal is decided before dispatch and tested that way: a control binding is refused by the mode gate before any write, a Codex hub prompt before its thread exists is refused with **zero** control calls dispatched, a duplicate hub client id is refused rather than silently replaced, and a publication without `--consent` never reaches Discord. Capabilities also declare the unsupported operations with reasons |
 | AC12 | JCode text correction | not started | the native surface does not exist. A real jcode 0.99.1 ACP turn emits only `available_commands_update`, `agent_message_chunk` and `usage_update`, and its `agentCapabilities` declares `loadSession`, `promptCapabilities` and `sessionCapabilities` (close, resume) with no retraction or correction surface. A probe whose model restated a misspelling delivered both strings as ordinary chunks. `client.test.ts` proves an unknown update kind is ignored rather than rendered as a fabricated correction. Separately measured: `session/load` answers success for an id that does not exist and replays nothing, so `ops jcode history` refuses an empty replay (exit 1 with a naming message) unless `--allow-empty` is passed, rather than letting "0 messages" read as a real session. Gated on an agent-side surface, not on client work |
-| AC13 | Stream gap/overflow | closed | `hub.test.ts` covers the explicit gap path: a cursor behind the retained buffer returns `clipped: true` with the retained tail, a cursor at the head returns `clipped: false`, and a durable log replays in full from cursor 0. Observed cursor values and delivered event ids recorded in the test; 27 hub tests and `tsc` clean at `d9b1bf31` |
+| AC13 | Stream gap/overflow | closed | `hub.test.ts` covers the explicit gap path: a cursor behind the retained buffer returns `clipped: true` with the retained tail, a cursor at the head returns `clipped: false`, and a durable log replays in full from cursor 0. Observed cursor values and delivered event ids recorded in the test; 31 hub tests and `tsc` clean |
 | AC14 | Duplicate incoming event | closed | real run through the public CLI and HTTP API: first submit admitted with `duplicate: false`, the same request id returned `duplicate: true` without a second turn, the sequence advanced exactly once (4), the same id with different text was refused with 409, and a fresh id was admitted |
 | AC15 | Crash after launch before ACK | not started | no crash-after-launch-before-ack case |
 | AC16 | Competing managed launch paths | partial | the hub lease refuses a second writer; no Paperclip launcher fencing |
@@ -76,15 +76,16 @@ AC03, AC04, AC06, AC07, AC13, AC14, AC17, AC18, AC23 and AC25 are closed. Every 
 | WP5 | JCode/KCode adapters | partial | ACP backend, CLI, hub, durable stream, presence, ack and a Discord view of a live session verified; KCode identity absent and Jcode exposes no retraction or correction surface |
 | WP6 | Paperclip plugin and runtime adapter | partial | run metadata read and a local-command managed run; no entity projection or enrollment, model-backed run blocked |
 | WP7 | Discord comparison and route ownership | partial | consent-gated metadata publication, a live channel view of a hub session (`ops discord view`) with durable resume, and a native-session mirror (`ops jcode watch --tenant/--surface/--state`) that posted four real messages from a terminal session it did not start, with a durable index; no in-bot wiring, route ownership or cutover |
-| WP8 | Reliability and acceptance witnesses | partial | 61 backend tests plus 27 hub, 15 ACP client, 43 Codex control, 5 Codex transport, 4 Codex hub, 9 publication, 13 Discord view, 7 native mirror and 17 binding tests; three real witnesses (three clients on one jcode hub, native terminal mirrored into a channel, real Codex thread served and mirrored); test-suite gate baseline recorded in `docs/release-gate-2026-11-14.md` |
+| WP8 | Reliability and acceptance witnesses | partial | 61 backend tests plus 31 hub, 16 ACP client, 43 Codex control, 5 Codex transport, 4 Codex hub, 9 publication, 13 Discord view, 7 native mirror and 17 binding tests; three real witnesses (three clients on one jcode hub, native terminal mirrored into a channel, real Codex thread served and mirrored); test-suite gate baseline recorded in `docs/release-gate-2026-11-14.md` |
 | WP9 | Migration and retirement | not started | decision matrix and rollback rehearsal only; nothing drained or retired |
 
 ## What would move the most cases
 
-1. A live Discord view bound to an external session closes AC03, AC06 and part of AC07, AC26.
-2. Codex control is now exercised for AC03, AC04, AC17 and AC18, including a real approval request answered by both the CLI and the served hub.
-3. A Paperclip external-session entity closes AC29 and unblocks AC30, AC22.
-4. Failure-path cases (AC07, AC13, AC14, AC16, AC23, AC25, AC37) are cheap and need no new environment.
+1. A Paperclip external-session entity closes AC29 and unblocks AC30 and AC22. This is now the single largest lever.
+2. A live route change between two running sessions closes AC05; today rebind is proven only as a fail-closed guard.
+3. Native process oracles close AC08, AC09, AC10 and AC24: PID reuse, a wrong backend, and a synthetic engine are all identity questions with no evidence yet.
+4. Remaining failure paths that need no new environment: AC11 (per-operation refusal before spawn), AC15 (crash after launch before ack), AC19 (artifact changed after approval), AC20 (credential revocation), AC21 (kill/revoke race), AC26 (echo suppression) and AC27 (cold backlog).
+5. AC12 stays blocked on an agent-side correction surface; jcode 0.99.1 exposes none.
 
 ## Mutation validation (2026-11-14)
 

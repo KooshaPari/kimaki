@@ -53,9 +53,11 @@ describe('Codex hub backend', () => {
   })
 
   it('refuses a prompt before the thread exists and surfaces start failures', async () => {
-    const { controller } = fake({ start: 'app-server refused' })
+    const { controller, calls } = fake({ start: 'app-server refused' })
     const backend = createCodexHubBackend({ controller, cwd: 'C:/work' })
     expect(await backend.prompt('hi')).toBeInstanceOf(Error)
+    // The refusal is decided before any control dispatch: nothing was sent.
+    expect(calls).toEqual([])
     const failure = await backend.start()
     expect(failure).toBeInstanceOf(Error)
     expect((failure as Error).message).toMatch(/refused/)
