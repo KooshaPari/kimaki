@@ -390,6 +390,7 @@ export function registerOpsCommands(cli: Goke) {
     .option('--client <id>', 'Client identity to register in hub presence')
     .option('--cursor <n>', 'Start from this cursor (default: 0)')
     .option('--prompt <text>', 'Submit one prompt after attaching')
+    .option('--request-id <id>', 'Idempotency id for the prompt; a repeat refers to the existing receipt')
     .option('--ack', 'Acknowledge the last sequence once a turn finishes')
     .option('--watch <ms>', 'Stream without prompting for at most this long, then detach')
     .option('--timeout <ms>', 'Maximum attach duration in milliseconds (default: 120000)')
@@ -459,7 +460,7 @@ export function registerOpsCommands(cli: Goke) {
       }
 
       if (options.prompt !== undefined) {
-        const submitted = await promptHub({ baseUrl: url, text: options.prompt })
+        const submitted = await promptHub({ baseUrl: url, text: options.prompt, requestId: options.requestId })
         if (submitted instanceof Error) {
           controller.abort()
           await attach

@@ -97,7 +97,7 @@ describe('startHubServer', () => {
       body: JSON.stringify({ text: 'hello' }),
     })
     expect(posted.status).toBe(202)
-    expect(await posted.json()).toEqual({ accepted: true, characters: 5 })
+    expect(await posted.json()).toMatchObject({ accepted: true, characters: 5 })
 
     for (const result of [await first, await second]) {
       expect(result.ready).toMatchObject({ cursor: 0, clipped: false, source: 'none' })

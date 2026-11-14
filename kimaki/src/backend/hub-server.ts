@@ -2,7 +2,7 @@
 // one live backend session at the same time.
 //
 // GET  /state            hub snapshot, including attached clients and their acks
-// POST /prompt  {text}   submit one turn (single writer, refused while busy)
+// POST /prompt  {text, requestId?}  submit one turn; a repeated requestId refers to the receipt
 // POST /cancel           cancel the running turn
 // POST /ack {client, seq} record how far a client has processed the stream
 // GET  /events?cursor=N&client=<id>  server-sent events, replayed from the cursor then live
@@ -60,7 +60,8 @@ export async function startHubServer({
         const body = await readBody(request)
         const text = typeof body === 'object' && body !== null ? (body as Record<string, unknown>)['text'] : undefined
         if (typeof text !== 'string') return json(response, 400, { error: 'prompt body needs a text string' })
-        const result = await hub.submit(text)
+        const requestId = typeof body === 'object' && body !== null ? (body as Record<string, unknown>)['requestId'] : undefined
+        const result = await hub.submit(text, typeof requestId === 'string' ? { requestId } : undefined)
         if (result instanceof Error) return json(response, 409, { error: result.message })
         return json(response, 202, result)
       }

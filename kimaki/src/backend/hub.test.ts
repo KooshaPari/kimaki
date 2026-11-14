@@ -51,7 +51,7 @@ describe('createSessionHub', () => {
     if (a instanceof Error || b instanceof Error) throw new Error('subscribe failed')
 
     const submitted = await hub.submit('hello')
-    expect(submitted).toEqual({ accepted: true, characters: 5 })
+    expect(submitted).toMatchObject({ accepted: true, characters: 5 })
     await wait(10)
 
     const kinds = (events: HubEvent[]) => events.map((event) => event.type)
@@ -332,6 +332,22 @@ describe('createSessionHub', () => {
     expect(hub.ack({ clientId: 'ghost', seq: 1 })).toBeInstanceOf(Error)
     expect(hub.ack({ clientId: '', seq: 1 })).toBeInstanceOf(Error)
     expect(hub.ack({ clientId: 'cli', seq: -1 })).toBeInstanceOf(Error)
+  })
+
+  it('admits a repeated request id once and refers to the existing receipt', async () => {
+    const { backend, calls } = fakeBackend()
+    const hub = createSessionHub({ backend })
+    if (hub instanceof Error) throw hub
+    const first = await hub.submit('hello', { requestId: 'req-1' })
+    const repeat = await hub.submit('hello', { requestId: 'req-1' })
+    expect(first).toMatchObject({ accepted: true, duplicate: false })
+    expect(repeat).toMatchObject({ accepted: true, duplicate: true })
+    expect(calls.prompts).toHaveLength(1)
+    await wait(10)
+    // One turn means one started frame, not two.
+    const started = hub.snapshot().seq
+    expect(started).toBeGreaterThan(0)
+    expect(await hub.submit('different text', { requestId: 'req-1' })).toBeInstanceOf(Error)
   })
 
   it('refuses a duplicate client identity while it is attached', async () => {

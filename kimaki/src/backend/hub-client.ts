@@ -47,16 +47,16 @@ export async function readHubState(options: HubClientOptions): Promise<HubSnapsh
   }
 }
 
-export async function promptHub(options: HubClientOptions & { text: string }): Promise<{ accepted: boolean; characters: number } | Error> {
+export async function promptHub(options: HubClientOptions & { text: string; requestId?: string }): Promise<{ accepted: boolean; characters: number; duplicate: boolean } | Error> {
   const response = await call(options, '/prompt', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ text: options.text }),
+    body: JSON.stringify(options.requestId === undefined ? { text: options.text } : { text: options.text, requestId: options.requestId }),
   })
   if (response instanceof Error) return response
   if (!response.ok) return new ConfigError({ reason: `Hub refused the prompt with status ${response.status}` })
   try {
-    return (await response.json()) as { accepted: boolean; characters: number }
+    return (await response.json()) as { accepted: boolean; characters: number; duplicate: boolean }
   } catch (cause) {
     return new ConfigError({ reason: 'Hub returned a prompt body that is not JSON', cause })
   }

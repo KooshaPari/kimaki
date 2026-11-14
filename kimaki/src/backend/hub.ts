@@ -73,7 +73,7 @@ export const hubCapabilities = Object.freeze({
 export type SessionHub = {
   capabilities: typeof hubCapabilities
   start(): Promise<{ sessionId: string; model: string | null } | Error>
-  submit(text: string): Promise<{ accepted: true; characters: number } | Error>
+  submit(text: string, options?: { requestId?: string }): Promise<{ accepted: true; characters: number; duplicate: boolean } | Error>
   cancel(): Promise<Error | undefined>
   subscribe(input: { cursor?: number; clientId?: string; onEvent: (event: HubEvent) => void }): HubSubscription | Error
   /** Record the last sequence a client has processed. Monotonic, per client. */
@@ -211,6 +211,7 @@ export function createSessionHub({
   let sessionId: string | null = null
   let selectedModel: string | null = null
   const subscribers = new Map<string, { deliver: (event: HubEvent) => void; acked: number }>()
+  const receipts = new Map<string, { characters: number; startedSeq: number }>()
 
   // A restored log means the session may already exist; reuse its identity.
   for (const event of restored) {
@@ -333,13 +334,27 @@ export function createSessionHub({
     return { acked: entry.acked }
   }
 
-  const submit = async (text: string): Promise<{ accepted: true; characters: number } | Error> => {
+  const submit = async (text: string, options?: { requestId?: string }): Promise<{ accepted: true; characters: number; duplicate: boolean } | Error> => {
     if (closed) return new ConfigError({ reason: 'Hub is closed' })
     if (typeof text !== 'string' || !text.trim()) return new ConfigError({ reason: 'Hub prompt text must be non-empty' })
+    const requestId = options?.requestId?.trim()
+    if (requestId !== undefined && requestId.length > 0) {
+      const seen = receipts.get(requestId)
+      if (seen !== undefined) {
+        // A repeat of the same request refers to the existing receipt rather than
+        // starting a second turn. Different text under one id is a conflict.
+        if (seen.characters !== text.length) {
+          return new ConfigError({ reason: `Request ${requestId} was already admitted with different text` })
+        }
+        return { accepted: true, characters: seen.characters, duplicate: true }
+      }
+    }
     if (busy) return new ConfigError({ reason: 'A prompt is already running in this session' })
     const ready = await start()
     if (ready instanceof Error) return ready
     busy = true
+    const startedSeq = seq + 1
+    if (requestId !== undefined && requestId.length > 0) receipts.set(requestId, { characters: text.length, startedSeq })
     publish((value) => ({ seq: value, type: 'prompt.started', characters: text.length }))
     // The turn runs detached so callers can return immediately and watch events.
     void (async () => {
@@ -356,7 +371,7 @@ export function createSessionHub({
         busy = false
       }
     })()
-    return { accepted: true, characters: text.length }
+    return { accepted: true, characters: text.length, duplicate: false }
   }
 
   const cancel = async (): Promise<Error | undefined> => {

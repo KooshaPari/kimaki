@@ -69,7 +69,7 @@ describe('hub client', () => {
 
     await new Promise((resolve) => setTimeout(resolve, 100))
     const submitted = await promptHub({ baseUrl: server.url, text: 'hello' })
-    expect(submitted).toEqual({ accepted: true, characters: 5 })
+    expect(submitted).toMatchObject({ accepted: true, characters: 5 })
     await finished
 
     // Acknowledge while still attached: presence ends with the connection.
