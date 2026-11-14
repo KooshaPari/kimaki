@@ -624,6 +624,7 @@ export function registerOpsCommands(cli: Goke) {
     .option('--interval <ms>', 'Polling interval in milliseconds (default: 2000)')
     .option('--iterations <n>', 'Stop after this many polls; 0 keeps polling (default: 0)')
     .option('--emit-existing', 'Emit history already present at attach time')
+    .option('--allow-empty', 'Accept a session whose first poll replays no history')
     .option('--tenant <id>', 'Discord guild ID')
     .option('--surface <id>', 'Discord channel ID')
     .option('--token <token>', 'Bot token (default: KIMAKI_BOT_TOKEN)')
@@ -669,6 +670,13 @@ export function registerOpsCommands(cli: Goke) {
         await client.close()
         if (loaded instanceof Error) {
           failure = loaded
+          break
+        }
+        // jcode answers session/load successfully for an id that does not exist
+        // and replays nothing, so an empty first poll is ambiguous: following it
+        // would poll forever and never report anything. Refuse it explicitly.
+        if (polls === 0 && loaded.history.length === 0 && options.allowEmpty !== true) {
+          failure = new ConfigError({ reason: 'The agent replayed no history on the first poll; jcode 0.99.1 also returns success for an unknown session id, so this is refused unless --allow-empty is given' })
           break
         }
         if (watermark === null) {

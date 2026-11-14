@@ -314,6 +314,12 @@ Sixth pass:
 | Rebind upgrade safety | a state file in the older `{seq}` shape, with a live view then a new turn | resumed rather than refused, posted exactly the new turn, and the file was upgraded in place to include `sessionId`, so an upgrade does not silently stall existing views |
 | AC13 concurrent cursors | one subscriber at cursor 0 (clipped) and one at the head, then a second live turn | the clipped subscriber held the tail `3,4` plus the live `5,6,7`, the live subscriber held only `5,6,7`, and the hub reported two subscribers, so replay choice does not leak between clients |
 
+Seventh pass:
+
+| Area | What was checked | Observed |
+| --- | --- | --- |
+| AC12 unknown session in the watcher | `ops jcode watch --session session_does_not_exist --iterations 1` | **defect fixed**: before this it polled silently and exited 0 with nothing reported, because jcode answers `session/load` successfully for a missing id. The first poll now refuses an empty history (exit 1, message naming the ambiguity) and `--allow-empty` opts back in (exit 0). The same command against a real session still exits 0 |
+
 Backup restore and live rebind, 2026-11-14:
 
 | Case | Evidence |
