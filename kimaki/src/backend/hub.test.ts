@@ -402,6 +402,124 @@ describe('createSessionHub', () => {
     expect(other.snapshot().clients).toContainEqual({ clientId: 'cli', acked: 0 })
   })
 
+  // AC13: A gap between what a client has seen and what the hub can still replay
+  // must be explicit. The hub may not claim clipped:false while silently dropping
+  // events, and every replay must still leave the client able to resume forward.
+  describe('AC13 stream gap and overflow', () => {
+    const turnSeqs = (events: HubEvent[]) => events.map((event) => event.seq)
+
+    const expectContiguousFrom = (events: HubEvent[], requestedCursor: number) => {
+      const seqs = turnSeqs(events)
+      expect(seqs.length).toBeGreaterThan(0)
+      // Nothing at or below the requested cursor is re-delivered.
+      expect(seqs[0]!).toBeGreaterThan(requestedCursor)
+      // No hole inside what was delivered: it is a tail, not a sample.
+      for (let index = 1; index < seqs.length; index += 1) {
+        expect(seqs[index]!).toBe(seqs[index - 1]! + 1)
+      }
+    }
+
+    it('reports clipped with no log, delivers only the buffered tail, and leaves a forward cursor', async () => {
+      const { backend } = fakeBackend()
+      const hub = createSessionHub({ backend, bufferLimit: 2 })
+      if (hub instanceof Error) throw hub
+      await hub.submit('hello')
+      await wait(10)
+      expect(hub.snapshot().durable).toBe(false)
+
+      const seen: HubEvent[] = []
+      const subscription = hub.subscribe({ cursor: 0, onEvent: (event) => seen.push(event) })
+      if (subscription instanceof Error) throw subscription
+
+      // The gap is announced rather than hidden.
+      expect(subscription.clipped).toBe(true)
+      // There is no disk to fall back on, so the only replayable source is the
+      // in-memory tail; `clipped` is what carries the honesty about the gap.
+      expect(subscription.source).toBe('buffer')
+      // Only the buffered tail survived; events 1 and 2 are honestly gone.
+      expect(turnSeqs(seen)).toEqual([3, 4])
+      // The returned cursor is the latest sequence, so a client resumes forward
+      // instead of replaying the same gap forever.
+      expect(subscription.cursor).toBe(4)
+      expect(subscription.cursor).toBe(hub.snapshot().seq)
+    })
+
+    it('reports not clipped with a log, replaying every event from disk in order', async () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-hub-ac13-log-'))
+      const logFile = path.join(dir, 'events.jsonl')
+      try {
+        const hub = createSessionHub({ backend: fakeBackend().backend, logFile, bufferLimit: 2 })
+        if (hub instanceof Error) throw hub
+        await hub.submit('hello')
+        await wait(10)
+
+        const seen: HubEvent[] = []
+        const subscription = hub.subscribe({ cursor: 0, onEvent: (event) => seen.push(event) })
+        if (subscription instanceof Error) throw subscription
+
+        // The same cursor that is clipped without a log is complete with one.
+        expect(subscription.clipped).toBe(false)
+        expect(subscription.source).toBe('log')
+        expect(turnSeqs(seen)).toEqual([1, 2, 3, 4])
+        expect(subscription.cursor).toBe(4)
+        await hub.close()
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true })
+      }
+    })
+
+    it('resumes from a cursor inside the buffer without re-delivering older events', async () => {
+      const { backend } = fakeBackend()
+      const hub = createSessionHub({ backend, bufferLimit: 2 })
+      if (hub instanceof Error) throw hub
+      await hub.submit('hello')
+      await wait(10)
+
+      const seen: HubEvent[] = []
+      const subscription = hub.subscribe({ cursor: 3, onEvent: (event) => seen.push(event) })
+      if (subscription instanceof Error) throw subscription
+
+      // The cursor sits at the oldest buffered sequence, so this is a normal
+      // in-buffer resume rather than a gap.
+      expect(turnSeqs(seen)).toEqual([4])
+      expect(subscription.clipped).toBe(false)
+      expect(subscription.source).toBe('buffer')
+      expect(subscription.cursor).toBe(4)
+    })
+
+    it('never claims not clipped while dropping events in the no-log case', async () => {
+      const { backend } = fakeBackend()
+      const hub = createSessionHub({ backend, bufferLimit: 2 })
+      if (hub instanceof Error) throw hub
+      await hub.submit('hello')
+      await wait(10)
+
+      for (const requestedCursor of [0, 1]) {
+        const seen: HubEvent[] = []
+        const subscription = hub.subscribe({ cursor: requestedCursor, onEvent: (event) => seen.push(event) })
+        if (subscription instanceof Error) throw subscription
+
+        if (subscription.clipped) {
+          // A reported gap means the hub may only show the surviving tail, and
+          // that tail must be contiguous and start strictly after the cursor.
+          expectContiguousFrom(seen, requestedCursor)
+          expect(turnSeqs(seen)).toEqual([3, 4])
+        } else {
+          // If the hub hides nothing, it must truly have every event past the cursor.
+          expect(turnSeqs(seen)).toEqual([1, 2, 3, 4].filter((seq) => seq > requestedCursor))
+        }
+      }
+
+      // Clipped is a property of the request, not a lie about the stream: once the
+      // cursor reaches the oldest buffered sequence the hub is honest again.
+      const covered: HubEvent[] = []
+      const coveredSubscription = hub.subscribe({ cursor: 2, onEvent: (event) => covered.push(event) })
+      if (coveredSubscription instanceof Error) throw coveredSubscription
+      expect(coveredSubscription.clipped).toBe(false)
+      expect(turnSeqs(covered)).toEqual([3, 4])
+    })
+  })
+
   it('clamps a stale ack file entry to the restored sequence', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-hub-acks-clamp-'))
     const logFile = path.join(dir, 'events.jsonl')
