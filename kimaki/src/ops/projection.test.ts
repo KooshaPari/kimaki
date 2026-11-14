@@ -1,4 +1,8 @@
 import { describe, expect, test } from 'vitest'
+import { ConfigError } from '../errors.js'
+import { enrollSession } from './paperclip/enrollment.ts'
+import type { PaperclipObservedEntity } from './paperclip/project.ts'
+import { projectObservedSession } from './paperclip/project.ts'
 import { createProjection, projectEvent, fromOpenCodeObservedEvent } from './projection.ts'
 import type { OpenCodeObservedEvent } from './runtime/opencode.ts'
 
@@ -44,5 +48,100 @@ describe('metadata projection', () => {
     expect(fromOpenCodeObservedEvent({ ...observed, source: { ...observed.source, endpointId: 'other' } }).kind).toBe('identity-mismatch')
     expect(fromOpenCodeObservedEvent({ ...observed, raw: { id: 'event', created: 1, type: 'session.renamed', data: { sessionID: 'other', title: 'private' }, durable: { aggregateID: 'aggregate', seq: 4, version: 1 } } }).kind).toBe('identity-mismatch')
     expect(fromOpenCodeObservedEvent({ ...observed, raw: { id: 'event', created: 1, type: 'session.text.delta', data: { sessionID: key.nativeSessionId, assistantMessageID: 'message', ordinal: 0, delta: 'private' } } }).kind).toBe('unsupported-evidence')
+  })
+})
+
+describe('paperclip observed-session projection', () => {
+  const enrolled = enrollSession({
+    action: 'enroll',
+    session,
+    runtime: { backendKind: 'native', endpointId: 'endpoint', version: '2.0.29' },
+    surface: 'paperclip',
+    mode: 'observe',
+    publication: 'none',
+    createdAt: '2026-11-14T21:00:00.000Z',
+  })
+  if (enrolled instanceof ConfigError) throw enrolled
+  const enrollment = enrolled.record
+  const observedAt = '2026-11-14T21:05:00.000Z'
+
+  function entity(overrides: Record<string, unknown> = {}): PaperclipObservedEntity {
+    const result = projectObservedSession({
+      enrollment,
+      session,
+      metadata: { runtimeVersion: '2.0.29', observedAt },
+      ...overrides,
+    })
+    if (result instanceof ConfigError) throw result
+    return result
+  }
+
+  test('projects an enrolled session idempotently with a stable derived entity', () => {
+    const first = entity()
+    const second = entity()
+    expect(second).toEqual(first)
+    expect(JSON.stringify(second)).toBe(JSON.stringify(first))
+    expect(first).toMatchObject({
+      kind: 'paperclip-observed-session',
+      version: 1,
+      ownership: 'external-observe',
+      policy: { mode: 'observe', publication: 'none', writes: false, dispatch: false },
+      observed: {
+        hostId: session.hostId,
+        endpointId: session.endpointId,
+        backendKind: session.backendKind,
+        nativeSessionId: session.nativeSessionId,
+        runtimeVersion: '2.0.29',
+        observedAt,
+        enrolledAt: '2026-11-14T21:00:00.000Z',
+      },
+    })
+    expect(first.entityId).toMatch(/^pc_[0-9a-f]{32}$/)
+    expect(first.digest).toMatch(/^sha256:[0-9a-f]{64}$/)
+    expect(first.externalRef).toEqual({
+      system: 'kimaki',
+      enrollmentId: enrollment.enrollmentId,
+      sessionId: JSON.stringify([session.hostId, session.endpointId, session.backendKind, session.nativeSessionId]),
+    })
+    expect(first).not.toHaveProperty('transcript')
+    expect(JSON.stringify(first)).not.toContain('secret')
+  })
+
+  test('refuses an unenrolled session instead of inventing an entity', () => {
+    const none = projectObservedSession({ enrollment: null, session, metadata: {} })
+    expect(none).toBeInstanceOf(ConfigError)
+    expect((none as Error).message).toMatch(/enrollment/)
+    const other = projectObservedSession({
+      enrollment,
+      session: { ...session, nativeSessionId: 'other' },
+      metadata: {},
+    })
+    expect(other).toBeInstanceOf(ConfigError)
+    expect((other as Error).message).toMatch(/not the enrolled session/)
+    expect(other).not.toHaveProperty('entityId')
+  })
+
+  test('a mutated session changes only the derived fields', () => {
+    const before = entity()
+    const after = entity({ metadata: { runtimeVersion: '9.9.9', observedAt: '2026-11-14T22:00:00.000Z' } })
+    const { observed: observedBefore, digest: digestBefore, ...restBefore } = before
+    const { observed: observedAfter, digest: digestAfter, ...restAfter } = after
+    expect(restAfter).toEqual(restBefore)
+    expect(observedAfter).toEqual({
+      ...observedBefore,
+      runtimeVersion: '9.9.9',
+      observedAt: '2026-11-14T22:00:00.000Z',
+    })
+    expect(digestAfter).not.toBe(digestBefore)
+  })
+
+  test('refuses a tampered enrollment record', () => {
+    const tampered = { ...enrollment, createdAt: '2020-01-01T00:00:00.000Z' }
+    const refused = projectObservedSession({ enrollment: tampered, session, metadata: {} })
+    expect(refused).toBeInstanceOf(ConfigError)
+    expect((refused as Error).message).toMatch(/digest/)
+    const widened = projectObservedSession({ enrollment: { ...enrollment, mode: 'control' }, session, metadata: {} })
+    expect(widened).toBeInstanceOf(ConfigError)
+    expect((widened as Error).message).toMatch(/mode/)
   })
 })
