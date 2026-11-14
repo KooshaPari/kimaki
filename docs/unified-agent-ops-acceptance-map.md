@@ -13,11 +13,11 @@ Checksums from the bundle's own `SHA256SUMS.txt`: 7 of 7 documents match.
 | Status | Cases |
 | --- | --- |
 | Closed at the plan's standard | 10 |
-| Partial | 13 |
-| Not started | 17 |
+| Partial | 14 |
+| Not started | 16 |
 | Total | 40 |
 
-AC03, AC04, AC06, AC07, AC13, AC14, AC17, AC18, AC23 and AC25 are closed. Every other case still lacks both a real native surface and a live service path in the same piece of evidence, which is the standard the plan sets. AC18 closed when a real Codex 0.169 app-server raised an approval request and the client's answer changed what the runtime executed.
+AC03, AC04, AC06, AC07, AC13, AC14, AC17, AC18, AC23 and AC25 are closed. Every other case still lacks both a real native surface and a live service path in the same piece of evidence, which is the standard the plan sets. AC18 closed when a real Codex 0.169 app-server raised an approval request and the client's answer changed what the runtime executed. AC19 is partial: a payload digest pins an answer to the artifact the caller read, but fileChange content is not covered and no real-binary digest witness exists. AC20 is partial: a stub 401 and an emptied token fail closed, but no live Discord credential was revoked.
 
 ## Acceptance cases
 
@@ -41,8 +41,8 @@ AC03, AC04, AC06, AC07, AC13, AC14, AC17, AC18, AC23 and AC25 are closed. Every 
 | AC16 | Competing managed launch paths | partial | the hub lease refuses a second writer; no Paperclip launcher fencing |
 | AC17 | Cancel request | closed | a real codex 0.169 app-server turn was interrupted mid-flight through `ops codex turn --cancel-after 2500` against a deliberately slow local model: the CLI printed `cancel-requested` and the turn settled with `"status": "interrupted"` and empty text, which is the native turn state. The hub also accepts a cancel and stays inert when idle |
 | AC18 | Approval race/replay | closed | `startCodexAppServer` holds a server-initiated request instead of failing it with `-32601`; `createCodexController` surfaces the full payload (command, cwd, kind, grantRoot, approvalId, startedAtMs), applies an opt-in policy, and answers exactly once. A replay, an unknown id, an id the transport dropped, and a second racing answer are each refused by name. Invalid policy decisions fail closed to `decline`; `humanCommand` refuses `acceptForSession`; `item/permissions/requestApproval` is refused rather than held; the supported capability names the two methods it answers; approvals require `holdsServerRequests: true`; the transport reports delivery only for a live writable child and clears held ids on exit. 37 controller, 5 transport and 4 hub tests pass; `tsc` clean; commit `8ee74cef`. The transport tests use a fake app-server child, and the real-native half is measured too: a real codex 0.169 app-server, driven by a local model that asks for `exec_command`, raised `item/commandExecution/requestApproval` (requestId 0, command `pwsh -Command 'echo approval-ok'`). `ops codex turn --approval accept` delivered `{decision:"accept"}`, the runtime executed the command (`Process exited with code 0 ... Output: approval-ok`), and the turn completed; `--approval decline` produced `exec_command failed: Rejected("rejected by user")` and no execution; with no approval channel at all the same run produced `Rejected("approval request failed")`, so nothing is granted by default. `ops codex serve --approval accept --approval-policy untrusted` surfaced the same request and the same real execution through the hub |
-| AC19 | Artifact changed after approval | not started | no artifact digest/revision mismatch case |
-| AC20 | Credential revocation | partial | consent revoked mid-flight blocks publication; credential revocation is not exercised |
+| AC19 | Artifact changed after approval | partial | The approval request carries a SHA-256 digest over method, threadId, turnId, itemId, command, cwd, kind, grantRoot, approvalId and reason. `answerApproval` requires the digest for accept/acceptForSession and refuses a missing or mismatched digest before any JSON-RPC answer; decline/cancel may omit it. A command mutated between `pendingApprovals()` and the answer is refused; both CLI approval surfaces print the digest. 43 controller tests pass; `tsc` clean; commit `d883083e`. The digest is controller-computed from the approval params, not a runtime artifact hash, and a fileChange's file contents are not in those params; no real-binary digest witness yet |
+| AC20 | Credential revocation | partial | A stub Discord REST surface answers 401 after consent, an emptied bot token, and an already-revoked token. Each path returns a DiscordError, makes no successful send, and records zero delivered messages; 9 publication tests pass, commit `73c4cf08`. The revocation is simulated at the REST boundary; no live Discord credential was revoked |
 | AC21 | Prompt injection through chat/output | not started | no prompt-injection-through-output case |
 | AC22 | Worker success, sync-back failure | not started | no worker-success/sync-back-failure reconciliation case |
 | AC23 | Failed HERDR wait/read | closed | real CLI run with a binary that cannot exist: exit 1, no JSON inventory on stdout, and a message naming the failed Herdr inventory command. Unit tests also cover a missing binary and unsafe timeouts before spawning |
@@ -76,7 +76,7 @@ AC03, AC04, AC06, AC07, AC13, AC14, AC17, AC18, AC23 and AC25 are closed. Every 
 | WP5 | JCode/KCode adapters | partial | ACP backend, CLI, hub, durable stream, presence, ack and a Discord view of a live session verified; KCode identity absent and Jcode exposes no retraction or correction surface |
 | WP6 | Paperclip plugin and runtime adapter | partial | run metadata read and a local-command managed run; no entity projection or enrollment, model-backed run blocked |
 | WP7 | Discord comparison and route ownership | partial | consent-gated metadata publication, a live channel view of a hub session (`ops discord view`) with durable resume, and a native-session mirror (`ops jcode watch --tenant/--surface/--state`) that posted four real messages from a terminal session it did not start, with a durable index; no in-bot wiring, route ownership or cutover |
-| WP8 | Reliability and acceptance witnesses | partial | 61 backend tests plus 27 hub, 15 ACP client, 37 Codex control, 5 Codex transport, 4 Codex hub, 6 publication, 8 Discord view, 7 native mirror and 8 binding tests; three real witnesses (three clients on one jcode hub, native terminal mirrored into a channel, real Codex thread served and mirrored); test-suite gate baseline recorded in `docs/release-gate-2026-11-14.md` |
+| WP8 | Reliability and acceptance witnesses | partial | 61 backend tests plus 27 hub, 15 ACP client, 43 Codex control, 5 Codex transport, 4 Codex hub, 9 publication, 8 Discord view, 7 native mirror and 8 binding tests; three real witnesses (three clients on one jcode hub, native terminal mirrored into a channel, real Codex thread served and mirrored); test-suite gate baseline recorded in `docs/release-gate-2026-11-14.md` |
 | WP9 | Migration and retirement | not started | decision matrix and rollback rehearsal only; nothing drained or retired |
 
 ## What would move the most cases
@@ -236,6 +236,13 @@ The witness model is a local stub that speaks the Responses API, so no account c
 | Transport tie | approvals require `holdsServerRequests: true`; the capability is supported only then |
 | Dead child | respond/respondError return false after exit or close; pendingServerRequests is empty |
 | Decision validation | an invalid policy value fails closed to decline; humanCommand refuses acceptForSession |
+
+Approval digest and credential revocation, 2026-11-14:
+
+| Case | Evidence |
+| --- | --- |
+| AC19 digest | `pendingApprovals()` carries `sha256:` over the artifact fields. An accept with the digest the caller read is forwarded; a wrong digest, a missing digest on accept, and a command mutated after it was read are refused before any answer. decline/cancel may omit the digest. 43 controller tests, `tsc` clean, commit `d883083e` |
+| AC20 revocation | A stub REST surface answers 401 after consent, an emptied bot token, and an already-revoked token; every path returns a DiscordError with zero delivered messages. 9 publication tests, commit `73c4cf08`. No live Discord credential was revoked |
 
 Codex parity with the jcode fabric, measured end to end:
 
