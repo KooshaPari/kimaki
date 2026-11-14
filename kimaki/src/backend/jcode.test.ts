@@ -5,9 +5,10 @@
 import { describe, expect, it } from 'vitest'
 
 import { createJcodeBackend } from './jcode.js'
-import type { AcpClient, AcpClientOptions, CreateJcodeBackend } from './acp/contracts.js'
+import type { JcodeBackendInput } from './jcode.js'
+import type { AcpClient, AcpClientOptions } from './acp/contracts.js'
 
-type Input = Parameters<CreateJcodeBackend>[0]
+type Input = JcodeBackendInput
 
 type Calls = {
   options: AcpClientOptions[]
@@ -200,5 +201,114 @@ describe('createJcodeBackend', () => {
     } })
     await backend.start()
     expect(await backend.prompt('hi')).toEqual({ stopReason: 'end_turn', text: 'ok', updateCount: 1, usage })
+  })
+})
+
+// AC39: a profile, not the peer's self-reported label, resolves the executable
+// and the environment. KCode claims `jcode`, so a kcode profile must refuse a
+// `jcode` handshake instead of falling back to the stock binary.
+describe('Runtime profile identity', () => {
+  const kcodeHandshake: Partial<AcpClient> = {
+    async initialize() {
+      return { protocolVersion: 1, agentName: 'kcode' }
+    },
+  }
+
+  it('runs a kcode profile end to end: executable, env prefix and provenance', async () => {
+    const { backend, fake } = backendWith(kcodeHandshake, { profile: 'kcode', store: 'C:/Users/koosh/.kcode' })
+
+    expect(backend.profile).toEqual({
+      id: 'kcode',
+      executable: 'kcode',
+      envPrefix: 'KCODE_',
+      storeDir: '~/.kcode',
+      expectedIdentity: 'kcode',
+    })
+    expect(await backend.start()).toEqual({ sessionId: 'sess-1', model: null })
+
+    const options = fake.calls.options[0]!
+    expect(options.command).toBe('kcode')
+    expect(options.env?.['KCODE_HOME']).toBe('C:/Users/koosh/.kcode')
+    expect(options.env?.['JCODE_HOME']).toBeUndefined()
+    expect(fake.calls.newSession).toEqual([{ cwd: 'C:/work/project' }])
+  })
+
+  it('defaults the executable from the profile and refuses no executable at all', async () => {
+    const { backend: kcode, fake } = backendWith(kcodeHandshake, { profile: 'kcode' })
+    await kcode.start()
+    expect(fake.calls.options[0]!.command).toBe('kcode')
+
+    const missing = backendWith(kcodeHandshake, { profile: 'kcode', binary: '   ' })
+    const refused = await missing.backend.start()
+    expect(refused).toBeInstanceOf(Error)
+    expect((refused as Error).message).toContain('Runtime profile kcode expects executable kcode, but no executable was supplied')
+    expect(missing.fake.calls.options).toEqual([])
+  })
+
+  it('refuses to route a kcode profile through the stock jcode executable (backend path)', async () => {
+    const { backend, fake } = backendWith(kcodeHandshake, { profile: 'kcode', binary: 'C:/bin/jcode.exe' })
+    const refused = await backend.start()
+    expect(refused).toBeInstanceOf(Error)
+    const message = (refused as Error).message
+    expect(message).toContain('Runtime profile kcode expects executable kcode')
+    expect(message).toContain("'C:/bin/jcode.exe' is the jcode executable")
+    // No fallback: no client was created and no ACP call was made.
+    expect(fake.calls.options).toEqual([])
+    expect(fake.calls.initialize).toBe(0)
+    expect(fake.calls.newSession).toEqual([])
+  })
+
+  it('refuses a jcode profile handed the kcode executable (backend path)', async () => {
+    const { backend, fake } = backendWith({}, { binary: 'C:/w6-install/bin/kcode.exe' })
+    const refused = await backend.start()
+    expect(refused).toBeInstanceOf(Error)
+    expect((refused as Error).message).toContain('Runtime profile jcode expects executable jcode')
+    expect((refused as Error).message).toContain('is the kcode executable')
+    expect(fake.calls.options).toEqual([])
+  })
+
+  it('refuses a kcode handshake that self-reports jcode (ACP handshake)', async () => {
+    // The default fake reports `jcode`, which is exactly KCode's claim.
+    const { backend, fake } = backendWith({}, { profile: 'kcode' })
+    const refused = await backend.start()
+    expect(refused).toBeInstanceOf(Error)
+    const message = (refused as Error).message
+    expect(message).toContain("Runtime profile kcode expects identity 'kcode'")
+    expect(message).toContain("the ACP handshake reported 'jcode'")
+    // The label never selects the binary and never creates a session.
+    expect(fake.calls.newSession).toEqual([])
+    expect(fake.calls.options[0]!.command).toBe('kcode')
+  })
+
+  it('refuses a handshake that reports no identity at all', async () => {
+    const silent: Partial<AcpClient> = {
+      async initialize() {
+        return { protocolVersion: 1, agentName: null }
+      },
+    }
+    const { backend, fake } = backendWith(silent, { profile: 'kcode' })
+    const refused = await backend.start()
+    expect(refused).toBeInstanceOf(Error)
+    expect((refused as Error).message).toContain("expects the peer to report identity 'kcode'")
+    expect((refused as Error).message).toContain('reported none')
+    expect(fake.calls.newSession).toEqual([])
+  })
+
+  it('refuses an unknown profile id and records no provenance', async () => {
+    const { backend, fake } = backendWith({}, { profile: 'kcode-fork' })
+    expect(backend.profile).toBe(null)
+    const refused = await backend.start()
+    expect(refused).toBeInstanceOf(Error)
+    expect((refused as Error).message).toContain("Unknown runtime profile 'kcode-fork'")
+    expect((refused as Error).message).toContain('jcode, kcode')
+    expect(fake.calls.options).toEqual([])
+  })
+
+  it('keeps the stock jcode profile as the explicit default', async () => {
+    const { backend, fake } = backendWith()
+    expect(backend.profile?.id).toBe('jcode')
+    expect(await backend.start()).toEqual({ sessionId: 'sess-1', model: null })
+    expect(fake.calls.options[0]!.command).toBe('jcode')
+    expect(fake.calls.options[0]!.env).toBeUndefined()
   })
 })

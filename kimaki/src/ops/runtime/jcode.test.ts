@@ -72,7 +72,7 @@ describe('Jcode passive discovery', () => {
     expect(await target.readSnapshot({ key: { hostId: 'host', endpointId: 'endpoint', backendKind: 'jcode', nativeSessionId: 'session_a' } }))
       .toEqual({
         key: { hostId: 'host', endpointId: 'endpoint', backendKind: 'jcode', nativeSessionId: 'session_a' },
-        source: { hostId: 'host', endpointId: 'endpoint', backendKind: 'jcode' },
+        source: { hostId: 'host', endpointId: 'endpoint', backendKind: 'jcode', profileId: 'jcode' },
         session: { id: 'session_a', title: 'titled' },
       })
     expect(await target.readSnapshot({ key: { hostId: 'host', endpointId: 'other', backendKind: 'jcode', nativeSessionId: 'session_a' } })).toBeInstanceOf(Error)
@@ -155,6 +155,140 @@ describe('Jcode passive observation', () => {
     // The whole surface is reads: no write, mkdir, unlink or spawn is reachable from it.
     expect(reads.length).toBeGreaterThan(0)
     expect(writes).toEqual([])
-    expect(Object.keys(readOnly).sort()).toEqual(['capabilities', 'discover', 'observe', 'readSnapshot'])
+    expect(Object.keys(readOnly).sort()).toEqual(['capabilities', 'discover', 'observe', 'profile', 'readSnapshot'])
   })
 })
+
+// AC39: KCode shares the ACP surface and the sessions/session_*.json layout
+// with stock jcode but owns a different executable, store and KCODE_*
+// environment, and its reporter claims `jcode`. The profile, never the
+// self-reported label, decides which store is read.
+describe('Runtime profile identity', () => {
+  const kcodeHome = (records: Record<string, unknown>) => {
+    const files = Object.fromEntries(Object.entries(records).map(([name, value]) => [`${name}.json`, JSON.stringify(value)]))
+    const reads: string[] = []
+    return {
+      reads,
+      readDir: async (path: string) => {
+        reads.push(`dir:${path}`)
+        return Object.keys(files)
+      },
+      readFile: async (path: string) => {
+        reads.push(`file:${path}`)
+        const name = path.split('/').pop() ?? ''
+        if (!(name in files)) throw new Error(`missing ${name}`)
+        return files[name]!
+      },
+    }
+  }
+
+  it('preserves a kcode profile end to end: store, provenance and label are kcode', async () => {
+    const source = kcodeHome({ session_k: session('session_k', 'KCode session', '2026-05-01T00:00:00Z') })
+    const observer = createJcodeObserver({
+      jcodeHome: 'C:/Users/koosh/.kcode',
+      profile: 'kcode',
+      hostId: 'host',
+      endpointId: 'endpoint',
+      ...source,
+    })
+    if (observer instanceof Error) throw observer
+
+    // Provenance: the kcode profile, with the family label kept separate.
+    expect(observer.profile).toEqual({
+      id: 'kcode',
+      executable: 'kcode',
+      envPrefix: 'KCODE_',
+      storeDir: '~/.kcode',
+      expectedIdentity: 'kcode',
+    })
+
+    const page = await observer.discover()
+    if (page instanceof Error) throw page
+    expect(page.source).toEqual({ hostId: 'host', endpointId: 'endpoint', backendKind: 'jcode', profileId: 'kcode' })
+    expect(page.sessions).toEqual([
+      { key: { hostId: 'host', endpointId: 'endpoint', backendKind: 'jcode', nativeSessionId: 'session_k' }, title: 'KCode session' },
+    ])
+    // Only the kcode store was read, never ~/.jcode.
+    expect(source.reads.length).toBeGreaterThan(0)
+    expect(source.reads.every((path) => path.includes('.kcode') && !path.includes('.jcode'))).toBe(true)
+
+    const snapshot = await observer.readSnapshot({
+      key: { hostId: 'host', endpointId: 'endpoint', backendKind: 'jcode', nativeSessionId: 'session_k' },
+    })
+    if (snapshot instanceof Error) throw snapshot
+    expect(snapshot.source.profileId).toBe('kcode')
+  })
+
+  it('refuses an unknown profile without reading any store (observer path)', () => {
+    const reads: string[] = []
+    const refused = createJcodeObserver({
+      jcodeHome: 'C:/Users/koosh/.kcode',
+      profile: 'kcode-fork',
+      hostId: 'host',
+      endpointId: 'endpoint',
+      readDir: async (path) => {
+        reads.push(path)
+        return []
+      },
+      readFile: async (path) => {
+        reads.push(path)
+        return ''
+      },
+    })
+    expect(refused).toBeInstanceOf(Error)
+    expect((refused as Error).message).toContain("Unknown runtime profile 'kcode-fork'")
+    expect((refused as Error).message).toContain('jcode, kcode')
+    expect(reads).toEqual([])
+  })
+
+  it('refuses a kcode profile pointed at the stock .jcode store (publication label path)', () => {
+    const reads: string[] = []
+    const refused = createJcodeObserver({
+      jcodeHome: 'C:/Users/koosh/.jcode',
+      profile: 'kcode',
+      hostId: 'host',
+      endpointId: 'endpoint',
+      readDir: async (path) => {
+        reads.push(path)
+        return []
+      },
+      readFile: async (path) => {
+        reads.push(path)
+        return ''
+      },
+    })
+    expect(refused).toBeInstanceOf(Error)
+    const message = (refused as Error).message
+    expect(message).toContain('Runtime profile kcode expects store ~/.kcode')
+    expect(message).toContain("ends in '.jcode'")
+    // No fallback: the stock store is never read for a kcode identity.
+    expect(reads).toEqual([])
+  })
+
+  it('refuses a jcode profile pointed at the kcode store', () => {
+    const refused = createJcodeObserver({
+      jcodeHome: 'C:/Users/koosh/.kcode',
+      profile: 'jcode',
+      hostId: 'host',
+      endpointId: 'endpoint',
+      readDir: async () => [],
+      readFile: async () => '',
+    })
+    expect(refused).toBeInstanceOf(Error)
+    expect((refused as Error).message).toContain('expects store ~/.jcode')
+    expect((refused as Error).message).toContain("ends in '.kcode'")
+  })
+
+  it('refuses a missing store and names the profile it expected', () => {
+    const refused = createJcodeObserver({
+      profile: 'kcode',
+      hostId: 'host',
+      endpointId: 'endpoint',
+      readDir: async () => [],
+      readFile: async () => '',
+    })
+    expect(refused).toBeInstanceOf(Error)
+    expect((refused as Error).message).toContain('Runtime profile kcode needs an explicit store (expected ~/.kcode)')
+  })
+})
+

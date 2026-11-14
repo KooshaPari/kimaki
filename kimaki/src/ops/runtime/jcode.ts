@@ -2,7 +2,8 @@
 // session records but emits only an allowlisted identity and title. Transcripts,
 // tool output, provider credentials and message bodies are never returned.
 import { ConfigError } from '../../errors.js'
-import type { SessionKey } from '../contracts.js'
+import type { RuntimeProfile, SessionKey } from '../contracts.js'
+import { RUNTIME_PROFILE_IDS, RUNTIME_PROFILES, STOCK_JCODE_PROFILE } from '../contracts.js'
 import { passiveCapabilities, sessionKeyId } from '../registry.js'
 
 type NativeSession = { id: string; title: string | null; updatedAt: string | null; messageCount: number }
@@ -13,19 +14,65 @@ export type JcodeObservedEvent =
 
 const record = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value)
 
-export function createJcodeObserver({ jcodeHome, hostId, endpointId, readFile, readDir, intervalMs = 500 }: {
-  jcodeHome: string
+// A profile is resolved before any store is read. An omitted profile is the
+// stock jcode profile, an unknown one is a refusal rather than a fallback.
+const resolveProfile = (id: string | undefined): RuntimeProfile | ConfigError => {
+  if (id === undefined) return STOCK_JCODE_PROFILE
+  const profile = (RUNTIME_PROFILES as Record<string, RuntimeProfile | undefined>)[id]
+  if (profile === undefined) {
+    return new ConfigError({ reason: `Unknown runtime profile '${id}'. Expected one of: ${RUNTIME_PROFILE_IDS.join(', ')}` })
+  }
+  return profile
+}
+
+const storeLeaf = (path: string): string => path.replace(/[\\/]+$/, '').split(/[\\/]/).pop() ?? ''
+
+// The store leaf names the runtime that wrote it. A profile must never read
+// another runtime's store: KCode claims the jcode identity, so a `.jcode` store
+// under a kcode profile would silently attribute KCode sessions to stock jcode.
+const otherStoreLeaf = (profile: RuntimeProfile): string => (profile.id === 'kcode' ? '.jcode' : '.kcode')
+
+// Resolve the store path against the profile. The path is always explicit; the
+// profile decides which directory name is legitimate for this identity.
+const resolveStore = (profile: RuntimeProfile, supplied: string | undefined): string | ConfigError => {
+  const path = (supplied ?? '').trim()
+  if (!path) {
+    return new ConfigError({ reason: `Runtime profile ${profile.id} needs an explicit store (expected ${profile.storeDir})` })
+  }
+  const leaf = storeLeaf(path)
+  const foreign = otherStoreLeaf(profile)
+  if (leaf === foreign) {
+    return new ConfigError({
+      reason: `Runtime profile ${profile.id} expects store ${profile.storeDir}, but the supplied store ends in '${foreign}'; refusing to resolve a ${profile.id} session from the ${foreign} store`,
+    })
+  }
+  return path
+}
+
+export function createJcodeObserver({ jcodeHome, store, profile: requestedProfile, hostId, endpointId, readFile, readDir, intervalMs = 500 }: {
+  // Back-compat alias for `store`, kept because the CLI already passes it.
+  jcodeHome?: string
+  // Explicit store directory holding sessions/session_*.json.
+  store?: string
+  // RuntimeProfileId; defaults to the stock jcode profile.
+  profile?: string
   hostId: string
   endpointId: string
   readFile: (path: string) => Promise<string>
   readDir: (path: string) => Promise<string[]>
   intervalMs?: number
 }) {
+  const resolution = resolveProfile(requestedProfile)
+  if (resolution instanceof Error) return resolution
+  const profile = resolution
   const valid = sessionKeyId({ hostId, endpointId, backendKind: 'jcode', nativeSessionId: 'validation' })
   if (valid instanceof Error) return valid
-  if (!jcodeHome.trim()) return new ConfigError({ reason: 'An explicit Jcode home is required' })
-  const source = Object.freeze({ hostId, endpointId, backendKind: 'jcode' as const })
-  const sessionsDir = `${jcodeHome.replace(/[\\/]+$/, '')}/sessions`
+  const resolvedStore = resolveStore(profile, store ?? jcodeHome)
+  if (resolvedStore instanceof Error) return resolvedStore
+  // backendKind stays the ACP family label; profileId is the provenance that
+  // distinguishes this KCode fork from stock jcode.
+  const source = Object.freeze({ hostId, endpointId, backendKind: 'jcode' as const, profileId: profile.id })
+  const sessionsDir = `${resolvedStore.replace(/[\\/]+$/, '')}/sessions`
   const fileFor = (id: string) => `${sessionsDir}/${id}.json`
   const reason = 'Jcode exposes no exclusive writer lease, so control is not offered'
 
@@ -44,13 +91,15 @@ export function createJcodeObserver({ jcodeHome, hostId, endpointId, readFile, r
     return { id: value.id, title, updatedAt, messageCount }
   }
 
-  const keyFor = (nativeSessionId: string): SessionKey => ({ ...source, nativeSessionId })
+  const keyFor = (nativeSessionId: string): SessionKey => ({ hostId, endpointId, backendKind: 'jcode' as const, nativeSessionId })
   const poll = async (nativeSessionId: string): Promise<NativeSession | undefined> => {
     const raw = await readFile(fileFor(nativeSessionId)).catch(() => undefined)
     return raw === undefined ? undefined : parse(raw)
   }
 
   return {
+    // Which profile resolved this store. Provenance for every page and snapshot.
+    profile,
     capabilities: {
       ...passiveCapabilities,
       discovery: { kind: 'supported' as const },
@@ -97,7 +146,7 @@ export function createJcodeObserver({ jcodeHome, hostId, endpointId, readFile, r
       const session = parse(raw)
       if (!session) return new ConfigError({ reason: 'Malformed or mismatched Jcode session record' })
       if (session.id !== nativeSessionId) return new ConfigError({ reason: 'Record identity does not match the requested session' })
-      return { key: Object.freeze({ ...source, nativeSessionId }), source, session: { id: session.id, title: session.title } }
+      return { key: Object.freeze(keyFor(nativeSessionId)), source, session: { id: session.id, title: session.title } }
     },
     // Polling observation over the persisted record. Only counts and titles are
     // emitted. Nothing from messages, tool calls or paths is ever surfaced.
@@ -113,7 +162,7 @@ export function createJcodeObserver({ jcodeHome, hostId, endpointId, readFile, r
       }
       if (signal?.aborted) return new ConfigError({ reason: 'Observation already aborted' })
       const nativeSessionId = key.nativeSessionId
-      const scopedKey = Object.freeze({ ...source, nativeSessionId })
+      const scopedKey = Object.freeze(keyFor(nativeSessionId))
       const first = await poll(nativeSessionId)
       if (!first) return new ConfigError({ reason: 'Jcode session record is missing or unreadable' })
       let title = first.title

@@ -7,10 +7,23 @@
 // fails closed by resolving an Error instead of throwing.
 
 import { ConfigError } from '../errors.ts'
+import type { RuntimeProfile } from '../ops/contracts.ts'
+import { RUNTIME_PROFILE_IDS, RUNTIME_PROFILES, STOCK_JCODE_PROFILE } from '../ops/contracts.ts'
 import { createAcpClient } from './acp/client.ts'
 import type { AcpClient, AcpClientOptions, CreateAcpClient, CreateJcodeBackend, JcodeBackend } from './acp/contracts.ts'
 
 const TOOL_PROFILES = ['none', 'minimal', 'full'] as const
+
+/** Backend input plus the runtime identity it runs under. */
+export type JcodeBackendInput = Parameters<CreateJcodeBackend>[0] & {
+  /** RuntimeProfileId; defaults to the stock jcode profile. */
+  profile?: string
+  /** Explicit store; scopes the child environment to the profile's prefix. */
+  store?: string
+}
+
+/** The backend plus the profile that resolved it, so callers can record provenance. */
+export type JcodeBackendWithProfile = JcodeBackend & { readonly profile: RuntimeProfile | null }
 
 const CAPABILITIES: JcodeBackend['capabilities'] = {
   prompt: true,
@@ -20,14 +33,46 @@ const CAPABILITIES: JcodeBackend['capabilities'] = {
   exclusiveControl: false,
 }
 
-export const createJcodeBackend: CreateJcodeBackend = (input) => {
-  const binary = input.binary ?? 'jcode'
+// An omitted profile is stock jcode. An unknown one is a refusal, never a
+// silent fallback to the stock binary.
+const resolveProfile = (id: string | undefined): RuntimeProfile | ConfigError => {
+  if (id === undefined) return STOCK_JCODE_PROFILE
+  const profile = (RUNTIME_PROFILES as Record<string, RuntimeProfile | undefined>)[id]
+  if (profile === undefined) {
+    return new ConfigError({ reason: `Unknown runtime profile '${id}'. Expected one of: ${RUNTIME_PROFILE_IDS.join(', ')}` })
+  }
+  return profile
+}
+
+// The executable name without a directory, extension or version suffix.
+const executableName = (path: string): string =>
+  (path.replace(/[\\/]+$/, '').split(/[\\/]/).pop() ?? '').replace(/\.(exe|cmd|bat|ps1)$/i, '')
+
+const knownExecutable = (name: string): string | undefined =>
+  Object.values(RUNTIME_PROFILES).find((profile) => profile.executable === name)?.executable
+
+export const createJcodeBackend = (input: JcodeBackendInput): JcodeBackendWithProfile => {
+  const resolution = resolveProfile(input.profile)
+  const profile = resolution instanceof Error ? null : resolution
+  const binary = (input.binary ?? profile?.executable ?? '').trim()
   const toolProfile = input.toolProfile ?? 'none'
   const configuredModel = input.model
   const createClient: CreateAcpClient = input.createClient ?? createAcpClient
 
   // Invalid startup configuration is an Error the first start resolves, never a throw.
   const configError: Error | null = (() => {
+    if (resolution instanceof Error) return resolution
+    if (!profile) return new ConfigError({ reason: 'A runtime profile is required' })
+    if (!binary) {
+      return new ConfigError({ reason: `Runtime profile ${profile.id} expects executable ${profile.executable}, but no executable was supplied` })
+    }
+    const named = executableName(binary)
+    const other = knownExecutable(named)
+    if (other !== undefined && other !== profile.executable) {
+      return new ConfigError({
+        reason: `Runtime profile ${profile.id} expects executable ${profile.executable}, but '${binary}' is the ${other} executable; refusing to route a ${profile.id} session through ${other}`,
+      })
+    }
     if (!input.cwd?.trim()) return new ConfigError({ reason: 'Jcode backend needs an explicit working directory (cwd)' })
     if (!TOOL_PROFILES.includes(toolProfile)) return new ConfigError({ reason: 'Jcode tool profile must be none, minimal or full' })
     if (input.timeoutMs !== undefined && (!Number.isSafeInteger(input.timeoutMs) || input.timeoutMs < 1)) {
@@ -43,12 +88,21 @@ export const createJcodeBackend: CreateJcodeBackend = (input) => {
   let starting: Promise<{ sessionId: string; model: string | null } | Error> | null = null
   let closed = false
 
-  const options = (): AcpClientOptions => ({
-    command: binary,
-    args: ['acp', '--tool-profile', toolProfile],
-    cwd: input.cwd,
-    ...(input.timeoutMs === undefined ? {} : { timeoutMs: input.timeoutMs }),
-  })
+  // The child environment is scoped to the resolved profile. A kcode profile
+  // never inherits the stock runtime's home variable, and a jcode profile never
+  // adopts KCode's.
+  const options = (): AcpClientOptions => {
+    const env = profile && input.store !== undefined
+      ? { ...process.env, [`${profile.envPrefix}HOME`]: input.store }
+      : undefined
+    return {
+      command: binary,
+      args: ['acp', '--tool-profile', toolProfile],
+      cwd: input.cwd,
+      ...(env === undefined ? {} : { env }),
+      ...(input.timeoutMs === undefined ? {} : { timeoutMs: input.timeoutMs }),
+    }
+  }
 
   const ensureClient = (): AcpClient | Error => {
     if (client) return client
@@ -88,6 +142,22 @@ export const createJcodeBackend: CreateJcodeBackend = (input) => {
       if (acp instanceof Error) return acp
       const initialized = await attempt(() => acp.initialize(), 'Jcode ACP initialize failed')
       if (initialized instanceof Error) return initialized
+      // The peer's self-report is evidence, not authority. KCode claims `jcode`,
+      // so a kcode profile must observe `kcode` or refuse. The label never
+      // selects the executable and never falls back to the stock binary.
+      const resolved = profile
+      if (!resolved) return new ConfigError({ reason: 'A runtime profile is required' })
+      const observed = initialized.agentName
+      if (observed === null) {
+        return new ConfigError({
+          reason: `Runtime profile ${resolved.id} expects the peer to report identity '${resolved.expectedIdentity}', but the ACP handshake reported none`,
+        })
+      }
+      if (observed !== resolved.expectedIdentity) {
+        return new ConfigError({
+          reason: `Runtime profile ${resolved.id} expects identity '${resolved.expectedIdentity}', but the ACP handshake reported '${observed}'; refusing to route a ${resolved.id} session`,
+        })
+      }
       const session = await attempt(() => acp.newSession({ cwd: input.cwd }), 'Jcode ACP session/new failed')
       if (session instanceof Error) return session
       if (!session.sessionId?.trim()) return new ConfigError({ reason: 'Jcode returned an empty ACP session ID' })
@@ -155,6 +225,8 @@ export const createJcodeBackend: CreateJcodeBackend = (input) => {
   }
 
   return {
+    // Provenance: null only when the profile id itself was refused.
+    profile,
     capabilities: CAPABILITIES,
     sessionId: () => started?.sessionId ?? null,
     start,
