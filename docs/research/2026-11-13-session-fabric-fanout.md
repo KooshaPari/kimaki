@@ -264,3 +264,12 @@ reproduces exactly the multi-writer ambiguity that fact 3 makes real.
 - Behaviour of a resumed session under triggers other than a prompt from another client.
 - herdr subscription socket behaviour as a presence source. Only the upstream research doc was read, not a live
   subscription.
+
+## 8. Update: the hub now exists
+
+The first phased increment in this note is implemented. `kimaki/src/backend/hub.ts` owns one backend session and one writer, publishes an ordered event stream into a bounded replay buffer, and hands clients a cursor. `kimaki/src/backend/hub-server.ts` exposes it on loopback with `GET /state`, `POST /prompt`, `POST /cancel` and `GET /events?cursor=N` over server-sent events. `ops jcode serve` wires those to a real `jcode acp` child.
+
+Measured: two independent clients attached to one hub received an identical sequence (1 to 4) and identical assistant text for a real turn against jcode 0.99.1. Coverage: 11 hub unit tests, 6 server tests, and one opt-in real acceptance (`KIMAKI_JCODE_HUB_E2E=1`).
+
+What this increment does not change, from section 2: ordering and replay are per process, so a restarted hub loses its stream; the single writer is enforced by the hub rather than by a runtime lease; there is no delivery acknowledgement from a client beyond its cursor; and presence is just a subscriber count.
+

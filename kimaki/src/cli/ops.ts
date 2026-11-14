@@ -339,4 +339,48 @@ export function registerOpsCommands(cli: Goke) {
       })
       else process.stdout.write(`\n${result.stopReason}\n`)
     })
+
+  cli.command('ops jcode serve', 'Serve one Jcode session on loopback so several clients can watch the same turns')
+    .option('--cwd <path>', 'Working directory for the Jcode ACP session')
+    .option('--binary <path>', 'Jcode executable (default: jcode)')
+    .option('--model <id>', 'Model selected for the ACP session instead of the agent default')
+    .option('--tool-profile <kind>', 'Jcode tool profile: none (default), minimal or full')
+    .option('--port <n>', 'Loopback port (default: 0, an ephemeral port)')
+    .option('--token <token>', 'Optional shared token required in the x-kimaki-hub header')
+    .option('--timeout <ms>', 'Per-request ACP deadline in milliseconds')
+    .action(async (options) => {
+      const cwd = required(options.cwd, 'cwd')
+      const toolProfile = options.toolProfile ?? 'none'
+      if (!['none', 'minimal', 'full'].includes(toolProfile)) fail(new ConfigError({ reason: 'Supply --tool-profile none, minimal or full' }))
+      const port = options.port === undefined ? 0 : Number(options.port)
+      if (!Number.isSafeInteger(port) || port < 0 || port > 65535) fail(new ConfigError({ reason: '--port must be an integer between 0 and 65535' }))
+      const timeoutMs = options.timeout === undefined ? undefined : Number(options.timeout)
+      if (timeoutMs !== undefined && (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1)) fail(new ConfigError({ reason: '--timeout must be a positive integer in milliseconds' }))
+      const model = options.model?.trim() ? options.model : undefined
+      const { createJcodeBackend } = await import('../backend/jcode.ts')
+      const { createSessionHub } = await import('../backend/hub.ts')
+      const { startHubServer } = await import('../backend/hub-server.ts')
+      const backend = createJcodeBackend({ binary: options.binary ?? 'jcode', cwd, model, toolProfile: toolProfile as 'none' | 'minimal' | 'full', timeoutMs })
+      const hub = createSessionHub({ backend, model })
+      if (hub instanceof Error) {
+        await backend.close()
+        fail(hub)
+      }
+      const server = await startHubServer({ hub, port, token: options.token })
+      if (server instanceof Error) {
+        await hub.close()
+        fail(server)
+      }
+      // One line so a supervising client can attach without guessing the port.
+      printJson({ url: server.url, port: server.port, capabilities: hub.capabilities })
+      const shutdown = async (): Promise<void> => {
+        await server.close()
+        await hub.close()
+        process.exit(0)
+      }
+      process.once('SIGINT', () => { void shutdown() })
+      process.once('SIGTERM', () => { void shutdown() })
+      // Stay attached until a signal arrives.
+      await new Promise<void>(() => {})
+    })
 }
