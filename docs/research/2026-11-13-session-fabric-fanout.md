@@ -273,3 +273,20 @@ Measured: two independent clients attached to one hub received an identical sequ
 
 A later increment added durability. With `--log <path>` the hub appends every event to a JSONL file, restores its sequence and session identity on restart, replays from that file when a cursor predates the in-memory window, and takes an advisory lease so a second hub refuses to write the same session. Measured: after a hard restart the hub resumed at sequence 4 with the same session id, and a fresh client replayed all four events without prompting the agent again. Clients now have identity and acknowledgement too: `GET /events?client=<id>` registers presence, `POST /ack {client, seq}` records how far a client has processed with monotonic updates, and presence ends when the connection closes. Acknowledgements are persisted beside the log when one is configured, so a restart no longer loses them. Still missing, from section 2: a shared broker across machines, and routing an ack for a client that is not currently attached.
 
+
+## 9. Decision: no cross-machine broker yet
+
+Fact, measured in the code: `hub-server.ts` binds `127.0.0.1` only, the event log is a local JSONL file, the writer lease is a local file next to it, and identity already carries a `hostId` in `ops/contracts.ts`. So the fabric is single-host by construction, while the identity model is already host-aware.
+
+Three shapes were considered.
+
+1. Federated per-host hubs. Each machine keeps its own hub and log; clients discover a hub by URL. Smallest change, and `hostId` already distinguishes origins.
+2. Shared store. A hub per host writes to one database instead of a local file. Gives cross-host replay and ack durability with no new protocol, at the cost of a dependency and a schema.
+3. Message broker. Hubs publish to NATS or Redis, clients subscribe there. Best fan-out ceiling, largest operational surface, and it duplicates the cursor and replay logic already tested here.
+
+None of the three can be validated on this host: there is no second machine, no remote client requirement, and the hub deliberately has no authentication story beyond an optional shared token because it never leaves loopback. Building any of them now would produce unverifiable code, which is exactly the failure mode this ledger exists to prevent.
+
+Decision: defer, and keep the single-host hub as the supported shape.
+
+Trigger to revisit: any real requirement for a client on another machine, or a second writer process for one session. When that arrives, take option 1 first. Its prerequisites are concrete: bind beyond loopback only with a mandatory token, add a hub URL registry keyed by `hostId`, and keep the JSONL log as the per-host record so option 2 can ingest it later without rewriting history.
+
