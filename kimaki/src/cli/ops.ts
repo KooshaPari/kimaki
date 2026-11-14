@@ -625,6 +625,68 @@ export function registerOpsCommands(cli: Goke) {
       printJson({ kind: 'stopped', polls, messages: seen })
     })
 
+  cli.command('ops codex serve', 'Serve one Codex thread on loopback so several clients can watch the same turns')
+    .option('--binary <path>', 'Explicit Codex executable')
+    .option('--codex-home <dir>', 'Explicit isolated Codex state directory')
+    .option('--cwd <path>', 'Working directory for the thread')
+    .option('--thread <id>', 'Resume this thread instead of starting a new one')
+    .option('--port <n>', 'Loopback port (default: 0, an ephemeral port)')
+    .option('--token <token>', 'Optional shared token required in the x-kimaki-hub header')
+    .option('--log <path>', 'Append-only JSONL event log; enables resume across restarts and takes a writer lease')
+    .option('--timeout-ms <n>', 'Request and turn timeout in milliseconds')
+    .action(async (options) => {
+      const binary = required(options.binary, 'binary')
+      const codexHome = required(options.codexHome, 'codex-home')
+      const cwd = required(options.cwd, 'cwd')
+      const port = options.port === undefined ? 0 : Number(options.port)
+      if (!Number.isSafeInteger(port) || port < 0 || port > 65535) fail(new ConfigError({ reason: '--port must be an integer between 0 and 65535' }))
+      const timeoutMs = options.timeoutMs === undefined ? undefined : Number(options.timeoutMs)
+      if (timeoutMs !== undefined && (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1)) fail(new ConfigError({ reason: '--timeout-ms must be a positive integer' }))
+      const { startCodexAppServer } = await import('../ops/runtime/codex-app-server.ts')
+      const { createCodexController } = await import('../ops/runtime/codex.ts')
+      const { createCodexHubBackend } = await import('../ops/runtime/codex-hub.ts')
+      const { createSessionHub } = await import('../backend/hub.ts')
+      const { startHubServer } = await import('../backend/hub-server.ts')
+      const server = await startCodexAppServer({ binary, codexHome, timeoutMs })
+      if (server instanceof Error) fail(server)
+      const controller = createCodexController({ hostId: 'local', endpointId: 'explicit-app-server', request: server.request, subscribe: server.subscribe, timeoutMs, turnTimeoutMs: timeoutMs })
+      if (controller instanceof Error) {
+        await server.close()
+        fail(controller)
+      }
+      // A resumed thread is the runtime's single writer, so the hub's single
+      // writer rule matches what Codex already enforces.
+      const backend = createCodexHubBackend({
+        controller,
+        cwd,
+        ...(options.thread === undefined ? {} : { resumeThreadId: options.thread }),
+      })
+      const hub = createSessionHub({ backend, logFile: options.log })
+      if (hub instanceof Error) {
+        controller.close()
+        await server.close()
+        fail(hub)
+      }
+      const started = await startHubServer({ hub, port, token: options.token })
+      if (started instanceof Error) {
+        await hub.close()
+        controller.close()
+        await server.close()
+        fail(started)
+      }
+      printJson({ url: started.url, port: started.port, capabilities: hub.capabilities })
+      const shutdown = async (): Promise<void> => {
+        await started.close()
+        await hub.close()
+        controller.close()
+        await server.close()
+        process.exit(0)
+      }
+      process.once('SIGINT', () => { void shutdown() })
+      process.once('SIGTERM', () => { void shutdown() })
+      await new Promise<void>(() => {})
+    })
+
   cli.command('ops codex history', 'Read an existing Codex thread through the app-server and print its messages')
     .option('--binary <path>', 'Explicit Codex executable')
     .option('--codex-home <dir>', 'Explicit isolated Codex state directory')

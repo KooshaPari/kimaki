@@ -168,3 +168,14 @@ Writer-lock measurements (two app-server processes, one thread):
 | Does a resumed thread in process A block process B? | Yes. B's `thread/resume` fails with `thread <id> already has an active writer`, and its `turn/start` then fails with `thread not found`. Codex enforces one writer per thread natively, unlike Jcode |
 | Does `thread/read` block a writer? | No. A reader held the thread open, a second process resumed it, and `turn/start` succeeded with a real turn id. Reading is therefore a safe observe path, and `readThread` must never resume, which a unit test now pins |
 | Do cross-process notifications arrive? | No. While another process held the turn, the first process received nothing, so observation is poll-based rather than push |
+
+Codex as a served session (same fabric as Jcode):
+
+| Step | Command | Observed |
+| --- | --- | --- |
+| Serve | `ops codex serve --binary codex.exe --codex-home <isolated> --cwd <dir>` | printed a loopback URL and the hub capability block |
+| Prompt through a shared client | `ops jcode attach --url <hub> --prompt "Serve this turn" --json` | `"stopReason":"completed"`, 24 characters streamed, cursor 4 |
+| Mirror into Discord | `ops discord view --url <hub> --tenant <guild> --surface <channel> --state <file>` | channel received `stub-model-reply items=4`; state file recorded the real Codex thread id `01a1db13-3efc-7303-92a7-aea8b5f7e553` at sequence 4 |
+
+That is the operator's goal applied to the second runtime: one live Codex thread,
+several clients, and Discord as one of them.
