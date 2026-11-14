@@ -57,3 +57,28 @@ Each milestone needs a named owner, concrete evidence links or reproducible comm
 - Discord publication is reachable through explicit CLI paths. `ops publish` requires `--consent` plus an explicit tenant, surface, host, endpoint, native session and token and posts exactly one fixed metadata line. `ops follow` subscribes to one external OpenCode session with the existing observer and publishes on a real `session.renamed`, bounded by a deadline. A 2026-11-12 acceptance ran against a real isolated OpenCode session and the real DigitalDiscord twin: without `--consent` the rename posted nothing, with consent exactly one fixed line appeared, and the `@everyone` title was not forwarded. The deadline stops observation and new publications, but a Discord request already in flight can still complete. Neither path is wired into the live bot event loop, default binding publication policy remains none, and no live Discord account or credential was used.
 - Dynamic binding was exercised against the real herdr 0.9.3 instance on 2026-11-12: `ops discover --source herdr` listed four real herdr-managed Codex panes with explicit session candidates, and one discovered identity (`wJ:p19`, `01a1ce3a-4529-7ab1-8258-76bbc30c99b9`) was bound through `ops bind` into an isolated database with `mode: observe` and `publication_policy: none`. A repeated request returned the identical row, a different tenant listed nothing, `ops detach` under a wrong tenant was refused, detach under the owning tenant marked the row detached, and re-running discovery showed that pane still `agent_status: done`, `revision: 2`, `state_change_seq: 14`. A second run then bound a different real pane (`wJ:p15`) to an already occupied surface and was refused with `Surface already has an active binding`, and after an explicit detach the same surface accepted the replacement identity at `generation: 2`. Each call was a separate CLI process, so binding durability across process restarts is demonstrated. Live event reconnection is not demonstrated because no Codex or Jcode observer streaming is implemented.
 - Next: wire an authorized external session through to a Discord view end to end, complete the first Paperclip external-observation pilot, qualify Jcode or record its permanent constraint, implement the separately authorized managed execution pilot, then run M8 release gates. Keep the existing bot capability and rollback inventory current.
+
+## Verification map: session hub increment, 2026-11-13
+
+Every requirement from this increment is mapped to a check that exercises a public surface. "Real" means the compiled or `tsx` CLI, its loopback HTTP/SSE API, real `jcode 0.99.1`, and files on disk. No mocks were used for the real column.
+
+| Requirement | Check | Observed |
+| --- | --- | --- |
+| One session, several clients | repo e2e `fans one real jcode turn out to two clients` | two clients, identical sequence 1 to 4, identical text `ok` |
+| Same behaviour through the shipped artifact | `dist/cli.js ops jcode serve` packaging run | 6 of 6 checks, real turn, log written, state durable |
+| Durable resume across restart | repo e2e `resumes the same stream after the hub restarts` | sequence 4, same session id, all four events replayed |
+| Log file on disk | public CLI run | 4 JSONL lines, one per event |
+| `--log` creates missing directories | public CLI run with a nested path | hub announced a URL and wrote the file |
+| Replay is ascending when disk and buffer mix | public CLI reconnect | `1,2,3,4`, never `3,4,1,2` |
+| `ready` precedes replayed and live events | public CLI SSE frame order | frames `ready,hub,hub,...` |
+| Second writer refused | repo e2e and public CLI | exit 1, `Another hub holds this session lease (pid N)` |
+| Stale lease taken over | unit test | dead pid replaced, lease removed on close |
+| Unsupported model refused, hub stays usable | repo e2e and public CLI | 409 with the agent's model error, then `busy false, seq 0` |
+| Cancel with no running turn | public CLI | 200, inert |
+| Corrupt log line tolerated | unit test | replay skipped the torn line, kept the valid event |
+| Loopback only | public CLI | URL matched `http://127.0.0.1:<port>` |
+
+Environmental correction: the earlier note that the agent's default model is always denied was model-specific. On 2026-11-13 the host config resolves its default to a working provider, so the refusal path is now exercised with an explicitly unsupported model id instead of relying on a provider denial.
+
+Not covered by a real path: cross-machine fan-out, client delivery acknowledgement beyond the cursor, and per-client presence. Those are declared missing rather than tested.
+

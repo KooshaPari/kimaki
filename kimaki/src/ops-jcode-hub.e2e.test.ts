@@ -141,6 +141,66 @@ test.skipIf(ENABLED)('stays dormant without the opt-in flag', () => {
   expect(process.env['KIMAKI_JCODE_HUB_E2E']).not.toBe('1')
 })
 
+// Two refusals that matter for shared use: a second hub must not write the same
+// log, and an unsupported model must be refused at submit time instead of
+// half-starting a turn.
+test.skipIf(!ENABLED)('refuses a second hub on the same log and an unsupported model', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'kimaki-jcode-hub-refuse-'))
+  const logFile = path.join(dir, 'events.jsonl')
+  const startServe = (extra: string[], log = logFile) =>
+    spawn(
+      process.execPath,
+      ['--import', 'tsx', CLI, 'ops', 'jcode', 'serve', '--cwd', dir, '--log', log, '--timeout', '180000', ...extra],
+      { cwd: PACKAGE_ROOT, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true },
+    )
+  const collectExit = (child: ChildProcess) => {
+    let text = ''
+    child.stdout!.setEncoding('utf8').on('data', (chunk: string) => {
+      text += chunk
+    })
+    child.stderr!.setEncoding('utf8').on('data', (chunk: string) => {
+      text += chunk
+    })
+    return new Promise<{ code: number | null; text: () => string }>((resolve) => {
+      child.once('close', (code) => resolve({ code, text: () => text }))
+      setTimeout(() => resolve({ code: null, text: () => text }), 60_000)
+    })
+  }
+  let owner: ChildProcess | undefined
+  let intruder: ChildProcess | undefined
+  let badModel: ChildProcess | undefined
+  try {
+    owner = startServe(['--model', MODEL])
+    const ownerUrl = await waitForUrl(owner)
+    expect(ownerUrl).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/)
+
+    intruder = startServe(['--model', MODEL])
+    const refused = await collectExit(intruder)
+    expect(refused.code, 'a second hub must not keep running').not.toBe(0)
+    expect(refused.text(), 'the refusal must name the lease').toMatch(/session lease/i)
+
+    // A model the agent does not offer fails during start, so submit is refused.
+    // Its own log keeps it clear of the lease held by the first hub.
+    badModel = startServe(['--model', 'kimaki-nonexistent-model', '--port', '0'], path.join(dir, 'bad-model.jsonl'))
+    const badUrl = await waitForUrl(badModel)
+    const posted = await fetch(`${badUrl}/prompt`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ text: PROMPT }),
+    })
+    expect(posted.status, 'an unsupported model must be refused').toBe(409)
+    const body = (await posted.json()) as { error?: unknown }
+    expect(String(body.error)).toMatch(/model/i)
+    const state = (await (await fetch(`${badUrl}/state`)).json()) as { busy: unknown; seq: unknown }
+    expect(state).toMatchObject({ busy: false, seq: 0 })
+  } finally {
+    for (const child of [owner, intruder, badModel]) {
+      if (child !== undefined && child.exitCode === null) killTree(child)
+    }
+    await removeTempDirs([dir])
+  }
+}, 240_000)
+
 // A durable hub keeps its stream across a restart: the sequence, the session it
 // recorded, and the events a client already saw are all readable again from the
 // log, without replaying the turn or prompting the agent.
