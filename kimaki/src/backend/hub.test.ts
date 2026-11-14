@@ -535,6 +535,38 @@ describe('createSessionHub', () => {
       expect(hub.snapshot().seq).toBe(4)
     })
 
+    it('serves a clipped and a live subscriber at the same time without cross-talk', async () => {
+      const { backend } = fakeBackend()
+      const hub = createSessionHub({ backend, bufferLimit: 2 })
+      if (hub instanceof Error) throw hub
+      await hub.submit('first')
+      await wait(10)
+
+      const clipped: HubEvent[] = []
+      const live: HubEvent[] = []
+      const a = hub.subscribe({ cursor: 0, onEvent: (event) => clipped.push(event) })
+      const b = hub.subscribe({ cursor: 4, onEvent: (event) => live.push(event) })
+      if (a instanceof Error) throw a
+      if (b instanceof Error) throw b
+      expect(a.clipped).toBe(true)
+      expect(b.clipped).toBe(false)
+      expect(a.source).toBe('buffer')
+      expect(b.source).toBe('none')
+      expect(clipped.map((event) => event.seq)).toEqual([3, 4])
+      expect(live).toEqual([])
+
+      const second = await hub.submit('second')
+      expect(second).not.toBeInstanceOf(Error)
+      await wait(80)
+      // The first turn was session.started plus three turn events; this turn is
+      // prompt.started, one chunk and prompt.finished, so it ends at 7.
+      expect(hub.snapshot().seq).toBe(7)
+      // Both receive the whole second turn live; they differ only in replay history.
+      expect(clipped.map((event) => event.seq)).toEqual([3, 4, 5, 6, 7])
+      expect(live.map((event) => event.seq)).toEqual([5, 6, 7])
+      expect(hub.snapshot().subscribers).toBe(2)
+    })
+
     it('replays the whole history from the log when the buffer is smaller than it', async () => {
       const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-hub-ac13-tiny-'))
       const logFile = path.join(dir, 'events.jsonl')
