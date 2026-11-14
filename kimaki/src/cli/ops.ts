@@ -391,6 +391,7 @@ export function registerOpsCommands(cli: Goke) {
     .option('--token <token>', 'Optional shared token required in the x-kimaki-hub header')
     .option('--log <path>', 'Append-only JSONL event log; enables resume across restarts and takes a writer lease')
     .option('--timeout <ms>', 'Per-request ACP deadline in milliseconds')
+    .option('--buffer <n>', 'In-memory replay buffer size in events (default: 500)')
     .action(async (options) => {
       const cwd = required(options.cwd, 'cwd')
       const toolProfile = options.toolProfile ?? 'none'
@@ -400,11 +401,13 @@ export function registerOpsCommands(cli: Goke) {
       const timeoutMs = options.timeout === undefined ? undefined : Number(options.timeout)
       if (timeoutMs !== undefined && (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1)) fail(new ConfigError({ reason: '--timeout must be a positive integer in milliseconds' }))
       const model = options.model?.trim() ? options.model : undefined
+      const buffer = options.buffer === undefined ? undefined : Number(options.buffer)
+      if (buffer !== undefined && (!Number.isSafeInteger(buffer) || buffer < 1)) fail(new ConfigError({ reason: '--buffer must be a positive integer' }))
       const { createJcodeBackend } = await import('../backend/jcode.ts')
       const { createSessionHub } = await import('../backend/hub.ts')
       const { startHubServer } = await import('../backend/hub-server.ts')
       const backend = createJcodeBackend({ binary: options.binary ?? 'jcode', cwd, model, toolProfile: toolProfile as 'none' | 'minimal' | 'full', timeoutMs })
-      const hub = createSessionHub({ backend, model, logFile: options.log })
+      const hub = createSessionHub({ backend, model, logFile: options.log, ...(buffer === undefined ? {} : { bufferLimit: buffer }) })
       if (hub instanceof Error) {
         await backend.close()
         fail(hub)
@@ -457,6 +460,7 @@ export function registerOpsCommands(cli: Goke) {
       const deadline = setTimeout(() => controller.abort(), timeout)
       const chunks: string[] = []
       const events: Array<{ seq: number; type: string }> = []
+      let ready: { cursor: number; clipped: boolean; source: string } | undefined
       let lastSeq = cursor
       let outcome: { stopReason?: string; error?: string } = {}
       let settle: (() => void) | undefined
@@ -469,6 +473,14 @@ export function registerOpsCommands(cli: Goke) {
         clientId: options.client,
         cursor,
         signal: controller.signal,
+        // A clipped replay means the hub cannot serve what this client missed.
+        // Say so instead of presenting a partial tail as the whole stream.
+        onReady: (frame) => {
+          ready = { cursor: frame.cursor, clipped: frame.clipped, source: frame.source }
+          // The frame's cursor is the one we asked for, not the oldest retained
+          // event, so name the condition rather than inventing a sequence.
+          if (frame.clipped && !options.json) process.stderr.write('replay clipped: the hub no longer retains every event after the requested cursor\n')
+        },
         onEvent: (event) => {
           lastSeq = event.seq
           events.push({ seq: event.seq, type: event.type })
@@ -501,7 +513,9 @@ export function registerOpsCommands(cli: Goke) {
         controller.abort()
         await attach
         clearTimeout(deadline)
-        if (options.json) printJson({ state, events })
+        // `ready` carries the hub's own statement about whether the replay is
+        // complete, so a caller never has to infer it from the event list.
+        if (options.json) printJson({ state, events, ready })
         else process.stdout.write(`attached to ${url} at seq ${state.seq}\n`)
         return
       }
@@ -541,7 +555,7 @@ export function registerOpsCommands(cli: Goke) {
       clearTimeout(deadline)
 
       if (options.json) {
-        printJson({ events, characters: chunks.join('').length, stopReason: outcome.stopReason, error: outcome.error, acked, cursor: lastSeq })
+        printJson({ events, characters: chunks.join('').length, stopReason: outcome.stopReason, error: outcome.error, acked, cursor: lastSeq, ready })
       } else {
         process.stdout.write(`\n${outcome.error ?? outcome.stopReason ?? 'no result'}\n`)
       }

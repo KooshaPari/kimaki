@@ -196,6 +196,20 @@ test('refuses a cursor it cannot attribute to a session', async () => {
   } finally { await f.close() }
 })
 
+test('refuses an unreadable state file instead of starting from zero', async () => {
+  const f = await fixture()
+  const before = await count()
+  try {
+    // Starting over on a corrupt cursor would repost turns the channel already has.
+    fs.writeFileSync(f.statePath, '{"seq": ')
+    const view = f.start()
+    const result = await view.run
+    expect(result).toBeInstanceOf(Error)
+    expect((result as Error).message).toMatch(/state/i)
+    expect(await count()).toBe(before)
+  } finally { await f.close() }
+})
+
 test('refuses a state cursor that belongs to another session', async () => {
   const f = await fixture()
   try {

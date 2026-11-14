@@ -91,6 +91,15 @@ rl.on('line', (line) => {
     return
   }
   if (text.startsWith('silent')) return
+  if (text.startsWith('ECHO_USER')) {
+    update(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'a' } })
+    // jcode does not emit this during a prompt today, but if it ever does the
+    // typed text must not be folded into the assistant's turn text.
+    update(sid, { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'typed-midturn' } })
+    update(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'b' } })
+    send({ jsonrpc: '2.0', id: message.id, result: { stopReason: 'end_turn' } })
+    return
+  }
   if (text.startsWith('CORRECTION')) {
     update(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'the sky is grenn' } })
     // Hypothetical retraction frame. jcode 0.99.1 advertises no correction
@@ -235,6 +244,19 @@ test('streams prompt chunks in order and assembles the turn', async () => {
   // tool_call + two chunks; the unknown permission notification is ignored.
   expect(result.updateCount).toBe(3)
   expect(result.usage).toEqual({ inputTokens: 30754, outputTokens: 28, totalTokens: 30782 })
+})
+
+test('keeps a mid-turn user echo out of the assistant turn text', async () => {
+  const client = await startAgent()
+  ok(await client.initialize())
+  const { sessionId } = ok(await client.newSession({ cwd: process.cwd() }))
+  const chunks: string[] = []
+  const result = ok(await client.prompt({ sessionId, text: 'ECHO_USER', onChunk: (text) => chunks.push(text) }))
+  // The typed text belongs to history, never to the assistant's reply.
+  expect(chunks).toEqual(['a', 'b'])
+  expect(result.text).toBe('ab')
+  expect(result.text).not.toContain('typed-midturn')
+  expect(result.updateCount).toBe(3)
 })
 
 test('cannot retract text already streamed: an unknown update kind is ignored, not invented', async () => {

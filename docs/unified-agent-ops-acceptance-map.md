@@ -220,3 +220,14 @@ An earlier attempt at this run failed and was traced to the test model, not the 
 the local stub delayed every request because its slow-mode check matched a substring
 present in all request bodies, and the stub had expired mid-run. Both were fixed in the
 harness before the passing run above.
+
+## Second validation pass (2026-11-14, later)
+
+| Area | What was checked | Observed |
+| --- | --- | --- |
+| AC13 through the CLI | `ops jcode serve --buffer 2`, one real ACP turn, then `ops jcode attach --cursor 0` | JSON summary carried `"ready":{"cursor":0,"clipped":true,"source":"buffer"}` and only the tail events 4 and 5; plain mode printed `replay clipped: the hub no longer retains every event after the requested cursor`; cursor 4 returned `clipped:false` and `source:"buffer"` as the control |
+| AC13 gap in the CLI itself | `ops jcode attach` ignored the hub's ready frame, so a clipped replay looked complete | fixed: the ready frame is now surfaced, and `--buffer` makes the bounded case reachable from the shipped command |
+| AC25 lookup failure | `429` on the channel lookup rather than the send | exit non-zero, **zero** POSTs, no `sent` line |
+| AC25 transient send failure | `503` on the send | exit non-zero after exactly **one** POST, no retry |
+| AC12 prompt-time echo | a `user_message_chunk` arriving during a prompt | excluded from the assistant text (test asserts `ab`, not `atyped-midturnb`); the mutation that folds it in fails the test |
+| Rebind with a damaged cursor | corrupt view state file | refused with an error naming the state, and nothing posted |
