@@ -14,10 +14,10 @@ Checksums from the bundle's own `SHA256SUMS.txt`: 7 of 7 documents match.
 | --- | --- |
 | Closed at the plan's standard | 13 |
 | Partial | 19 |
-| Not started | 10 |
+| Not started | 8 |
 | Total | 40 |
 
-AC03, AC04, AC06, AC07, AC09, AC10, AC11, AC13, AC14, AC17, AC18, AC23 and AC25 are closed. Every other case still lacks both a real native surface and a live service path in the same piece of evidence, which is the standard the plan sets. AC18 closed when a real Codex 0.169 app-server raised an approval request and the client's answer changed what the runtime executed. AC19 is partial: a payload digest pins an answer to the artifact the caller read, but fileChange content is not covered and no real-binary digest witness exists. AC20 is partial: a stub 401 and an emptied token fail closed, but no live Discord credential was revoked. AC33 is partial: a local JSON backup restores binding ids, generations, state and route ownership, but not an external store or a live cutover. AC38 is partial: the view guard is proven against a live session change from a fake hub, not a real `createSessionHub` rebind path. AC15 is partial: a throwing backend before ACK fails closed, but the crash is a fake throw. AC27 is partial: a cold inbox backlog replays once, but against the fixture hub. AC21 is partial: the view posts an injected turn as inert text with no mentions, but only the view path is covered. AC26 is partial: a second view on the same channel is refused, but no general bot-to-bot echo test exists.
+AC03, AC04, AC06, AC07, AC09, AC10, AC11, AC13, AC14, AC17, AC18, AC23, AC25 are closed. Every other case still lacks both a real native surface and a live service path in the same piece of evidence, which is the standard the plan sets.
 
 ## Acceptance cases
 
