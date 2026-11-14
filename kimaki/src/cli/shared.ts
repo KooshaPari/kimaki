@@ -5,6 +5,7 @@
 // discord.js are imported lazily too: loading them costs ~0.4s and ~250 MB per
 // CLI call, and most commands only talk to the bot over the lock port.
 
+import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import type { OpenCodeClient } from '@opencode/client'
@@ -24,7 +25,15 @@ export const SESSION_HELP = 'Session ID, Discord thread ID or thread URL (defaul
 export function fail(error: Error, code = 1): never {
   const lines = [error.message]
   for (let cause = error.cause; cause instanceof Error; cause = cause.cause) lines.push(`  caused by: ${cause.message}`)
-  process.stderr.write(`${lines.join('\n')}\n`)
+  const text = `${lines.join('\n')}\n`
+  // stderr to a pipe is asynchronous: exiting straight after the write can abort
+  // inside libuv on Windows (UV_HANDLE_CLOSING, exit 0xC0000409) before the text
+  // is flushed. Write synchronously, then exit with the intended code.
+  try {
+    fs.writeSync(2, text)
+  } catch {
+    process.stderr.write(text)
+  }
   process.exit(code)
 }
 

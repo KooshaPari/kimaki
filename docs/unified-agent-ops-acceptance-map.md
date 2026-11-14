@@ -284,3 +284,15 @@ Fourth pass:
 | Two surfaces on one session | two `ops discord view` processes on different channels of one hub | **defect found and fixed**: both views defaulted to client id `discord-view`, and the hub refuses a duplicate id (`Hub refused the stream with status 400`), so only one channel ever received the turn. The default is now `discord-view-<pid>`. After the fix both channels received exactly one message and both state files recorded the same session id at sequence 4 |
 | Wrong tenant | `ops discord view --tenant 000000000000000000` on a channel owned by another guild | refuses without posting; covered by a unit test that asserts an Error, no message and no state file. **Open issue**: the CLI process exits with Windows code `0xC0000409` and a libuv `UV_HANDLE_CLOSING` assertion instead of a clean 1 when it fails this early, so the refusal is correct but the exit path is not clean |
 | Rebind with a cursor ahead of the hub | state `{sessionId: <real>, seq: <seq + 500>}` | **defect found and fixed**: the view exited 0 with `{"kind":"closed"}` and `attach --cursor 500` also exited 0 with no events. The hub wrote SSE headers before subscribing, so its refusal arrived as a 200 whose JSON body the client read as an empty stream, and `attach` ignored the `Error` that `openHubStream` resolves. The server now subscribes before writing headers (400 with `Hub cursor is ahead of the stream`) and the CLI fails on a refused attach. Re-verified: raw fetch returns 400, and `attach --cursor 500` exits 1 |
+
+Exit-abort investigation for that open issue:
+
+| Check | Observed |
+| --- | --- |
+| Reproduction | three runs of the wrong-tenant view: exits `3221226505`, `1`, `3221226505`; the first probe run was `0xC0000409` twice out of three, so it is a race, not a deterministic failure |
+| Unreachable hub (`--url http://127.0.0.1:1`) | exit 1, clean. The abort needs a completed Discord REST exchange |
+| `ops publish` with a missing event file | exit 1, clean. No REST exchange |
+| Synchronous stderr write in `fail` | kept, because it guarantees the message is flushed before exit, but it does not change the abort (`0xC0000409` on three of three after the change) |
+| `REST` client | exposes no `destroy()` in discord.js 14.26.4, so the CLI cannot close the keep-alive agent before exiting |
+
+Conclusion: the abort comes from calling `process.exit()` while discord.js' keep-alive socket is still closing, which libuv reports as a closing async handle. A clean fix means replacing `process.exit()` in the CLI's `fail` path with a drained exit (set `process.exitCode`, let the loop close sockets, and only then terminate), which touches every command's exit strategy. The message is still printed before the abort, and the exit code is non-zero either way, so the refusal is safe; the cleanliness of the code is the remaining gap and is left documented rather than half-fixed.
