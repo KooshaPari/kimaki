@@ -2,9 +2,14 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import { ChannelType, REST, Routes } from 'discord.js'
 import { ConfigError, DiscordError } from '../../errors.js'
+import { markForPublish, type EchoConfig } from './echo.ts'
 
-export async function openNativeDiscordWatch({ rest, tenantId, channelId, statePath, sessionId }: {
+export async function openNativeDiscordWatch({ rest, tenantId, channelId, statePath, sessionId, echo }: {
   rest: REST; tenantId: string; channelId: string; statePath: string; sessionId: string
+  // Optional durable provenance. When supplied, every posted message carries
+  // this service's echo marker so a sibling ingest drops it instead of
+  // publishing it again. Omitted, the output line is unchanged.
+  echo?: EchoConfig
 }): Promise<Error | { publish: (history: { role: string; text: string }[]) => Promise<Error | number> }> {
   let cursor = 0
   try {
@@ -26,8 +31,14 @@ export async function openNativeDiscordWatch({ rest, tenantId, channelId, stateP
     let count = 0
     for (let index = cursor; index < history.length; index++) {
       const message = history[index]!
+      const content = `${message.role}: ${message.text}`
       const sent = await rest.post(Routes.channelMessages(channelId), {
-        body: { content: `${message.role}: ${message.text}`, allowed_mentions: { parse: [] } },
+        body: {
+          content: echo
+            ? markForPublish({ serviceId: echo.serviceId, origin: `watch:${index}`, hop: 1, content })
+            : content,
+          allowed_mentions: { parse: [] },
+        },
       }).catch((cause) => new DiscordError({ operation: 'publish native watch message', cause }))
       if (sent instanceof Error) return sent
       try {

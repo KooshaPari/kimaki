@@ -6,6 +6,7 @@ import { afterAll, beforeAll, expect, test } from 'vitest'
 import { ChannelType, REST } from 'discord.js'
 import { DigitalDiscord } from 'discord-digital-twin/src'
 import { openNativeDiscordWatch } from './watch.ts'
+import { classifyIncoming, readEchoMarker, stripEchoMarker } from './echo.ts'
 
 const root = 'E:\\koosh\\Agents\\scratch\\native-discord'
 let twin: DigitalDiscord
@@ -68,4 +69,23 @@ test('429 is surfaced once without advancing durable cursor', async () => {
     await new Promise<void>((resolve) => server.close(() => resolve()))
     await fs.rm(statePath, { force: true })
   }
+})
+
+test('an echo-configured publish carries the durable marker that blocks re-ingest', async () => {
+  const statePath = state('echo-marker')
+  await fs.rm(statePath, { force: true })
+  const before = (await twin.channel(channelId).getMessages()).length
+  const echo = { serviceId: 'kimaki', self: { id: twin.botUserId, bot: true } }
+  try {
+    const watcher = await openNativeDiscordWatch({ rest: rest(), tenantId: twin.guildId, channelId, statePath, sessionId: 'native-session', echo })
+    if (watcher instanceof Error) throw watcher
+    expect(await watcher.publish(history.slice(0, 1))).toBe(1)
+    const posted = (await twin.channel(channelId).getMessages()).at(-1)!
+    // The mirror line is unchanged; provenance is an added, typed trailer.
+    expect(stripEchoMarker(posted.content)).toBe('user: native-ok')
+    expect(readEchoMarker(posted.content)).toEqual({ serviceId: 'kimaki', origin: 'watch:0', hop: 1 })
+    const message = { id: posted.id, author: { id: posted.author.id, bot: !!posted.author.bot }, content: posted.content }
+    expect(classifyIncoming(message, echo)).toEqual({ action: 'drop', reason: 'own-message' })
+    expect((await twin.channel(channelId).getMessages()).length - before).toBe(1)
+  } finally { await fs.rm(statePath, { force: true }) }
 })
