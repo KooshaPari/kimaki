@@ -538,6 +538,10 @@ export function registerOpsCommands(cli: Goke) {
     .option('--interval <ms>', 'Polling interval in milliseconds (default: 2000)')
     .option('--iterations <n>', 'Stop after this many polls; 0 keeps polling (default: 0)')
     .option('--emit-existing', 'Emit history already present at attach time')
+    .option('--tenant <id>', 'Discord guild ID')
+    .option('--surface <id>', 'Discord channel ID')
+    .option('--token <token>', 'Bot token (default: KIMAKI_BOT_TOKEN)')
+    .option('--state <path>', 'Durable native message cursor file')
     .action(async (options) => {
       const session = required(options.session, 'session')
       const cwd = required(options.cwd, 'cwd')
@@ -546,6 +550,17 @@ export function registerOpsCommands(cli: Goke) {
       const iterations = options.iterations === undefined ? 0 : Number(options.iterations)
       if (!Number.isSafeInteger(iterations) || iterations < 0) fail(new ConfigError({ reason: '--iterations must be zero or a positive integer' }))
       const { createAcpClient } = await import('../backend/acp/client.ts')
+      const discordRequested = [options.tenant, options.surface, options.state, options.token].some((value) => value !== undefined)
+      if (discordRequested && (!options.tenant?.trim() || !options.surface?.trim() || !options.state?.trim() || !(options.token ?? process.env['KIMAKI_BOT_TOKEN'])?.trim())) fail(new ConfigError({ reason: 'Discord watch requires --tenant, --surface, --state and --token (or KIMAKI_BOT_TOKEN) together' }))
+      let mirror: Exclude<Awaited<ReturnType<typeof import('../ops/discord/watch.ts').openNativeDiscordWatch>>, Error> | undefined
+      if (discordRequested) {
+        const { REST } = await import('discord.js')
+        const { openNativeDiscordWatch } = await import('../ops/discord/watch.ts')
+        const rest = new REST({ ...(process.env['KIMAKI_DISCORD_REST_URL'] ? { api: process.env['KIMAKI_DISCORD_REST_URL'] } : {}), version: '10', rejectOnRateLimit: () => true }).setToken(options.token ?? process.env['KIMAKI_BOT_TOKEN']!)
+        const opened = await openNativeDiscordWatch({ rest, tenantId: options.tenant!, channelId: options.surface!, statePath: options.state!, sessionId: session })
+        if (opened instanceof Error) fail(opened)
+        mirror = opened
+      }
       // jcode 0.99.1 does not stream another client's turn into an attached ACP
       // session (observed: zero updates while `jcode run --resume` wrote to the
       // same session), and a second `session/load` on the same connection returns
@@ -579,9 +594,15 @@ export function registerOpsCommands(cli: Goke) {
           // rather than inventing continuity.
           watermark = 0
         }
-        for (const message of loaded.history.slice(watermark)) {
-          printJson({ kind: 'native', role: message.role, text: message.text, index: seen })
-          seen += 1
+        if (mirror) {
+          const published = await mirror.publish(loaded.history)
+          if (published instanceof Error) { failure = published; break }
+          seen += published
+        } else {
+          for (const message of loaded.history.slice(watermark)) {
+            printJson({ kind: 'native', role: message.role, text: message.text, index: seen })
+            seen += 1
+          }
         }
         watermark = loaded.history.length
         polls += 1
