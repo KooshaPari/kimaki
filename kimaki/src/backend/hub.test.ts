@@ -345,4 +345,62 @@ describe('createSessionHub', () => {
     const again = hub.subscribe({ clientId: 'cli', onEvent: () => {} })
     expect(again).not.toBeInstanceOf(Error)
   })
+
+  it('remembers an acknowledgement across a restart when the stream is durable', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-hub-acks-'))
+    const logFile = path.join(dir, 'events.jsonl')
+    try {
+      const first = createSessionHub({ backend: fakeBackend().backend, logFile })
+      if (first instanceof Error) throw first
+      const subscription = first.subscribe({ clientId: 'cli', onEvent: () => {} })
+      if (subscription instanceof Error) throw subscription
+      await first.submit('hello')
+      await wait(10)
+      expect(first.ack({ clientId: 'cli', seq: 4 })).toEqual({ acked: 4 })
+      await first.close()
+
+      const second = createSessionHub({ backend: fakeBackend().backend, logFile })
+      if (second instanceof Error) throw second
+      const resumed = second.subscribe({ clientId: 'cli', onEvent: () => {} })
+      if (resumed instanceof Error) throw resumed
+      expect(second.snapshot().clients).toContainEqual({ clientId: 'cli', acked: 4 })
+      await second.close()
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('does not pretend to remember acks without a durable stream', async () => {
+    const hub = createSessionHub({ backend: fakeBackend().backend })
+    if (hub instanceof Error) throw hub
+    const subscription = hub.subscribe({ clientId: 'cli', onEvent: () => {} })
+    if (subscription instanceof Error) throw subscription
+    await hub.submit('hello')
+    await wait(10)
+    expect(hub.ack({ clientId: 'cli', seq: 4 })).toEqual({ acked: 4 })
+    expect(hub.snapshot().durable).toBe(false)
+    const other = createSessionHub({ backend: fakeBackend().backend })
+    if (other instanceof Error) throw other
+    const fresh = other.subscribe({ clientId: 'cli', onEvent: () => {} })
+    if (fresh instanceof Error) throw fresh
+    expect(other.snapshot().clients).toContainEqual({ clientId: 'cli', acked: 0 })
+  })
+
+  it('clamps a stale ack file entry to the restored sequence', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-hub-acks-clamp-'))
+    const logFile = path.join(dir, 'events.jsonl')
+    const acksFile = `${logFile}.acks.json`
+    try {
+      fs.writeFileSync(logFile, `${JSON.stringify({ seq: 1, type: 'prompt.started', characters: 5 })}\n`)
+      fs.writeFileSync(acksFile, JSON.stringify({ cli: 99 }))
+      const hub = createSessionHub({ backend: fakeBackend().backend, logFile })
+      if (hub instanceof Error) throw hub
+      const subscription = hub.subscribe({ clientId: 'cli', onEvent: () => {} })
+      if (subscription instanceof Error) throw subscription
+      expect(hub.snapshot().clients).toContainEqual({ clientId: 'cli', acked: 1 })
+      await hub.close()
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
 })

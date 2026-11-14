@@ -112,6 +112,21 @@ function readLog(logFile: string): HubEvent[] {
   return events
 }
 
+function readAcks(acksFile: string): Record<string, number> {
+  try {
+    const parsed: unknown = JSON.parse(fs.readFileSync(acksFile, 'utf8'))
+    if (!isRecord(parsed)) return {}
+    const acks: Record<string, number> = {}
+    for (const [clientId, value] of Object.entries(parsed)) {
+      if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) acks[clientId] = value
+    }
+    return acks
+  } catch {
+    // A missing or torn ack file just means nothing is remembered yet.
+    return {}
+  }
+}
+
 function pidAlive(pid: number): boolean {
   try {
     process.kill(pid, 0)
@@ -176,6 +191,20 @@ export function createSessionHub({
   const restored = logFile === undefined ? [] : readLog(logFile)
   let seq = restored.length > 0 ? restored[restored.length - 1]!.seq : 0
   const buffer: HubEvent[] = restored.slice(-bufferLimit)
+  // Acknowledgements survive a restart only when the stream itself is durable.
+  const acksFile = logFile === undefined ? undefined : `${logFile}.acks.json`
+  const persistedAcks = acksFile === undefined ? {} : readAcks(acksFile)
+  const persistAck = (clientId: string, acked: number): void => {
+    if (acksFile === undefined) return
+    const next = { ...persistedAcks, [clientId]: acked }
+    try {
+      fs.mkdirSync(path.dirname(acksFile), { recursive: true })
+      fs.writeFileSync(acksFile, JSON.stringify(next))
+      persistedAcks[clientId] = acked
+    } catch {
+      // Losing the ack file degrades resume, it does not break the stream.
+    }
+  }
   let started = false
   let busy = false
   let closed = false
@@ -276,7 +305,7 @@ export function createSessionHub({
       }
     }
 
-    const entry = { deliver: onEvent, acked: wanted }
+    const entry = { deliver: onEvent, acked: Math.min(seq, Math.max(wanted, persistedAcks[identity] ?? 0)) }
     subscribers.set(identity, entry)
     return {
       clientId: identity,
@@ -297,7 +326,10 @@ export function createSessionHub({
     const entry = subscribers.get(clientId)
     if (entry === undefined) return new ConfigError({ reason: `Client ${clientId} is not attached` })
     // Monotonic: a stale ack from a reconnecting client must not move it backwards.
-    if (acked > entry.acked) entry.acked = acked
+    if (acked > entry.acked) {
+      entry.acked = acked
+      persistAck(clientId, acked)
+    }
     return { acked: entry.acked }
   }
 
