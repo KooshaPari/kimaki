@@ -34,7 +34,7 @@ AC03, AC04, AC06, AC13, AC14, AC23 and AC25 are closed. Every other case still l
 | AC09 | PID reuse/runtime restart | not started | no PID-reuse or runtime-restart separation case |
 | AC10 | Wrong backend fallback | not started | no wrong-binary, wrong-profile or wrong-provider negative case |
 | AC11 | Unsupported capability | partial | capabilities declare unsupported operations and the CLI refuses them; no per-operation pre-dispatch test |
-| AC12 | JCode text correction | not started | the native surface does not exist. A real jcode 0.99.1 ACP turn emits only `available_commands_update`, `agent_message_chunk` and `usage_update`, and its `agentCapabilities` declares `loadSession`, `promptCapabilities` and `sessionCapabilities` (close, resume) with no retraction or correction surface. A probe whose model restated a misspelling delivered both strings as ordinary chunks. `client.test.ts` now proves an unknown update kind is ignored rather than rendered as a fabricated correction, so this case is gated on an agent-side surface, not on client work |
+| AC12 | JCode text correction | not started | the native surface does not exist. A real jcode 0.99.1 ACP turn emits only `available_commands_update`, `agent_message_chunk` and `usage_update`, and its `agentCapabilities` declares `loadSession`, `promptCapabilities` and `sessionCapabilities` (close, resume) with no retraction or correction surface. A probe whose model restated a misspelling delivered both strings as ordinary chunks. `client.test.ts` proves an unknown update kind is ignored rather than rendered as a fabricated correction. Separately measured: `session/load` answers success for an id that does not exist and replays nothing, so `ops jcode history` refuses an empty replay (exit 1 with a naming message) unless `--allow-empty` is passed, rather than letting "0 messages" read as a real session. Gated on an agent-side surface, not on client work |
 | AC13 | Stream gap/overflow | closed | `hub.test.ts` covers the explicit gap path: a cursor behind the retained buffer returns `clipped: true` with the retained tail, a cursor at the head returns `clipped: false`, and a durable log replays in full from cursor 0. Observed cursor values and delivered event ids recorded in the test; 27 hub tests and `tsc` clean at `d9b1bf31` |
 | AC14 | Duplicate incoming event | closed | real run through the public CLI and HTTP API: first submit admitted with `duplicate: false`, the same request id returned `duplicate: true` without a second turn, the sequence advanced exactly once (4), the same id with different text was refused with 409, and a fresh id was admitted |
 | AC15 | Crash after launch before ACK | not started | no crash-after-launch-before-ack case |
@@ -47,7 +47,7 @@ AC03, AC04, AC06, AC13, AC14, AC23 and AC25 are closed. Every other case still l
 | AC22 | Worker success, sync-back failure | not started | no worker-success/sync-back-failure reconciliation case |
 | AC23 | Failed HERDR wait/read | closed | real CLI run with a binary that cannot exist: exit 1, no JSON inventory on stdout, and a message naming the failed Herdr inventory command. Unit tests also cover a missing binary and unsafe timeouts before spawning |
 | AC24 | Synthetic engine backend | partial | identity comparison fails closed; no synthetic-engine oracle test |
-| AC25 | Output send failure/429 | closed | a local REST stub answers the channel lookup 200 and the send 429: the CLI exits non-zero after exactly one POST, never prints `sent`, and emits a non-empty failure. `rejectOnRateLimit` was set on both REST clients because discord.js otherwise re-issues a 429 forever, which contradicted the at-most-once claim |
+| AC25 | Output send failure/429 | closed | a local REST stub answers the channel lookup 200 and the send 429: the CLI exits non-zero after exactly one POST, never prints `sent`, and emits a non-empty failure. The same stub with a 500 exposed a second defect: discord.js retried the send three times, so one call made four delivery attempts. Both clients now set `rejectOnRateLimit: () => true` and `retries: 0`, and the 500 case is pinned by its own test (one attempt, non-zero exit). `ops follow` has a dedicated 429 witness as well |
 | AC26 | Echo between bots/services | not started | no echo suppression case |
 | AC27 | Cold inbox backlog | not started | no cold inbox backlog case |
 | AC28 | Usage across reattach/retry | partial | ACP token usage is surfaced per turn; no accounting across reattach or retry |
@@ -97,6 +97,7 @@ fails, then restoring the file and re-running the suite green.
 | AC13 | `clipped = true` in the log branch | 2 tests fail, including the full-log replay case |
 | AC25 | removed `rejectOnRateLimit` from all four REST clients | the 429 test fails after 120103 ms: the retry loop never returns and `posts` is not 1 |
 | AC12 | the client renders an unknown `agent_message_retraction` as the text `<retracted>` | the test fails with `the sky is grenn<retracted>...`, so it detects fabrication |
+| AC13 | `if (ready.clipped)` disabled in `ops discord view` | the new clipped-replay test fails after 30013 ms: the view would mirror a partial turn instead of refusing |
 
 Restored state: `hub.test.ts`, `acp/client.test.ts`, `ops-publish.e2e.test.ts` and
 `discord/watch.test.ts` are 49 of 49 green, and `git status` is clean.
@@ -110,6 +111,8 @@ Coverage of the 429 path after this pass:
   that the process must exit; it was not separately mutated to avoid a ten-minute run.
 - Native mirror: `discord/watch.test.ts` covers a 429 leaving the cursor unadvanced.
 - `ops discord view`: uses the same guarded client; not separately 429-tested.
+- 5xx: measured before the fix at four POST attempts for one call, now exactly one, pinned
+  by the 500 test.
 
 The AC12 probe was reproduced on jcode 0.99.1: 14 `agent_message_chunk` updates plus
 `available_commands_update` and `usage_update`, and no correction kind.

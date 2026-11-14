@@ -19,7 +19,7 @@ beforeAll(async () => {
 afterAll(async () => { await discord?.stop() })
 
 let serial = 0
-async function fixture(fail = false) {
+async function fixture(fail = false, bufferLimit?: number) {
   const backend: HubBackend = {
     async start() { return { sessionId: 'view-session', model: null } },
     async prompt(_prompt, onChunk) {
@@ -31,7 +31,7 @@ async function fixture(fail = false) {
     async cancel() { return undefined },
     async close() {},
   }
-  const hub = createSessionHub({ backend })
+  const hub = createSessionHub(bufferLimit === undefined ? { backend } : { backend, bufferLimit })
   if (hub instanceof Error) throw hub
   const server = await startHubServer({ hub, port: 0 })
   if (server instanceof Error) throw server
@@ -126,5 +126,20 @@ test('failed turn posts reason without prompt text', async () => {
     expect(messages.at(-1)?.content).not.toContain('private prompt text')
     view.controller.abort()
     expect(await view.run).toBeUndefined()
+  } finally { await f.close() }
+})
+
+test('refuses a clipped replay instead of mirroring a partial history', async () => {
+  const f = await fixture(false, 2)
+  const before = await count()
+  try {
+    // Four events against a two-event buffer, so cursor 0 predates the buffer.
+    expect(await f.hub.submit('too old to replay')).not.toBeInstanceOf(Error)
+    const view = f.start()
+    const result = await view.run
+    expect(result).toBeInstanceOf(Error)
+    expect((result as Error).message).toMatch(/clipped/i)
+    expect(await count()).toBe(before)
+    expect(fs.existsSync(f.statePath)).toBe(false)
   } finally { await f.close() }
 })

@@ -64,7 +64,7 @@ export function registerOpsCommands(cli: Goke) {
       const timeout = options.timeout === undefined ? 60_000 : Number(options.timeout)
       if (!Number.isSafeInteger(timeout) || timeout < 1 || timeout > 2_147_483_647) fail(new ConfigError({ reason: '--timeout must be a positive integer in milliseconds' }))
       // At-most-once delivery: a 429 must surface as a failure, never be retried silently.
-      const rest = new (await import('discord.js')).REST({ ...(process.env['KIMAKI_DISCORD_REST_URL'] ? { api: process.env['KIMAKI_DISCORD_REST_URL'] } : {}), version: '10', rejectOnRateLimit: () => true }).setToken(token)
+      const rest = new (await import('discord.js')).REST({ ...(process.env['KIMAKI_DISCORD_REST_URL'] ? { api: process.env['KIMAKI_DISCORD_REST_URL'] } : {}), version: '10', retries: 0, rejectOnRateLimit: () => true }).setToken(token)
       const counts = { sent: 0, denied: 0, ignored: 0 }
       const grant = { ...target, publication: 'metadata' as const, consent: true }
       const controller = new AbortController()
@@ -164,7 +164,7 @@ export function registerOpsCommands(cli: Goke) {
       if (!observed || typeof observed !== 'object' || !observed.key || typeof observed.key !== 'object' || !observed.source || typeof observed.source !== 'object' || !observed.raw || typeof observed.raw !== 'object' || !observed.raw.data || typeof observed.raw.data !== 'object' || Array.isArray(observed.raw.data)) fail(new ConfigError({ reason: 'Invalid OpenCode observed event in --event-file' }))
       const { REST } = await import('discord.js')
       const { publishObservedMetadata } = await import('../ops/discord/publication.ts')
-      const rest = new REST({ ...(process.env['KIMAKI_DISCORD_REST_URL'] ? { api: process.env['KIMAKI_DISCORD_REST_URL'] } : {}), version: '10', rejectOnRateLimit: () => true }).setToken(token)
+      const rest = new REST({ ...(process.env['KIMAKI_DISCORD_REST_URL'] ? { api: process.env['KIMAKI_DISCORD_REST_URL'] } : {}), version: '10', retries: 0, rejectOnRateLimit: () => true }).setToken(token)
       const result = await publishObservedMetadata({ rest, target, observed, grant: { ...target, publication: 'metadata', consent: true } })
       if (result instanceof Error) fail(result)
       if (result.kind === 'denied') fail(new ConfigError({ reason: 'Publication denied: event and Discord surface must match the explicit scope' }))
@@ -556,7 +556,7 @@ export function registerOpsCommands(cli: Goke) {
       if (discordRequested) {
         const { REST } = await import('discord.js')
         const { openNativeDiscordWatch } = await import('../ops/discord/watch.ts')
-        const rest = new REST({ ...(process.env['KIMAKI_DISCORD_REST_URL'] ? { api: process.env['KIMAKI_DISCORD_REST_URL'] } : {}), version: '10', rejectOnRateLimit: () => true }).setToken(options.token ?? process.env['KIMAKI_BOT_TOKEN']!)
+        const rest = new REST({ ...(process.env['KIMAKI_DISCORD_REST_URL'] ? { api: process.env['KIMAKI_DISCORD_REST_URL'] } : {}), version: '10', retries: 0, rejectOnRateLimit: () => true }).setToken(options.token ?? process.env['KIMAKI_BOT_TOKEN']!)
         const opened = await openNativeDiscordWatch({ rest, tenantId: options.tenant!, channelId: options.surface!, statePath: options.state!, sessionId: session })
         if (opened instanceof Error) fail(opened)
         mirror = opened
@@ -618,6 +618,7 @@ export function registerOpsCommands(cli: Goke) {
     .option('--cwd <path>', 'Working directory the session belongs to')
     .option('--binary <path>', 'Jcode executable (default: jcode)')
     .option('--timeout <ms>', 'Per-request ACP deadline in milliseconds')
+    .option('--allow-empty', 'Accept a session that replays no history')
     .option('--json', 'Print one JSON document instead of one line per message')
     .action(async (options) => {
       const session = required(options.session, 'session')
@@ -634,6 +635,12 @@ export function registerOpsCommands(cli: Goke) {
       const loaded = await client.loadSession({ sessionId: session, cwd })
       await client.close()
       if (loaded instanceof Error) fail(loaded)
+      // jcode 0.99.1 answers session/load successfully for an id that does not
+      // exist and replays nothing, so an empty replay is ambiguous. Refuse it
+      // rather than let an operator read "0 messages" as a real session.
+      if (loaded.history.length === 0 && options.allowEmpty !== true) {
+        fail(new ConfigError({ reason: 'The agent replayed no history; jcode 0.99.1 also returns success for an unknown session id, so this is refused unless --allow-empty is given' }))
+      }
       // Replayed input is what the native client sent, so it is the only proof
       // that a session outside kimaki is being observed rather than invented.
       if (options.json) printJson({ sessionId: loaded.sessionId, model: loaded.model, history: loaded.history })
@@ -664,7 +671,7 @@ export function registerOpsCommands(cli: Goke) {
       if (!Number.isSafeInteger(timeout) || timeout < 0) fail(new ConfigError({ reason: '--timeout must be zero or a positive integer in milliseconds' }))
       const { REST } = await import('discord.js')
       const { openDiscordView } = await import('../ops/discord/view.ts')
-      const rest = new REST({ ...(process.env['KIMAKI_DISCORD_REST_URL'] ? { api: process.env['KIMAKI_DISCORD_REST_URL'] } : {}), version: '10', rejectOnRateLimit: () => true }).setToken(token)
+      const rest = new REST({ ...(process.env['KIMAKI_DISCORD_REST_URL'] ? { api: process.env['KIMAKI_DISCORD_REST_URL'] } : {}), version: '10', retries: 0, rejectOnRateLimit: () => true }).setToken(token)
       const controller = new AbortController()
       const deadline = timeout === 0 ? null : setTimeout(() => controller.abort(), timeout)
       const failure = await openDiscordView({
