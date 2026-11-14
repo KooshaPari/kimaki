@@ -213,6 +213,8 @@ Real-binary approval witness, all through the shipped CLI:
 | `--approval accept`, two commands in one turn | two separate approval requests, one per command, each answered `accept`; both commands ran |
 | `--approval acceptForSession`, two different commands | two requests again, so the session grant is not a blanket pass for the turn |
 | `--approval acceptForSession`, the identical command twice | exactly one request; both invocations ran (`exit code 0`, `approval-ok` twice), so codex keys the session grant on the command |
+| `--approval accept`, `require_escalated` request | the request carried the model's own justification in `reason` and a `digest`; accepting it ran the command outside the sandbox (`Process exited with code 0 ... Output: escalated-ok`) |
+| `--approval decline`, same escalation | `exec_command failed: Rejected("rejected by user")`; nothing ran |
 | `ops codex serve --approval accept --approval-policy untrusted` | the hub surfaced the same request on stdout and the command ran (`exit code 0`, `approval-ok`) |
 
 The witness model is a local stub that speaks the Responses API, so no account credential is involved; every other element is the shipped program and the real codex 0.169 binary.
