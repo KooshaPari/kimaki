@@ -180,3 +180,20 @@ test('a 429 on the view post fails without advancing the cursor', async () => {
     await new Promise<void>((resolve) => stub.close(() => resolve()))
   }
 })
+
+test('refuses a state cursor that belongs to another session', async () => {
+  const f = await fixture()
+  try {
+    expect(await f.hub.submit('bound turn')).not.toBeInstanceOf(Error)
+    const sessionId = f.hub.snapshot().sessionId
+    expect(typeof sessionId).toBe('string')
+    // A cursor from a different session would silently skip this one's turns.
+    fs.writeFileSync(f.statePath, JSON.stringify({ sessionId: 'other-session', seq: f.hub.snapshot().seq }))
+    const before = await count()
+    const view = f.start()
+    const result = await view.run
+    expect(result).toBeInstanceOf(Error)
+    expect((result as Error).message).toMatch(/belongs to session/)
+    expect(await count()).toBe(before)
+  } finally { await f.close() }
+})

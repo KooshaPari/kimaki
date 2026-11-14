@@ -2,7 +2,7 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import { ChannelType, REST, Routes } from 'discord.js'
 import { ConfigError, DiscordError } from '../../errors.js'
-import { ackHub, openHubStream } from '../../backend/hub-client.ts'
+import { ackHub, openHubStream, readHubState } from '../../backend/hub-client.ts'
 import type { HubEvent } from '../../backend/hub.ts'
 
 export async function openDiscordView({ rest, tenantId, channelId, clientId, cursor, statePath, baseUrl, signal, onPosted }: {
@@ -17,10 +17,12 @@ export async function openDiscordView({ rest, tenantId, channelId, clientId, cur
   onPosted?: (seq: number) => void
 }): Promise<Error | undefined> {
   let posted = 0
+  let savedSession: string | undefined
   try {
-    const saved = JSON.parse(await fs.readFile(statePath, 'utf8')) as { seq?: unknown }
+    const saved = JSON.parse(await fs.readFile(statePath, 'utf8')) as { seq?: unknown; sessionId?: unknown }
     if (!Number.isSafeInteger(saved.seq) || (saved.seq as number) < 0) return new ConfigError({ reason: 'Invalid Discord view state cursor' })
     posted = saved.seq as number
+    if (typeof saved.sessionId === 'string' && saved.sessionId.trim()) savedSession = saved.sessionId
   } catch (cause) {
     if ((cause as NodeJS.ErrnoException).code !== 'ENOENT') {
       return new ConfigError({ reason: 'Cannot read Discord view state', cause })
@@ -28,6 +30,14 @@ export async function openDiscordView({ rest, tenantId, channelId, clientId, cur
     console.info(`Discord view state missing at ${statePath}; starting at sequence 0`)
   }
   if (cursor !== undefined && (!Number.isSafeInteger(cursor) || cursor < 0)) return new ConfigError({ reason: 'Invalid Discord view cursor' })
+  // A view resume is only meaningful for the session it was posted from. Refuse a
+  // state file that belongs to another session instead of silently skipping its
+  // turns, which is what makes rebinding safe rather than lossy.
+  const hubState = await readHubState({ baseUrl })
+  if (hubState instanceof Error) return hubState
+  if (savedSession !== undefined && hubState.sessionId !== null && hubState.sessionId !== savedSession) {
+    return new ConfigError({ reason: `Discord view state belongs to session ${savedSession}, but the hub is serving ${hubState.sessionId}` })
+  }
   const channel = await rest.get(Routes.channel(channelId)).catch((cause) => new DiscordError({ operation: 'read Discord view channel', cause }))
   if (channel instanceof Error) return channel
   if (!channel || typeof channel !== 'object' || !('id' in channel) || channel.id !== channelId
@@ -43,9 +53,20 @@ export async function openDiscordView({ rest, tenantId, channelId, clientId, cur
   let pending = Promise.resolve()
   let text = ''
   let lastSeen = posted
+  let boundSession = savedSession ?? (hubState.sessionId ?? undefined)
   const handle = async (event: HubEvent): Promise<void> => {
     if (failure || event.seq <= lastSeen) return
     lastSeen = event.seq
+    if (event.type === 'session.started') {
+      // The hub names its session on start; a state file for a different one is a
+      // rebind, not a resume, so it must fail rather than mix two sessions.
+      if (boundSession !== undefined && boundSession !== event.sessionId) {
+        failure = new ConfigError({ reason: `Discord view state belongs to session ${boundSession}, but the hub started ${event.sessionId}` })
+        controller.abort()
+        return
+      }
+      boundSession = event.sessionId
+    }
     if (event.type === 'prompt.started') text = ''
     if (event.type === 'prompt.chunk') text += event.text
     if (event.type !== 'prompt.finished' && event.type !== 'prompt.failed') return
@@ -68,7 +89,7 @@ export async function openDiscordView({ rest, tenantId, channelId, clientId, cur
       await fs.mkdir(path.dirname(statePath), { recursive: true })
       const temp = `${statePath}.${process.pid}.${crypto.randomUUID()}.tmp`
       try {
-        await fs.writeFile(temp, JSON.stringify({ seq: event.seq }))
+        await fs.writeFile(temp, JSON.stringify({ sessionId: boundSession ?? null, seq: event.seq }))
         await fs.rename(temp, statePath)
       } finally { await fs.rm(temp, { force: true }) }
       posted = event.seq
