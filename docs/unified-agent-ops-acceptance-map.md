@@ -12,12 +12,12 @@ Checksums from the bundle's own `SHA256SUMS.txt`: 7 of 7 documents match.
 
 | Status | Cases |
 | --- | --- |
-| Closed at the plan's standard | 9 |
-| Partial | 14 |
+| Closed at the plan's standard | 10 |
+| Partial | 13 |
 | Not started | 17 |
 | Total | 40 |
 
-AC03, AC04, AC06, AC07, AC13, AC14, AC17, AC23 and AC25 are closed. Every other case still lacks both a real native surface and a live service path in the same piece of evidence, which is the standard the plan sets. AC18 moved from not started to partial: the approval race and replay paths now exist and are tested at the controller and transport layers, but no real Codex 0.169 approval request has been driven end to end.
+AC03, AC04, AC06, AC07, AC13, AC14, AC17, AC18, AC23 and AC25 are closed. Every other case still lacks both a real native surface and a live service path in the same piece of evidence, which is the standard the plan sets. AC18 closed when a real Codex 0.169 app-server raised an approval request and the client's answer changed what the runtime executed.
 
 ## Acceptance cases
 
@@ -40,7 +40,7 @@ AC03, AC04, AC06, AC07, AC13, AC14, AC17, AC23 and AC25 are closed. Every other 
 | AC15 | Crash after launch before ACK | not started | no crash-after-launch-before-ack case |
 | AC16 | Competing managed launch paths | partial | the hub lease refuses a second writer; no Paperclip launcher fencing |
 | AC17 | Cancel request | closed | a real codex 0.169 app-server turn was interrupted mid-flight through `ops codex turn --cancel-after 2500` against a deliberately slow local model: the CLI printed `cancel-requested` and the turn settled with `"status": "interrupted"` and empty text, which is the native turn state. The hub also accepts a cancel and stays inert when idle |
-| AC18 | Approval race/replay | partial | `startCodexAppServer` holds a server-initiated request instead of failing it with `-32601`; `createCodexController` surfaces the full payload (command, cwd, kind, grantRoot, approvalId, startedAtMs), applies an opt-in policy, and answers exactly once. A replay, an unknown id, an id the transport dropped, and a second racing answer are each refused by name. Invalid policy decisions fail closed to `decline`; `humanCommand` refuses `acceptForSession`; `item/permissions/requestApproval` is refused rather than held; the supported capability names the two methods it answers; approvals require `holdsServerRequests: true`; the transport reports delivery only for a live writable child and clears held ids on exit. 37 controller, 5 transport and 4 hub tests pass; `tsc` clean; commit `8ee74cef`. The transport tests use a fake app-server child, so the real-native half is still missing: no Codex 0.169 approval request has been driven through a real binary |
+| AC18 | Approval race/replay | closed | `startCodexAppServer` holds a server-initiated request instead of failing it with `-32601`; `createCodexController` surfaces the full payload (command, cwd, kind, grantRoot, approvalId, startedAtMs), applies an opt-in policy, and answers exactly once. A replay, an unknown id, an id the transport dropped, and a second racing answer are each refused by name. Invalid policy decisions fail closed to `decline`; `humanCommand` refuses `acceptForSession`; `item/permissions/requestApproval` is refused rather than held; the supported capability names the two methods it answers; approvals require `holdsServerRequests: true`; the transport reports delivery only for a live writable child and clears held ids on exit. 37 controller, 5 transport and 4 hub tests pass; `tsc` clean; commit `8ee74cef`. The transport tests use a fake app-server child, and the real-native half is measured too: a real codex 0.169 app-server, driven by a local model that asks for `exec_command`, raised `item/commandExecution/requestApproval` (requestId 0, command `pwsh -Command 'echo approval-ok'`). `ops codex turn --approval accept` delivered `{decision:"accept"}`, the runtime executed the command (`Process exited with code 0 ... Output: approval-ok`), and the turn completed; `--approval decline` produced `exec_command failed: Rejected("rejected by user")` and no execution; with no approval channel at all the same run produced `Rejected("approval request failed")`, so nothing is granted by default. `ops codex serve --approval accept --approval-policy untrusted` surfaced the same request and the same real execution through the hub |
 | AC19 | Artifact changed after approval | not started | no artifact digest/revision mismatch case |
 | AC20 | Credential revocation | partial | consent revoked mid-flight blocks publication; credential revocation is not exercised |
 | AC21 | Prompt injection through chat/output | not started | no prompt-injection-through-output case |
@@ -82,7 +82,7 @@ AC03, AC04, AC06, AC07, AC13, AC14, AC17, AC23 and AC25 are closed. Every other 
 ## What would move the most cases
 
 1. A live Discord view bound to an external session closes AC03, AC06 and part of AC07, AC26.
-2. Codex control is now exercised for AC03, AC04 and AC17. AC18 is partial: the approval race and replay paths exist and are tested, but a real Codex approval request is still needed to close it.
+2. Codex control is now exercised for AC03, AC04, AC17 and AC18, including a real approval request answered by both the CLI and the served hub.
 3. A Paperclip external-session entity closes AC29 and unblocks AC30, AC22.
 4. Failure-path cases (AC07, AC13, AC14, AC16, AC23, AC25, AC37) are cheap and need no new environment.
 
@@ -200,7 +200,18 @@ previous turn's result, exiting before its own turn ran. A prompting attach now 
 at the hub's current sequence; verified by a turn that returned `"cursor": 10` for its
 own completion instead of a stale `4`.
 
-Approval requests are a first-class opt-in. Without an approval channel the transport still answers a server-initiated request such as `item/commandExecution/requestApproval` with JSON-RPC error `-32601` on a microtask and the turn settles: an approval-gated action fails rather than being granted. With `--approval`, the transport holds the request instead, the controller surfaces it, and the first answer wins. A replay, an unknown id, an id the transport dropped, and a second racing answer are each refused by name. The tests use a fake app-server child for the transport half, so the real-binary approval request remains the open half of AC18.
+Approval requests are a first-class opt-in. Without an approval channel the transport still answers a server-initiated request such as `item/commandExecution/requestApproval` with JSON-RPC error `-32601` on a microtask and the turn settles: an approval-gated action fails rather than being granted. With `--approval`, the transport holds the request instead, the controller surfaces it, and the first answer wins. A replay, an unknown id, an id the transport dropped, and a second racing answer are each refused by name. The transport half is tested against a fake app-server child, and the real-binary half is measured too: a real codex 0.169 app-server asked for a command under `approvalPolicy: untrusted`, and the answer decided whether the command ran.
+
+Real-binary approval witness, all through the shipped CLI:
+
+| Run | Observed |
+| --- | --- |
+| `--approval accept --approval-policy untrusted` | `{"kind":"approval-request","requestId":0,"method":"item/commandExecution/requestApproval","command":"...pwsh.exe -Command 'echo approval-ok'","decision":"accept"}`, then the turn completed and the model saw `Process exited with code 0 ... Output: approval-ok` |
+| `--approval decline` | the same request with `"decision":"decline"`; the model saw `exec_command failed: Rejected("rejected by user")` and nothing ran |
+| no `--approval` | no approval line at all; the model saw `exec_command failed: Rejected("approval request failed")`, so the default is fail-closed |
+| `ops codex serve --approval accept --approval-policy untrusted` | the hub surfaced the same request on stdout and the command ran (`exit code 0`, `approval-ok`) |
+
+The witness model is a local stub that speaks the Responses API, so no account credential is involved; every other element is the shipped program and the real codex 0.169 binary.
 
 | Check | Observed |
 | --- | --- |
