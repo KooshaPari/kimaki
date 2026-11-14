@@ -76,7 +76,7 @@ AC03, AC04, AC06, AC07, AC13, AC14, AC17, AC23 and AC25 are closed. Every other 
 | WP5 | JCode/KCode adapters | partial | ACP backend, CLI, hub, durable stream, presence, ack and a Discord view of a live session verified; KCode identity absent and Jcode exposes no retraction or correction surface |
 | WP6 | Paperclip plugin and runtime adapter | partial | run metadata read and a local-command managed run; no entity projection or enrollment, model-backed run blocked |
 | WP7 | Discord comparison and route ownership | partial | consent-gated metadata publication, a live channel view of a hub session (`ops discord view`) with durable resume, and a native-session mirror (`ops jcode watch --tenant/--surface/--state`) that posted four real messages from a terminal session it did not start, with a durable index; no in-bot wiring, route ownership or cutover |
-| WP8 | Reliability and acceptance witnesses | partial | 61 backend tests plus 27 hub, 15 ACP client, 17 Codex runtime, 5 publication, 4 Discord view and 7 native mirror tests; two real witnesses (three clients on one hub, native terminal mirrored into a channel); acceptance-case totals below; test-suite gate baseline recorded in `docs/release-gate-2026-11-14.md` |
+| WP8 | Reliability and acceptance witnesses | partial | 61 backend tests plus 27 hub, 15 ACP client, 21 Codex control, 2 Codex transport, 4 Codex hub, 6 publication, 8 Discord view, 7 native mirror and 8 binding tests; three real witnesses (three clients on one jcode hub, native terminal mirrored into a channel, real Codex thread served and mirrored); test-suite gate baseline recorded in `docs/release-gate-2026-11-14.md` |
 | WP9 | Migration and retirement | not started | decision matrix and rollback rehearsal only; nothing drained or retired |
 
 ## What would move the most cases
@@ -166,7 +166,7 @@ Writer-lock measurements (two app-server processes, one thread):
 | Question | Observed |
 | --- | --- |
 | Does a resumed thread in process A block process B? | Yes. B's `thread/resume` fails with `thread <id> already has an active writer`, and its `turn/start` then fails with `thread not found`. Codex enforces one writer per thread natively, unlike Jcode |
-| Does `thread/read` block a writer? | No. A reader held the thread open, a second process resumed it, and `turn/start` succeeded with a real turn id. Reading is therefore a safe observe path, and `readThread` must never resume, which a unit test now pins |
+| Does `thread/read` block a writer? | No. An app-server that had just read the thread stayed connected, a second process resumed that thread, and `turn/start` succeeded with a real turn id. Reading is therefore a safe observe path, and `readThread` must never resume, which a unit test now pins |
 | Do cross-process notifications arrive? | No. While another process held the turn, the first process received nothing, so observation is poll-based rather than push |
 
 Codex as a served session (same fabric as Jcode):
