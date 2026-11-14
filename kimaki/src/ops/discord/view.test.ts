@@ -77,6 +77,21 @@ async function waitFor(check: () => Promise<boolean>) {
   }
   throw new Error('Timed out waiting for Discord view')
 }
+// Waiting on the posted callback races nothing, and if the view gives up first the
+// real error is far more useful than a bare timeout.
+async function awaitPost(seen: () => number, expected: number, run: Promise<Error | undefined>) {
+  let failure: Error | undefined
+  void run.then((result) => { if (result instanceof Error) failure = result })
+  // The post is a full Discord round trip, which gets slower while the rest of the
+  // suite is in flight, so allow more than the bare in-memory polling budget.
+  for (let i = 0; i < 200; i++) {
+    if (seen() >= expected) return
+    if (failure) throw failure
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
+  if (failure) throw failure
+  throw new Error('Timed out waiting for Discord view')
+}
 
 test('the default client id is channel-scoped rather than process-scoped', () => {
   // Same channel, same identity, no matter which process asks.
@@ -547,6 +562,152 @@ test('a live rebind to another session fails closed and posts nothing for the ne
     // The cursor stays on A so a later resume replays B's turn instead of skipping it.
     expect(JSON.parse(fs.readFileSync(statePath, 'utf8'))).toEqual({ sessionId: 'session-a', seq: 4 })
     await waitFor(async () => hub.streams() === 0)
+  } finally {
+    controller.abort()
+    await hub.close()
+    fs.rmSync(statePath, { force: true })
+  }
+})
+
+test('an approved rebind follows the new live session and posts each turn once', async () => {
+  const hub = await rebindableHub()
+  const statePath = path.join(root, `approved-rebind-${process.pid}-${++serial}.json`)
+  const rest = new REST({ api: discord.restUrl, version: '10', retries: 0, rejectOnRateLimit: () => true }).setToken(discord.botToken)
+  const controller = new AbortController()
+  const before = await count()
+  const seen: number[] = []
+  const run = openDiscordView({ rest, tenantId: discord.guildId, channelId, clientId: 'view', statePath, baseUrl: hub.url, signal: controller.signal, rebind: true, onPosted: (seq) => { seen.push(seq) } })
+  try {
+    await waitFor(async () => hub.streams() === 1)
+    hub.emit({ seq: 1, type: 'session.started', sessionId: 'session-a', model: null })
+    for (const event of turnOn(2, 'bound answer')) hub.emit(event)
+    await awaitPost(() => seen.length, 1, run)
+    expect(JSON.parse(fs.readFileSync(statePath, 'utf8'))).toEqual({ sessionId: 'session-a', seq: 4 })
+    // The hub runs another session on the same URL while the view is still live.
+    // Approval was explicit, so the view follows it instead of failing closed.
+    hub.emit({ seq: 5, type: 'session.started', sessionId: 'session-b', model: null })
+    for (const event of turnOn(6, 'rebound answer')) hub.emit(event)
+    await awaitPost(() => seen.length, 2, run)
+    expect(seen).toEqual([4, 8])
+    const messages = (await discord.channel(channelId).getMessages()).slice(before)
+    expect(messages.map((message) => message.content)).toEqual(['bound answer', 'rebound answer'])
+    // The old session's turn is not replayed under the new binding.
+    expect(messages.filter((message) => message.content === 'bound answer').length).toBe(1)
+    // Full rebind transition: identity and cursor both move onto B.
+    expect(JSON.parse(fs.readFileSync(statePath, 'utf8'))).toEqual({ sessionId: 'session-b', seq: 8 })
+    controller.abort()
+    expect(await run).toBeUndefined()
+    await waitFor(async () => hub.streams() === 0)
+
+    // A restart on the rebound state file stays on B and reposts nothing.
+    const restartController = new AbortController()
+    let restarted = 0
+    const restart = openDiscordView({ rest, tenantId: discord.guildId, channelId, clientId: 'view', statePath, baseUrl: hub.url, signal: restartController.signal, onPosted: () => { restarted += 1 } })
+    await waitFor(async () => hub.streams() === 1)
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    expect(restarted).toBe(0)
+    expect((await count()) - before).toBe(2)
+    expect(JSON.parse(fs.readFileSync(statePath, 'utf8'))).toEqual({ sessionId: 'session-b', seq: 8 })
+    restartController.abort()
+    expect(await restart).toBeUndefined()
+  } finally {
+    controller.abort()
+    await hub.close()
+    fs.rmSync(statePath, { force: true })
+  }
+})
+
+test('an approved rebind follows a restarted hub that renumbers its session from one', async () => {
+  const hub = await rebindableHub()
+  const statePath = path.join(root, `renumbered-rebind-${process.pid}-${++serial}.json`)
+  const rest = new REST({ api: discord.restUrl, version: '10', retries: 0, rejectOnRateLimit: () => true }).setToken(discord.botToken)
+  const controller = new AbortController()
+  const before = await count()
+  const seen: number[] = []
+  const run = openDiscordView({ rest, tenantId: discord.guildId, channelId, clientId: 'view', statePath, baseUrl: hub.url, signal: controller.signal, rebind: true, onPosted: (seq) => { seen.push(seq) } })
+  try {
+    await waitFor(async () => hub.streams() === 1)
+    hub.emit({ seq: 1, type: 'session.started', sessionId: 'session-a', model: null })
+    for (const event of turnOn(2, 'first answer')) hub.emit(event)
+    await awaitPost(() => seen.length, 1, run)
+    expect(JSON.parse(fs.readFileSync(statePath, 'utf8'))).toEqual({ sessionId: 'session-a', seq: 4 })
+    // A restarted hub numbers its log from the beginning, so the new session's
+    // start arrives below the old cursor. It must still be seen and followed.
+    hub.emit({ seq: 1, type: 'session.started', sessionId: 'session-b', model: null })
+    for (const event of turnOn(2, 'second answer')) hub.emit(event)
+    await awaitPost(() => seen.length, 2, run)
+    expect(seen).toEqual([4, 4])
+    const messages = (await discord.channel(channelId).getMessages()).slice(before)
+    expect(messages.map((message) => message.content)).toEqual(['first answer', 'second answer'])
+    expect(JSON.parse(fs.readFileSync(statePath, 'utf8'))).toEqual({ sessionId: 'session-b', seq: 4 })
+    controller.abort()
+    expect(await run).toBeUndefined()
+  } finally {
+    controller.abort()
+    await hub.close()
+    fs.rmSync(statePath, { force: true })
+  }
+})
+
+test('an approved rebind drops a half-buffered turn from the old session', async () => {
+  const hub = await rebindableHub()
+  const statePath = path.join(root, `rebind-buffer-${process.pid}-${++serial}.json`)
+  const rest = new REST({ api: discord.restUrl, version: '10', retries: 0, rejectOnRateLimit: () => true }).setToken(discord.botToken)
+  const controller = new AbortController()
+  const before = await count()
+  const seen: number[] = []
+  const run = openDiscordView({ rest, tenantId: discord.guildId, channelId, clientId: 'view', statePath, baseUrl: hub.url, signal: controller.signal, rebind: true, onPosted: (seq) => { seen.push(seq) } })
+  try {
+    await waitFor(async () => hub.streams() === 1)
+    hub.emit({ seq: 1, type: 'session.started', sessionId: 'session-a', model: null })
+    // An old-session turn is in flight but never finishes before the change.
+    hub.emit({ seq: 2, type: 'prompt.started', characters: 11 })
+    hub.emit({ seq: 3, type: 'prompt.chunk', text: 'half a turn' })
+    // The approved rebind must not splice that unfinished text onto the new turn.
+    hub.emit({ seq: 4, type: 'session.started', sessionId: 'session-b', model: null })
+    // The view attaches to B mid-turn, so B's stream resumes with a chunk rather
+    // than opening a fresh prompt. Only B's own text may be published.
+    hub.emit({ seq: 5, type: 'prompt.chunk', text: 'new answer' })
+    hub.emit({ seq: 6, type: 'prompt.finished', stopReason: 'end_turn', characters: 10 })
+    await awaitPost(() => seen.length, 1, run)
+    expect(seen).toEqual([6])
+    const messages = (await discord.channel(channelId).getMessages()).slice(before)
+    expect(messages.map((message) => message.content)).toEqual(['new answer'])
+    expect(JSON.parse(fs.readFileSync(statePath, 'utf8'))).toEqual({ sessionId: 'session-b', seq: 6 })
+    controller.abort()
+    expect(await run).toBeUndefined()
+  } finally {
+    controller.abort()
+    await hub.close()
+    fs.rmSync(statePath, { force: true })
+  }
+})
+
+test('without approval a renumbered session change still fails closed', async () => {
+  const hub = await rebindableHub()
+  const statePath = path.join(root, `renumbered-refuse-${process.pid}-${++serial}.json`)
+  const rest = new REST({ api: discord.restUrl, version: '10', retries: 0, rejectOnRateLimit: () => true }).setToken(discord.botToken)
+  const controller = new AbortController()
+  const before = await count()
+  let posted = 0
+  const run = openDiscordView({ rest, tenantId: discord.guildId, channelId, clientId: 'view', statePath, baseUrl: hub.url, signal: controller.signal, rebind: false, onPosted: (seq) => { posted = seq } })
+  try {
+    await waitFor(async () => hub.streams() === 1)
+    hub.emit({ seq: 1, type: 'session.started', sessionId: 'session-a', model: null })
+    for (const event of turnOn(2, 'bound answer')) hub.emit(event)
+    // The cursor is persisted after the post, so wait for the post itself rather
+    // than polling the file, whose absence is not yet a failure.
+    await awaitPost(() => posted, 4, run)
+    expect(JSON.parse(fs.readFileSync(statePath, 'utf8'))).toEqual({ sessionId: 'session-a', seq: 4 })
+    hub.emit({ seq: 1, type: 'session.started', sessionId: 'session-b', model: null })
+    for (const event of turnOn(2, 'refused answer')) hub.emit(event)
+    const result = await run
+    expect(result).toBeInstanceOf(ConfigError)
+    expect((result as Error).message).toMatch(/session-a/)
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    const messages = (await discord.channel(channelId).getMessages()).slice(before)
+    expect(messages.map((message) => message.content)).toEqual(['bound answer'])
+    expect(JSON.parse(fs.readFileSync(statePath, 'utf8'))).toEqual({ sessionId: 'session-a', seq: 4 })
   } finally {
     controller.abort()
     await hub.close()

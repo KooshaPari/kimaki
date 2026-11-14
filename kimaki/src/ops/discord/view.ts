@@ -13,7 +13,7 @@ export function defaultViewClientId(channelId: string): string {
   return `discord-view-${channelId}`
 }
 
-export async function openDiscordView({ rest, tenantId, channelId, clientId, cursor, statePath, baseUrl, signal, onPosted }: {
+export async function openDiscordView({ rest, tenantId, channelId, clientId, cursor, statePath, baseUrl, signal, onPosted, rebind = false }: {
   rest: REST
   tenantId: string
   channelId: string
@@ -23,6 +23,9 @@ export async function openDiscordView({ rest, tenantId, channelId, clientId, cur
   baseUrl: string
   signal?: AbortSignal
   onPosted?: (seq: number) => void
+  // Following a live session change is an explicit operator decision. Off by
+  // default, because switching silently would mix two sessions in one channel.
+  rebind?: boolean
 }): Promise<Error | undefined> {
   let posted = 0
   let savedSession: string | undefined
@@ -68,15 +71,30 @@ export async function openDiscordView({ rest, tenantId, channelId, clientId, cur
   let lastSeen = posted
   let boundSession = savedSession ?? (hubState.sessionId ?? undefined)
   const handle = async (event: HubEvent): Promise<void> => {
-    if (failure || event.seq <= lastSeen) return
+    if (failure) return
+    // A restarted hub numbers its log from the beginning, so the new session's
+    // start can carry a lower sequence than the cursor. It still has to be seen:
+    // dropping it would silently keep posting the new session's turns under the
+    // old session's identity.
+    const foreignStart = event.type === 'session.started'
+      && boundSession !== undefined && boundSession !== event.sessionId
+    if (!foreignStart && event.seq <= lastSeen) return
+    // For an approved rebind this is also the cursor reset: the new session's
+    // events continue from its own start event, not from the old session's seq.
     lastSeen = event.seq
     if (event.type === 'session.started') {
       // The hub names its session on start; a state file for a different one is a
       // rebind, not a resume, so it must fail rather than mix two sessions.
       if (boundSession !== undefined && boundSession !== event.sessionId) {
-        failure = new ConfigError({ reason: `Discord view state belongs to session ${boundSession}, but the hub started ${event.sessionId}` })
-        controller.abort()
-        return
+        if (!rebind) {
+          failure = new ConfigError({ reason: `Discord view state belongs to session ${boundSession}, but the hub started ${event.sessionId}` })
+          controller.abort()
+          return
+        }
+        // The operator approved the rebind. Drop any buffered turn from the old
+        // session; its already-posted history is never replayed, and its queued
+        // events sit below the reset cursor so they cannot post after the switch.
+        text = ''
       }
       boundSession = event.sessionId
     }

@@ -905,6 +905,7 @@ export function registerOpsCommands(cli: Goke) {
     .option('--state <path>', 'Durable cursor file; a restart posts nothing twice')
     .option('--client <id>', 'Client identity to register in hub presence (default: discord-view-<surface>, which refuses a second view of the same channel)')
     .option('--cursor <n>', 'Start from this cursor when the state file is missing')
+    .option('--rebind', 'Follow a live session.started that names a different session instead of failing closed (default: refuse)')
     .option('--timeout <ms>', 'Maximum viewing duration in milliseconds (default: 0, unbounded)')
     .action(async (options) => {
       const url = required(options.url, 'url')
@@ -933,6 +934,7 @@ export function registerOpsCommands(cli: Goke) {
         statePath,
         baseUrl: url,
         signal: controller.signal,
+        rebind: options.rebind === true,
         onPosted: (seq) => printJson({ kind: 'posted', seq }),
       })
       if (deadline) clearTimeout(deadline)

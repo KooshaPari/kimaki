@@ -158,6 +158,36 @@ describe('startHubServer', () => {
     expect(missing.status).toBe(404)
   })
 
+  it('drops a subscriber whose stream is aborted, leaving no presence behind', async () => {
+    const { server, headers } = await boot()
+    const controller = new AbortController()
+    const response = await fetch(`${server.url}/events?cursor=0&client=gone`, { headers, signal: controller.signal })
+    expect(response.status).toBe(200)
+    // Read the ready frame so the subscription is definitely registered.
+    const reader = response.body!.getReader()
+    await reader.read()
+    const attached = (await (await fetch(`${server.url}/state`, { headers })).json()) as { subscribers: number; clients: Array<{ clientId: string }> }
+    expect(attached.subscribers).toBe(1)
+    expect(attached.clients).toContainEqual({ clientId: 'gone', acked: 0 })
+
+    controller.abort()
+    await reader.cancel().catch(() => undefined)
+    // Presence is ended by the connection close, so it must not linger and block
+    // the same client id from reattaching.
+    let after: { subscribers: number; clients: Array<{ clientId: string }> } = attached
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      after = (await (await fetch(`${server.url}/state`, { headers })).json()) as typeof attached
+      if (after.subscribers === 0) break
+      await new Promise((resolve) => setTimeout(resolve, 25))
+    }
+    expect(after.subscribers).toBe(0)
+    expect(after.clients).toEqual([])
+    // The id is reusable immediately afterwards.
+    const again = await fetch(`${server.url}/events?cursor=0&client=gone`, { headers, signal: new AbortController().signal })
+    expect(again.status).toBe(200)
+    await again.body?.cancel().catch(() => undefined)
+  })
+
   it('tracks presence by client id and accepts an acknowledgement', async () => {
     let release: () => void = () => {}
     const gate = new Promise<void>((resolve) => {
