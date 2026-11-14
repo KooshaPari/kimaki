@@ -102,8 +102,11 @@ fails, then restoring the file and re-running the suite green.
 | AC07 | the `mode: observe` gate disabled in `bindSurface` | 2 tests fail: the stale-control test and the existing boundary test, so neither passes on a control write being silently accepted |
 | AC05 | the cross-session state guard disabled in `ops discord view` | the new test fails at its 30017 ms poll bound: the view would resume another session's cursor instead of refusing |
 
-Restored state: `hub.test.ts`, `acp/client.test.ts`, `ops-publish.e2e.test.ts` and
-`discord/watch.test.ts` are 49 of 49 green, and `git status` is clean.
+After each mutation the file was restored from a byte copy and `git status` was checked
+clean. The suites covering these cases are `hub.test.ts` (27), `acp/client.test.ts` (15),
+`ops-publish.e2e.test.ts` (6), `ops/discord/view.test.ts` (7), `ops/discord/watch.test.ts`
+(7), `ops/bindings.test.ts` (8) and `ops-follow.e2e.test.ts` (3, one of them the 429
+witness); each was run green after the last edit to it.
 
 Coverage of the 429 path after this pass:
 
