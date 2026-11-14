@@ -38,6 +38,11 @@ export async function openDiscordView({ rest, tenantId, channelId, clientId, cur
   if (savedSession !== undefined && hubState.sessionId !== null && hubState.sessionId !== savedSession) {
     return new ConfigError({ reason: `Discord view state belongs to session ${savedSession}, but the hub is serving ${hubState.sessionId}` })
   }
+  // A cursor that cannot be attributed to a session would silently swallow the
+  // next session's early events, because they carry lower sequence numbers.
+  if (hubState.sessionId === null && posted > 0) {
+    return new ConfigError({ reason: 'Hub has no session yet, so the saved cursor cannot be attributed to one; start the session or use a fresh state file' })
+  }
   const channel = await rest.get(Routes.channel(channelId)).catch((cause) => new DiscordError({ operation: 'read Discord view channel', cause }))
   if (channel instanceof Error) return channel
   if (!channel || typeof channel !== 'object' || !('id' in channel) || channel.id !== channelId

@@ -124,3 +124,20 @@ Coverage of the 429 path after this pass:
 
 The AC12 probe was reproduced on jcode 0.99.1: 14 `agent_message_chunk` updates plus
 `available_commands_update` and `usage_update`, and no correction kind.
+
+## Public-interface acceptance (2026-11-14)
+
+Run through the shipped CLI against live processes, not fixtures: three real
+`ops jcode serve` hubs, each holding its own real ACP session, one real `ops discord
+view` process per attempt, and one real Discord-compatible server.
+
+| Step | Observed |
+| --- | --- |
+| Hub A session mirrored | channel received `alpha-session`; state file `{"sessionId":"session_flamingo_1794674661592_0a7ac6f73449ccf5","seq":5}` |
+| Same state file against hub B, which serves `session_dolphin_...` | `ops discord view` exit **1**, message `Discord view state belongs to session session_flamingo_..., but the hub is serving session_dolphin_...`; channel message count 1 before and 1 after, so nothing was mirrored and nothing was skipped silently |
+| Same state file against a fresh hub with no session yet | `ops discord view` exit **1**, message `Hub has no session yet, so the saved cursor cannot be attributed to one; start the session or use a fresh state file` |
+
+Constraint recorded honestly: the Discord side is `discord-digital-twin` because no
+live guild token or channel is available on this host. Every other element of the path
+is the real program: real `jcode` ACP child processes, real HTTP hub, real CLI exit
+codes and state files.

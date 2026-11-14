@@ -181,6 +181,21 @@ test('a 429 on the view post fails without advancing the cursor', async () => {
   }
 })
 
+test('refuses a cursor it cannot attribute to a session', async () => {
+  const f = await fixture()
+  try {
+    // The hub has not started a session, so a saved cursor cannot be checked
+    // against one; resuming it would swallow the next session's early events.
+    fs.writeFileSync(f.statePath, JSON.stringify({ seq: 5 }))
+    const before = await count()
+    const view = f.start()
+    const result = await view.run
+    expect(result).toBeInstanceOf(Error)
+    expect((result as Error).message).toMatch(/cannot be attributed/)
+    expect(await count()).toBe(before)
+  } finally { await f.close() }
+})
+
 test('refuses a state cursor that belongs to another session', async () => {
   const f = await fixture()
   try {
