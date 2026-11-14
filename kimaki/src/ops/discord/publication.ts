@@ -5,18 +5,44 @@
 // retried, because a POST that may have succeeded would duplicate on retry.
 import { ChannelType, REST, Routes } from 'discord.js'
 import { DiscordError } from '../../errors.js'
-import type { SessionKey } from '../contracts.js'
+import type { RuntimeProfile, RuntimeProfileId, SessionKey } from '../contracts.js'
+import { RUNTIME_PROFILES } from '../contracts.js'
 import type { OpenCodeObservedEvent } from '../runtime/opencode.js'
 
 export type MetadataTarget = { tenantId: string; surfaceId: string; session: SessionKey }
 export type MetadataGrant = MetadataTarget & { publication: 'metadata'; consent: boolean }
 
-// The only backend labels allowed in the fixed output line.
+// The only backend labels allowed in the fixed output line. A jcode-family
+// backend still distinguishes stock jcode from its KCode fork by profile, so the
+// display label is a superset of the backend family.
 export type MetadataBackend = 'opencode' | 'jcode'
+export type MetadataLabel = MetadataBackend | 'kcode'
 
-const NOTICE: Record<MetadataBackend, string> = {
+// What a caller may hand over as provenance. Either the resolved profile itself
+// (the observer exposes one) or just its id. The session binding never carries
+// this: it stays the ACP family label so stored records keep their shape.
+export type ProfileProvenance = Pick<RuntimeProfile, 'id'> | RuntimeProfileId
+
+const NOTICE: Record<MetadataLabel, string> = {
   opencode: '-# External OpenCode session activity observed.',
   jcode: '-# External Jcode session activity observed.',
+  kcode: '-# External KCode session activity observed.',
+}
+
+// Resolve the display label from the profile that actually served the session.
+// An omitted profile means the stock jcode identity for a jcode-family backend,
+// which keeps existing callers honest. An unknown profile, or a profile that
+// cannot belong to this backend family, resolves to null so the caller refuses
+// before any REST call. This is the only place the label is decided.
+function labelFor(backend: MetadataBackend, profile: ProfileProvenance | null | undefined): MetadataLabel | null {
+  if (backend !== 'opencode' && backend !== 'jcode') return null
+  if (profile === null || profile === undefined) return backend
+  const id = typeof profile === 'string' ? profile : profile.id
+  if (!Object.hasOwn(RUNTIME_PROFILES, id)) return null
+  const profileId = id as RuntimeProfileId
+  // KCode rides the jcode ACP family; it can never be published as opencode.
+  if (backend !== 'jcode') return null
+  return profileId
 }
 
 type Denied = { kind: 'denied' }
@@ -51,23 +77,29 @@ async function resolveSurface({ rest, tenantId, surfaceId }: { rest: REST; tenan
   return { channel }
 }
 
-async function postNotice({ rest, surfaceId, backend }: { rest: REST; surfaceId: string; backend: MetadataBackend }): Promise<Outcome> {
+async function postNotice({ rest, surfaceId, label }: { rest: REST; surfaceId: string; label: MetadataLabel }): Promise<Outcome> {
   const sent = await rest.post(Routes.channelMessages(surfaceId), {
-    body: { content: NOTICE[backend], allowed_mentions: { parse: [] } },
+    body: { content: NOTICE[label], allowed_mentions: { parse: [] } },
   }).catch((cause) => new DiscordError({ operation: 'publish observation metadata', cause }))
   if (sent instanceof DiscordError) return sent
   return { kind: 'sent' }
 }
 
-// Backend-neutral notice. The caller decides which metadata event justified it,
-// but nothing from that event reaches the message body.
-export async function publishMetadataNotice({ rest, target, grant, backend }: {
+// Backend-neutral notice. The caller decides which metadata event justified it
+// and which profile resolved the session, but nothing from that event reaches the
+// message body. `profile` is the observer's provenance; when it is omitted only a
+// stock jcode backend is assumed, never KCode.
+export async function publishMetadataNotice({ rest, target, grant, backend, profile }: {
   rest: REST
   target: MetadataTarget
   grant: MetadataGrant | null
   backend: MetadataBackend
+  profile?: ProfileProvenance | null
 }): Promise<Outcome> {
-  if (!Object.hasOwn(NOTICE, backend)) return { kind: 'denied' }
+  // Label resolution is first: an unknown profile is refused before any REST
+  // call, so it cannot even resolve the surface.
+  const label = labelFor(backend, profile)
+  if (label === null) return { kind: 'denied' }
   if (!scopeValid(target, grant)) return { kind: 'denied' }
   if (target.session.backendKind !== backend) return { kind: 'denied' }
   const tenantId = target.tenantId
@@ -78,7 +110,7 @@ export async function publishMetadataNotice({ rest, target, grant, backend }: {
   // Re-check after the await so a mid-flight revocation or scope change denies.
   if (!scopeValid({ ...target, tenantId, surfaceId, session }, grant)
     || target.tenantId !== tenantId || target.surfaceId !== surfaceId || !sameSession(session, target.session)) return { kind: 'denied' }
-  return postNotice({ rest, surfaceId, backend })
+  return postNotice({ rest, surfaceId, label })
 }
 
 // Trusted callers must obtain consent and revoke the same grant object themselves.
@@ -109,5 +141,5 @@ export async function publishObservedMetadata({ rest, target, observed, grant }:
     || observed.source.backendKind !== 'opencode' || observed.source.hostId !== session.hostId
     || observed.source.endpointId !== session.endpointId
     || !sameSession(session, observed.key) || observed.raw.data.sessionID !== session.nativeSessionId) return { kind: 'denied' }
-  return postNotice({ rest, surfaceId, backend: 'opencode' })
+  return postNotice({ rest, surfaceId, label: 'opencode' })
 }

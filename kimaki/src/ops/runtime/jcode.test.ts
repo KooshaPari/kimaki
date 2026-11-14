@@ -219,6 +219,17 @@ describe('Runtime profile identity', () => {
     expect(snapshot.source.profileId).toBe('kcode')
   })
 
+  it('exposes the stock jcode profile as provenance by default, not an inferred label', async () => {
+    const stock = observer({ session_a: session('session_a', 'titled', null) })
+    // The observer's own profile is the provenance a publication label must use;
+    // an omitted profile resolves to stock jcode rather than to whatever the
+    // session claims.
+    expect(stock.profile.id).toBe('jcode')
+    const snapshot = await stock.readSnapshot({ key: { hostId: 'host', endpointId: 'endpoint', backendKind: 'jcode', nativeSessionId: 'session_a' } })
+    if (snapshot instanceof Error) throw snapshot
+    expect(snapshot.source.profileId).toBe(stock.profile.id)
+  })
+
   it('refuses an unknown profile without reading any store (observer path)', () => {
     const reads: string[] = []
     const refused = createJcodeObserver({

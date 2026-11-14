@@ -4,7 +4,7 @@ import { afterAll, beforeAll, expect, test, vi } from 'vitest'
 import { ChannelType, REST } from 'discord.js'
 import { DigitalDiscord } from 'discord-digital-twin/src'
 import { DiscordError } from '../../errors.js'
-import { publishObservedMetadata } from './publication.js'
+import { publishMetadataNotice, publishObservedMetadata } from './publication.js'
 import type { OpenCodeObservedEvent } from '../runtime/opencode.js'
 
 const key = { hostId: 'host', endpointId: 'endpoint', backendKind: 'opencode', nativeSessionId: 'session' }
@@ -32,7 +32,9 @@ afterAll(async () => { await discord?.stop() })
 async function authSurface({ token }: { token: string }) {
   const attempts: { authorization: string | undefined; body: string }[] = []
   const delivered: string[] = []
+  const requests: { method: string | undefined; url: string | undefined }[] = []
   const server = http.createServer((request, response) => {
+    requests.push({ method: request.method, url: request.url })
     const chunks: Buffer[] = []
     request.on('data', (chunk) => chunks.push(chunk))
     request.on('end', () => {
@@ -66,6 +68,7 @@ async function authSurface({ token }: { token: string }) {
     rest: new REST({ api: `http://127.0.0.1:${port}`, version: '10' }).setToken(token),
     attempts,
     delivered,
+    requests,
     close: () => new Promise<void>((resolve) => server.close(() => resolve())),
   }
 }
@@ -199,6 +202,99 @@ test('fails closed before any send when the credential is already revoked', asyn
     expect(result).not.toMatchObject({ kind: 'sent' })
     // The surface lookup is rejected, so no message POST is ever attempted.
     expect(surface.attempts).toHaveLength(0)
+    expect(surface.delivered).toHaveLength(0)
+  } finally {
+    await surface.close()
+  }
+})
+
+// AC39 residual: the notice must name the profile that actually resolved the
+// session. The binding still records the ACP family label (`backendKind`), so a
+// KCode session is `backendKind: 'jcode'` on the record and `kcode` in the
+// published label. The label is carried by the notice content, never by the
+// stored binding shape.
+const jcodeSession = { hostId: 'host', endpointId: 'endpoint', backendKind: 'jcode', nativeSessionId: 'native' }
+
+function jcodeTarget() {
+  return { tenantId: discord.guildId, surfaceId: channelId, session: { ...jcodeSession } }
+}
+
+function jcodeGrant(target: ReturnType<typeof jcodeTarget>) {
+  return { ...target, session: { ...jcodeSession }, publication: 'metadata' as const, consent: true as const }
+}
+
+function noticeContent(body: string): string {
+  return (JSON.parse(body) as { content: string }).content
+}
+
+test('publishes a jcode profile observation under the jcode label', async () => {
+  const surface = await authSurface({ token: 'live-credential' })
+  const target = jcodeTarget()
+  try {
+    const result = await publishMetadataNotice({ rest: surface.rest, target, grant: jcodeGrant(target), backend: 'jcode', profile: 'jcode' })
+    expect(result).toMatchObject({ kind: 'sent' })
+    expect(surface.delivered).toHaveLength(1)
+    expect(noticeContent(surface.delivered[0]!)).toBe('-# External Jcode session activity observed.')
+    // Mentions stay disabled in every publication.
+    expect(JSON.parse(surface.delivered[0]!).allowed_mentions).toEqual({ parse: [] })
+  } finally {
+    await surface.close()
+  }
+})
+
+test('publishes a kcode profile observation under the kcode label, not jcode', async () => {
+  const surface = await authSurface({ token: 'live-credential' })
+  const target = jcodeTarget()
+  // Provenance arrives as the resolved profile object the observer exposes.
+  const profile = { id: 'kcode' as const }
+  try {
+    const result = await publishMetadataNotice({ rest: surface.rest, target, grant: jcodeGrant(target), backend: 'jcode', profile })
+    expect(result).toMatchObject({ kind: 'sent' })
+    expect(surface.delivered).toHaveLength(1)
+    const content = noticeContent(surface.delivered[0]!)
+    expect(content).toBe('-# External KCode session activity observed.')
+    expect(content).not.toContain('Jcode')
+    // The stored binding shape is untouched: the record is still the ACP family.
+    expect(target.session.backendKind).toBe('jcode')
+  } finally {
+    await surface.close()
+  }
+})
+
+test('refuses an unresolvable profile before any REST call', async () => {
+  const surface = await authSurface({ token: 'live-credential' })
+  const target = jcodeTarget()
+  try {
+    const result = await publishMetadataNotice({
+      rest: surface.rest,
+      target,
+      grant: jcodeGrant(target),
+      backend: 'jcode',
+      profile: 'kcode-fork' as never,
+    })
+    expect(result).toMatchObject({ kind: 'denied' })
+    // Not even the surface lookup runs, let alone the message POST.
+    expect(surface.requests).toHaveLength(0)
+    expect(surface.attempts).toHaveLength(0)
+    expect(surface.delivered).toHaveLength(0)
+  } finally {
+    await surface.close()
+  }
+})
+
+test('refuses a kcode profile paired with an opencode backend before any REST call', async () => {
+  const surface = await authSurface({ token: 'live-credential' })
+  const target = { tenantId: discord.guildId, surfaceId: channelId, session: { ...key } }
+  try {
+    const result = await publishMetadataNotice({
+      rest: surface.rest,
+      target,
+      grant: { ...target, session: { ...key }, publication: 'metadata' as const, consent: true as const },
+      backend: 'opencode',
+      profile: 'kcode',
+    })
+    expect(result).toMatchObject({ kind: 'denied' })
+    expect(surface.requests).toHaveLength(0)
     expect(surface.delivered).toHaveLength(0)
   } finally {
     await surface.close()
