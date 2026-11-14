@@ -34,7 +34,8 @@ export function registerOpsCommands(cli: Goke) {
       const token = required(options.token ?? process.env['KIMAKI_BOT_TOKEN'], 'token')
       const timeout = options.timeout === undefined ? 60_000 : Number(options.timeout)
       if (!Number.isSafeInteger(timeout) || timeout < 1 || timeout > 2_147_483_647) fail(new ConfigError({ reason: '--timeout must be a positive integer in milliseconds' }))
-      const rest = new (await import('discord.js')).REST({ ...(process.env['KIMAKI_DISCORD_REST_URL'] ? { api: process.env['KIMAKI_DISCORD_REST_URL'] } : {}), version: '10' }).setToken(token)
+      // At-most-once delivery: a 429 must surface as a failure, never be retried silently.
+      const rest = new (await import('discord.js')).REST({ ...(process.env['KIMAKI_DISCORD_REST_URL'] ? { api: process.env['KIMAKI_DISCORD_REST_URL'] } : {}), version: '10', rejectOnRateLimit: () => true }).setToken(token)
       const counts = { sent: 0, denied: 0, ignored: 0 }
       const grant = { ...target, publication: 'metadata' as const, consent: true }
       const controller = new AbortController()
@@ -134,7 +135,7 @@ export function registerOpsCommands(cli: Goke) {
       if (!observed || typeof observed !== 'object' || !observed.key || typeof observed.key !== 'object' || !observed.source || typeof observed.source !== 'object' || !observed.raw || typeof observed.raw !== 'object' || !observed.raw.data || typeof observed.raw.data !== 'object' || Array.isArray(observed.raw.data)) fail(new ConfigError({ reason: 'Invalid OpenCode observed event in --event-file' }))
       const { REST } = await import('discord.js')
       const { publishObservedMetadata } = await import('../ops/discord/publication.ts')
-      const rest = new REST({ ...(process.env['KIMAKI_DISCORD_REST_URL'] ? { api: process.env['KIMAKI_DISCORD_REST_URL'] } : {}), version: '10' }).setToken(token)
+      const rest = new REST({ ...(process.env['KIMAKI_DISCORD_REST_URL'] ? { api: process.env['KIMAKI_DISCORD_REST_URL'] } : {}), version: '10', rejectOnRateLimit: () => true }).setToken(token)
       const result = await publishObservedMetadata({ rest, target, observed, grant: { ...target, publication: 'metadata', consent: true } })
       if (result instanceof Error) fail(result)
       if (result.kind === 'denied') fail(new ConfigError({ reason: 'Publication denied: event and Discord surface must match the explicit scope' }))

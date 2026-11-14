@@ -1,6 +1,8 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import http from 'node:http'
+import type { AddressInfo } from 'node:net'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { afterAll, beforeAll, expect, test, vi } from 'vitest'
@@ -97,4 +99,38 @@ test('an unreachable Discord endpoint fails without reporting success', async ()
   }).then(() => null, (error: Error) => error)
   expect(unreachable).toBeInstanceOf(Error)
   expect(JSON.stringify(unreachable)).not.toContain('"kind":"sent"')
+}, 300_000)
+
+test('a 429 on the send fails once instead of retrying or claiming a send', async () => {
+  let posts = 0
+  const server = http.createServer((request, response) => {
+    if (request.method === 'GET' && request.url === `/v10/channels/${channelId}`) {
+      response.writeHead(200, { 'content-type': 'application/json' })
+      response.end(JSON.stringify({ id: channelId, guild_id: discord.guildId, type: 0, name: 'general' }))
+      return
+    }
+    if (request.method === 'POST' && request.url === `/v10/channels/${channelId}/messages`) {
+      posts += 1
+      response.writeHead(429, { 'content-type': 'application/json', 'retry-after': '1' })
+      response.end(JSON.stringify({ message: 'You are being rate limited.', retry_after: 0.05, global: false }))
+      return
+    }
+    response.writeHead(404, { 'content-type': 'application/json' })
+    response.end('{}')
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()))
+  const port = (server.address() as AddressInfo).port
+  try {
+    const failure = await exec(process.execPath, ['--import', 'tsx', path.resolve('src/cli.ts'), 'ops', 'publish', ...args(), '--consent'], {
+      timeout: 120_000,
+      env: { ...process.env, KIMAKI_BOT_TOKEN: 'stub', KIMAKI_DISCORD_REST_URL: `http://127.0.0.1:${port}` },
+    }).then(() => null, (error: Error & { stdout?: string; stderr?: string }) => error)
+    expect(failure).toBeInstanceOf(Error)
+    expect(posts).toBe(1)
+    const output = `${failure?.stdout ?? ''}${failure?.stderr ?? ''}`
+    expect(output).not.toContain('"kind":"sent"')
+    expect(output.trim().length).toBeGreaterThan(0)
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+  }
 }, 300_000)
