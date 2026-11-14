@@ -12,12 +12,12 @@ Checksums from the bundle's own `SHA256SUMS.txt`: 7 of 7 documents match.
 
 | Status | Cases |
 | --- | --- |
-| Closed at the plan's standard | 6 |
-| Partial | 16 |
+| Closed at the plan's standard | 7 |
+| Partial | 15 |
 | Not started | 18 |
 | Total | 40 |
 
-AC04, AC06, AC13, AC14, AC23 and AC25 are closed. Every other case still lacks both a real native surface and a live service path in the same piece of evidence, which is the standard the plan sets.
+AC03, AC04, AC06, AC13, AC14, AC23 and AC25 are closed. Every other case still lacks both a real native surface and a live service path in the same piece of evidence, which is the standard the plan sets.
 
 ## Acceptance cases
 
@@ -25,7 +25,7 @@ AC04, AC06, AC13, AC14, AC23 and AC25 are closed. Every other case still lacks b
 | --- | --- | --- | --- |
 | AC01 | External session discovered | partial | `ops discover` returns real sessions for OpenCode, Codex and Jcode through the public CLI; no process/task-count oracle recorded |
 | AC02 | Passive observe | partial | observers are read-only by construction and detach leaves the native session unchanged (herdr p19/p15, OpenCode session read back intact) |
-| AC03 | Original terminal continues | not started | no bound Discord view exists that would echo new native input |
+| AC03 | Original terminal continues | closed | a session created by the native `jcode run` CLI was attached with `ops jcode history`, which replayed the user's own prompt and the reply from `session/load`. With `ops jcode watch` polling, a second native turn typed after attach (`jcode run --resume ...`) produced exactly two new messages, user then agent, with no duplicates across eight polls, while the native client kept working. jcode 0.99.1 does not push another client's turn into an attached ACP session (measured: zero updates), so following native input is poll-based with a fresh ACP connection per cycle, and a repeated load on one connection returns the first snapshot |
 | AC04 | Observe disconnect/restart | closed | `ops discord view` holds a durable cursor: after a real ACP turn posted one channel message at sequence 5, the view was killed, restarted, and the next turn posted exactly one new message at sequence 9 with the first message still present and no duplicate. Recovery from a missing state file is reported ("starting at sequence 0"), and a clipped replay fails closed instead of reposting. Codex and the Jcode observer path are not covered by this evidence |
 | AC05 | Dynamic rebind | partial | metadata rebind with generation 2 fencing; no live client route change exercised |
 | AC06 | Multiple read views | closed | one real jcode ACP session was served by `ops jcode serve` while two CLI clients (`cli-a`, `cli-b`) prompted through `ops jcode attach` and a Discord channel rendered the turns through `ops discord view`. The channel received `bridge-ok` for the first turn and `bridge-two` for the second, each exactly once, with the CLI clients seeing the same turns. Uses discord-digital-twin as a real Discord-compatible server |
