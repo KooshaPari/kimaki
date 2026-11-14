@@ -179,3 +179,23 @@ Codex as a served session (same fabric as Jcode):
 
 That is the operator's goal applied to the second runtime: one live Codex thread,
 several clients, and Discord as one of them.
+
+Codex durability across a restart, and two defects it exposed:
+
+| Step | Observed |
+| --- | --- |
+| Serve with `--log events3.jsonl --thread <id>`, one turn | turn completed, log holds four events with the thread id in `session.started` |
+| Kill the hub, serve again with the same `--log` and `--thread` | the hub restored the session from the log and ran a second turn; the resumed thread carried 8 input items against 6 and 4 on earlier turns, so history survived both the restart and the resume |
+| Serve a second hub on the same log while the first runs | refused with `Another hub holds this session lease (pid …)` |
+
+Defect 1, found by that run: a hub restored from a log replays history but never
+reattaches the backend, so the first prompt failed with `The Codex backend has not
+started a thread`. `ops codex serve` now reattaches to the logged thread (resuming it)
+before listening, refuses a `--thread` that does not match the log, and refuses to
+serve when the resumed thread differs from the logged one.
+
+Defect 2, found while checking that: `ops jcode attach --prompt` defaulted to cursor 0,
+so replaying an earlier finished turn satisfied the wait and the client reported the
+previous turn's result, exiting before its own turn ran. A prompting attach now starts
+at the hub's current sequence; verified by a turn that returned `"cursor": 10` for its
+own completion instead of a stale `4`.

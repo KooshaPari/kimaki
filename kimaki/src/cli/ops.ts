@@ -439,14 +439,19 @@ export function registerOpsCommands(cli: Goke) {
     .option('--json', 'Print a JSON summary instead of streamed text')
     .action(async (options) => {
       const url = required(options.url, 'url')
-      const cursor = options.cursor === undefined ? 0 : Number(options.cursor)
-      if (!Number.isSafeInteger(cursor) || cursor < 0) fail(new ConfigError({ reason: '--cursor must be a non-negative integer' }))
+      const requestedCursor = options.cursor === undefined ? undefined : Number(options.cursor)
+      if (requestedCursor !== undefined && (!Number.isSafeInteger(requestedCursor) || requestedCursor < 0)) fail(new ConfigError({ reason: '--cursor must be a non-negative integer' }))
       const timeout = options.timeout === undefined ? 120_000 : Number(options.timeout)
       if (!Number.isSafeInteger(timeout) || timeout < 1) fail(new ConfigError({ reason: '--timeout must be a positive integer in milliseconds' }))
       const { openHubStream, promptHub, ackHub, readHubState } = await import('../backend/hub-client.ts')
 
       const state = await readHubState({ baseUrl: url })
       if (state instanceof Error) fail(state)
+      // With --prompt, replaying older turns first makes this client report the
+      // previous turn's result and exit before its own turn finishes. Attach at
+      // the current sequence so the summary describes the turn just submitted;
+      // replay-only callers still default to 0.
+      const cursor = requestedCursor ?? (options.prompt === undefined ? 0 : state.seq)
 
       const controller = new AbortController()
       const deadline = setTimeout(() => controller.abort(), timeout)
@@ -666,6 +671,31 @@ export function registerOpsCommands(cli: Goke) {
         controller.close()
         await server.close()
         fail(hub)
+      }
+      // A durable log restores the session id, but the backend still has to be
+      // reattached to it. Without this the hub replays history and then refuses
+      // every prompt, which is exactly what happened before this check existed.
+      const restored = hub.snapshot().sessionId
+      if (restored !== null) {
+        if (options.thread !== restored) {
+          await hub.close()
+          controller.close()
+          await server.close()
+          fail(new ConfigError({ reason: `The log belongs to thread ${restored}; pass --thread ${restored} to resume it` }))
+        }
+        const attached = await backend.start()
+        if (attached instanceof Error) {
+          await hub.close()
+          controller.close()
+          await server.close()
+          fail(attached)
+        }
+        if (attached.sessionId !== restored) {
+          await hub.close()
+          controller.close()
+          await server.close()
+          fail(new ConfigError({ reason: `The backend resumed ${attached.sessionId}, not the logged thread ${restored}` }))
+        }
       }
       const started = await startHubServer({ hub, port, token: options.token })
       if (started instanceof Error) {
