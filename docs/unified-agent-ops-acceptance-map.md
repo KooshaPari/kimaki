@@ -296,3 +296,11 @@ Exit-abort investigation for that open issue:
 | `REST` client | exposes no `destroy()` in discord.js 14.26.4, so the CLI cannot close the keep-alive agent before exiting |
 
 Conclusion: the abort comes from calling `process.exit()` while discord.js' keep-alive socket is still closing, which libuv reports as a closing async handle. A clean fix means replacing `process.exit()` in the CLI's `fail` path with a drained exit (set `process.exitCode`, let the loop close sockets, and only then terminate), which touches every command's exit strategy. The message is still printed before the abort, and the exit code is non-zero either way, so the refusal is safe; the cleanliness of the code is the remaining gap and is left documented rather than half-fixed.
+
+Fifth pass:
+
+| Area | What was checked | Observed |
+| --- | --- | --- |
+| AC03/AC12 interop | a session kimaki itself created over ACP (`ops jcode run` reported `session_vole_...`), read back with `ops jcode history` | the load replayed `user: Reply with exactly: acp-created-session` and `agent: acp-created-session`, so observation covers kimaki's own sessions and not only sessions started by a native client |
+| AC25 watch mirror failure | `ops jcode watch --discord --emit-existing` against a stub that 429s every post | printed `Discord publish native watch message failed` and exited non-zero, and **no state file was written**, so the cursor did not advance. The same `0xC0000409` teardown abort appeared here too, which confirms the exit-abort is repo-wide on Discord REST failures rather than specific to the view's tenant check |
+| Operator trap found | the same watch command without `KIMAKI_DISCORD_REST_URL` | it reached the real Discord API with the stub token and failed `401: Unauthorized`. Expected behaviour, worth knowing: the REST URL override is an environment variable, not a flag |
