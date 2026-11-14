@@ -1,7 +1,11 @@
 import { describe, expect, it } from 'vitest'
 import { createCodexHubBackend } from './codex-hub.ts'
 
-function fake(behaviour: { start?: string; resume?: string; turn?: () => Promise<unknown> } = {}) {
+function fake(behaviour: {
+  start?: string
+  resume?: string
+  turn?: () => Promise<Error | { threadId: string; turnId: string; status: string; text: string }>
+} = {}) {
   const calls: string[] = []
   const controller = {
     async startThread(input: { cwd?: string }) {
