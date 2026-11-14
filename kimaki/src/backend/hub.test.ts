@@ -589,6 +589,39 @@ describe('createSessionHub', () => {
     })
   })
 
+  it('restores a log that ends mid-turn and accepts a new turn afterwards', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-hub-midturn-'))
+    const logFile = path.join(dir, 'events.jsonl')
+    try {
+      // A crash during a turn leaves started and chunks but no finished event.
+      const partial = [
+        { seq: 1, type: 'prompt.started', characters: 5 },
+        { seq: 2, type: 'prompt.chunk', text: 'hal' },
+      ]
+      fs.writeFileSync(logFile, `${partial.map((event) => JSON.stringify(event)).join('\n')}\n`)
+      const hub = createSessionHub({ backend: fakeBackend().backend, logFile })
+      if (hub instanceof Error) throw hub
+      // The restored hub is not busy: nothing is in flight after a crash.
+      expect(hub.snapshot()).toMatchObject({ seq: 2, busy: false })
+      const replayed: HubEvent[] = []
+      const subscription = hub.subscribe({ cursor: 0, onEvent: (event) => replayed.push(event) })
+      if (subscription instanceof Error) throw subscription
+      expect(subscription.clipped).toBe(false)
+      expect(replayed.map((event) => event.seq)).toEqual([1, 2])
+      // A new turn continues the sequence instead of reusing the orphaned numbers.
+      const next = await hub.submit('hello')
+      expect(next).not.toBeInstanceOf(Error)
+      await wait(20)
+      expect(hub.snapshot().busy).toBe(false)
+      // The restored hub has no live backend session yet, so the next submit also
+      // publishes session.started: 3, then started, chunk and finished brings it to 6.
+      expect(hub.snapshot().seq).toBe(6)
+      await hub.close()
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
   it('restores the valid prefix of a log whose last line was torn by a crash', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-hub-torn-'))
     const logFile = path.join(dir, 'events.jsonl')

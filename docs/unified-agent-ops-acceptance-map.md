@@ -35,7 +35,7 @@ AC03, AC04, AC06, AC07, AC11, AC13, AC14, AC17, AC18, AC23 and AC25 are closed. 
 | AC10 | Wrong backend fallback | not started | no wrong-binary, wrong-profile or wrong-provider negative case |
 | AC11 | Unsupported capability | closed | each refusal is decided before dispatch and tested that way: a control binding is refused by the mode gate before any write, a Codex hub prompt before its thread exists is refused with **zero** control calls dispatched, a duplicate hub client id is refused rather than silently replaced, and a publication without `--consent` never reaches Discord. Capabilities also declare the unsupported operations with reasons |
 | AC12 | JCode text correction | not started | the native surface does not exist. A real jcode 0.99.1 ACP turn emits only `available_commands_update`, `agent_message_chunk` and `usage_update`, and its `agentCapabilities` declares `loadSession`, `promptCapabilities` and `sessionCapabilities` (close, resume) with no retraction or correction surface. A probe whose model restated a misspelling delivered both strings as ordinary chunks. `client.test.ts` proves an unknown update kind is ignored rather than rendered as a fabricated correction. Separately measured: `session/load` answers success for an id that does not exist and replays nothing, so `ops jcode history` refuses an empty replay (exit 1 with a naming message) unless `--allow-empty` is passed, rather than letting "0 messages" read as a real session. Gated on an agent-side surface, not on client work |
-| AC13 | Stream gap/overflow | closed | `hub.test.ts` covers the explicit gap path: a cursor behind the retained buffer returns `clipped: true` with the retained tail, a cursor at the head returns `clipped: false`, and a durable log replays in full from cursor 0. Observed cursor values and delivered event ids recorded in the test; 31 hub tests and `tsc` clean |
+| AC13 | Stream gap/overflow | closed | `hub.test.ts` covers the explicit gap path: a cursor behind the retained buffer returns `clipped: true` with the retained tail, a cursor at the head returns `clipped: false`, and a durable log replays in full from cursor 0. Observed cursor values and delivered event ids recorded in the test; 34 hub tests and `tsc` clean |
 | AC14 | Duplicate incoming event | closed | real run through the public CLI and HTTP API: first submit admitted with `duplicate: false`, the same request id returned `duplicate: true` without a second turn, the sequence advanced exactly once (4), the same id with different text was refused with 409, and a fresh id was admitted |
 | AC15 | Crash after launch before ACK | partial | A `backend.start()` that throws after the launch is normalized to an Error, so the hub never publishes `session.started` or reports a live session; a later submit fails closed and the sequence does not advance. 33 hub tests pass, `tsc` clean, commit `142dae78`. The crash is a fake backend throw, not a real managed process dying before ACK |
 | AC16 | Competing managed launch paths | partial | the hub lease refuses a second writer; no Paperclip launcher fencing |
@@ -319,6 +319,13 @@ Seventh pass:
 | Area | What was checked | Observed |
 | --- | --- | --- |
 | AC12 unknown session in the watcher | `ops jcode watch --session session_does_not_exist --iterations 1` | **defect fixed**: before this it polled silently and exited 0 with nothing reported, because jcode answers `session/load` successfully for a missing id. The first poll now refuses an empty history (exit 1, message naming the ambiguity) and `--allow-empty` opts back in (exit 0). The same command against a real session still exits 0 |
+
+Eighth pass:
+
+| Area | What was checked | Observed |
+| --- | --- | --- |
+| AC13 crash mid-turn | a log that ends after `prompt.started` and one chunk, then `createSessionHub` | restores `seq 2` with `busy:false`, replays both events unclipped, and a new turn continues the sequence to 6 instead of reusing the orphaned numbers (a restored hub also emits `session.started` on the next submit) |
+| AC25 malformed channel body | a channel lookup that answers 200 with `<html>not json</html>` | exit non-zero, **zero** POSTs, no `sent` line; publish suite now 10 of 10 |
 
 Backup restore and live rebind, 2026-11-14:
 
