@@ -26,7 +26,7 @@ AC03, AC04, AC06, AC07, AC13, AC14, AC17, AC23 and AC25 are closed. Every other 
 | AC01 | External session discovered | partial | `ops discover` returns real sessions for OpenCode, Codex and Jcode through the public CLI; no process/task-count oracle recorded |
 | AC02 | Passive observe | partial | observers are read-only by construction and detach leaves the native session unchanged (herdr p19/p15, OpenCode session read back intact) |
 | AC03 | Original terminal continues | closed | a session created by the native `jcode run` CLI was attached with `ops jcode history`, which replayed the user's own prompt and the reply from `session/load`. With `ops jcode watch` polling, a second native turn typed after attach (`jcode run --resume ...`) produced exactly two new messages, user then agent, with no duplicates across eight polls, while the native client kept working. jcode 0.99.1 does not push another client's turn into an attached ACP session (measured: zero updates), so following native input is poll-based with a fresh ACP connection per cycle, and a repeated load on one connection returns the first snapshot |
-| AC04 | Observe disconnect/restart | closed | `ops discord view` holds a durable cursor: after a real ACP turn posted one channel message at sequence 5, the view was killed, restarted, and the next turn posted exactly one new message at sequence 9 with the first message still present and no duplicate. Recovery from a missing state file is reported ("starting at sequence 0"), and a clipped replay fails closed instead of reposting. Codex and the Jcode observer path are not covered by this evidence |
+| AC04 | Observe disconnect/restart | closed | `ops discord view` holds a durable cursor: after a real ACP turn posted one channel message at sequence 5, the view was killed, restarted, and the next turn posted exactly one new message at sequence 9 with the first message still present and no duplicate. The same was then shown for a served Codex thread: a hub killed and restarted on the same log and thread ran a third turn that appeared once after the two earlier messages, with the same thread id in state. Recovery from a missing state file is reported, and a clipped replay fails closed instead of reposting |
 | AC05 | Dynamic rebind | partial | metadata rebind with generation 2 fencing and a stale-control refusal (see AC07). `ops discord view` now records the session id in its durable state and refuses a state cursor that belongs to another session, so rebinding a channel to a new session fails closed instead of silently skipping that session's turns. No live route change between two running sessions was exercised |
 | AC06 | Multiple read views | closed | one real jcode ACP session was served by `ops jcode serve` while two CLI clients (`cli-a`, `cli-b`) prompted through `ops jcode attach` and a Discord channel rendered the turns through `ops discord view`. The channel received `bridge-ok` for the first turn and `bridge-two` for the second, each exactly once. The same fabric was then demonstrated for the second runtime: `ops codex serve` held a real Codex thread, a shared client prompted it to `"stopReason":"completed"`, and the channel received the turn with the real thread id in the durable state. Uses discord-digital-twin as a real Discord-compatible server |
 | AC07 | Stale control | closed | a real libSQL binding was created at generation 1, detached, and rebound at generation 2. A control write reusing the superseded binding's request id and generation is refused, and a control write against the live binding is refused too, because generation is not a control credential and the boundary admits only `mode: observe`. Both rows remain `mode: observe`, `publication_policy: none`. Proven sensitive: disabling the mode gate makes this test and the existing boundary test fail |
@@ -206,3 +206,17 @@ error `-32601` on a microtask and the turn still settles. The capability reason 
 such a turn "stalls until interrupted", which was wrong and is corrected: an
 approval-gated action fails rather than being granted. A test drives that path with a
 fake app-server that asks for approval mid-turn and echoes the answer back.
+
+Codex parity with the jcode fabric, measured end to end:
+
+| Step | Observed |
+| --- | --- |
+| Two CLI clients on one served thread | `cli-a` and `cli-b` both exited 0; the channel received two messages, `items=4` then `items=6`, each once |
+| Kill the hub, restart it on the same log and thread | new hub started against the same thread id; `cli-c` exited 0 |
+| Channel after the restart | three messages with no duplicate of the two earlier ones, and the third carried `items=8`, so history accumulated across the restart |
+| Durable state | `{"sessionId":"01a1db37-99ca-7b40-a831-1e1e9fb13386","seq":10}` with the same thread id before and after |
+
+An earlier attempt at this run failed and was traced to the test model, not the product:
+the local stub delayed every request because its slow-mode check matched a substring
+present in all request bodies, and the stub had expired mid-run. Both were fixed in the
+harness before the passing run above.
