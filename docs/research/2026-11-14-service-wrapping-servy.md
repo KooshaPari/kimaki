@@ -10,9 +10,9 @@ Source: `https://github.com/aelassas/servy/releases/tag/v10.8`, released 2026-11
 
 Verified by downloading `servy-10.8-net48-x64-portable.7z` (2.1 MB) into scratch and running the CLI:
 
-- `servy-cli.exe version` reports `Servy.CLI 10.8.0.0`.
+- `servy-cli.exe version` reports `Servy.CLI 10.8.0.0`. A system-wide install already exists at `C:\Program Files\Servy\servy-cli.exe` and reports `10.8.0+9c83a0c3aa1ade4d44b0045c989ee8a921c4714b`.
 - Verbs: `install`, `uninstall`, `start`, `stop`, `status`, `restart`, `export`, `import`, `show`, `help`, `version`.
-- `show` refuses to run unelevated: "Access Denied. Please restart your shell as Administrator". Listing services needs an elevated shell.
+- `status` works unelevated and returns `NotInstalled` for a missing service; `show` refuses unelevated: "Access Denied. Please restart your shell as Administrator".
 - `install` flags include `--name`, `--displayName`, `--description`, `--path`, `--startupDir`, `--params`, `--startupType`, `--priority`, `--cpuAffinity`, `--startTimeout`, `--stopTimeout`, `--stdout`, `--stderr`, `--enableSizeRotation`, `--rotationSize`, `--enableDateRotation`, `--maxRotations`, `--useLocalTimeForRotation`, `--enableHealth`, `--debug`.
 - The CLI itself warns that `--params` exposes values in OS process listings and points at the `SERVY_PROCESS_PARAMETERS` environment variable instead. It also warns that `--debug` records environment variables and parameters into the service log.
 - The net48 SBOM lists 27 components.
@@ -40,6 +40,8 @@ Assessment for this host: the strongest Windows candidate. It is maintained, sig
 - On this host WSL is currently stopped (verified with `wsl.exe -l -v`: FedoraLinux-Desk and docker-desktop, both Stopped), so no systemd behaviour was executed. Under the standing coordination rule I did not start it.
 
 ## Concrete shape for kimaki
+
+Two reviewed artifacts ship with this note: `scripts/service/kimaki-servy-install.ps1`, which is a dry run unless given `-Apply`, and `scripts/service/kimaki.service` for systemd. The installer was exercised here: preflight passes, it resolves the nested package layout, and with `-Apply` in an unelevated shell it refuses with "elevation required".
 
 Windows, using verified flags only:
 
