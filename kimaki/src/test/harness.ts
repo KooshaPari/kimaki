@@ -197,20 +197,38 @@ export async function startOpencodeTestServer({
   const current: { child: ChildProcess | null } = { child: null }
 
   async function start() {
-    // A fresh port per start, like a restarted or upgraded user service.
-    const port = await freePort()
-    current.child = spawn(
-      opencodeBinary(),
-      ['serve', '--service', '--port', String(port), '--hostname', '127.0.0.1'],
-      { env, stdio: 'ignore' },
-    )
-    const deadline = Date.now() + 60_000
-    while (Date.now() < deadline) {
-      const endpoint = await Service.discover({ file: serviceFile }).catch(() => undefined)
-      if (endpoint?.url.endsWith(`:${port}`)) return
-      await sleep(100)
+    // One retry: under load the agent occasionally misses its registration window,
+    // and a silent retry is far cheaper than an opaque 60s failure.
+    let lastError = ""
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      // A fresh port per start, like a restarted or upgraded user service.
+      const port = await freePort()
+      let stderr = ""
+      const child = spawn(
+        opencodeBinary(),
+        ['serve', '--service', '--port', String(port), '--hostname', '127.0.0.1'],
+        { env, stdio: ['ignore', 'ignore', 'pipe'] },
+      )
+      current.child = child
+      child.stderr?.setEncoding("utf8")
+      child.stderr?.on("data", (chunk: string) => {
+        // Keep a bounded tail; a runaway log must not grow the test process.
+        stderr = `${stderr}${chunk}`.slice(-4000)
+      })
+      const deadline = Date.now() + 60_000
+      while (Date.now() < deadline) {
+        const endpoint = await Service.discover({ file: serviceFile }).catch(() => undefined)
+        if (endpoint?.url.endsWith(`:${port}`)) return
+        if (child.exitCode !== null) {
+          lastError = `agent exited with code ${child.exitCode}: ${stderr.trim().slice(-1200)}`
+          break
+        }
+        await sleep(100)
+      }
+      if (!lastError) lastError = `did not register within 60s: ${stderr.trim().slice(-1200)}`
+      await kill()
     }
-    throw new Error(`OpenCode test server did not register in ${serviceFile}`)
+    throw new Error(`OpenCode test server failed to start after 2 attempts (${serviceFile}): ${lastError}`)
   }
 
   async function kill() {
