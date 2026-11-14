@@ -26,20 +26,38 @@ const SKILLS_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '.
 export type BuiltinSkill = { id: string; name: string; description: string; path: string; content: string }
 
 function frontmatterValue(frontmatter: string, key: string): string | undefined {
-  return new RegExp(`^${key}:\\s*(.+)$`, 'm').exec(frontmatter)?.[1]?.trim()
+  const value = new RegExp(`^${key}:[ \\t]*(.*)$`, 'm').exec(frontmatter)?.[1]?.trim()
+  // `description:` and `description: ""` are empty values, not descriptions.
+  return value && !/^(['"])\1$/.test(value) ? value : undefined
 }
 
-export async function readBuiltinSkills(): Promise<FilesystemError | BuiltinSkill[]> {
+// Checkouts differ: core.autocrlf=true stores CRLF, some editors mix both, and a
+// BOM can survive a copy. Normalise in memory instead of rewriting skill files on
+// disk, so Windows and UNIX checkouts parse the same.
+export function normaliseNewlines(raw: string): string {
+  return raw.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n')
+}
+
+// Pure parse of one skill file. Kept exported so tests can cover every encoding
+// without depending on how this checkout happens to be checked out.
+export function parseBuiltinSkill(id: string, file: string, raw: string): FilesystemError | BuiltinSkill {
+  const text = normaliseNewlines(raw)
+  const match = /^---\n([\s\S]*?)\n---(?:\n([\s\S]*))?$/.exec(text)
+  const description = match?.[1] ? frontmatterValue(match[1], 'description') : undefined
+  if (!match || !description) return new FilesystemError({ operation: `parse ${file}: missing frontmatter description` })
+  // Virtual path: OpenCode has no file to scan for these (same as its /builtin skills).
+  return { id, name: id, description, path: `/kimaki/${id}.md`, content: (match[2] ?? '').trim() }
+}
+
+export async function readBuiltinSkills(skillsDir: string = SKILLS_DIR): Promise<FilesystemError | BuiltinSkill[]> {
   const skills: BuiltinSkill[] = []
   for (const id of BUILTIN_SKILL_IDS) {
-    const file = path.join(SKILLS_DIR, id, 'SKILL.md')
-    const text = await fs.promises.readFile(file, 'utf8').catch((cause) => new FilesystemError({ operation: `read ${file}`, cause }))
-    if (text instanceof Error) return text
-    const match = /^---\n([\s\S]*?)\n---\n([\s\S]*)$/.exec(text)
-    const description = match?.[1] ? frontmatterValue(match[1], 'description') : undefined
-    if (!match || !description) return new FilesystemError({ operation: `parse ${file}: missing frontmatter description` })
-    // Virtual path: OpenCode has no file to scan for these (same as its /builtin skills).
-    skills.push({ id, name: id, description, path: `/kimaki/${id}.md`, content: match[2]!.trim() })
+    const file = path.join(skillsDir, id, 'SKILL.md')
+    const raw = await fs.promises.readFile(file, 'utf8').catch((cause) => new FilesystemError({ operation: `read ${file}`, cause }))
+    if (raw instanceof Error) return raw
+    const skill = parseBuiltinSkill(id, file, raw)
+    if (skill instanceof Error) return skill
+    skills.push(skill)
   }
   return skills
 }
