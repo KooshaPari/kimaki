@@ -217,6 +217,16 @@ export const createAcpClient: CreateAcpClient = (options: AcpClientOptions): Acp
       const agentName = typeof result.agentName === 'string'
         ? result.agentName
         : typeof info?.name === 'string' ? info.name : null
+      // A fork can reuse another runtime's ACP surface and still misreport who it
+      // is, so the profile's expectation is checked here, once, for every caller.
+      if (options.expectedIdentity !== undefined && agentName !== options.expectedIdentity) {
+        const label = options.identityLabel ?? options.expectedIdentity
+        return new ConfigError({
+          reason: agentName === null
+            ? `Runtime profile ${label} expects the peer to report identity '${options.expectedIdentity}', but the ACP handshake reported none`
+            : `Runtime profile ${label} expects identity '${options.expectedIdentity}', but the ACP handshake reported '${agentName}'; refusing to route a ${label} session`,
+        })
+      }
       return { protocolVersion, agentName }
     },
 

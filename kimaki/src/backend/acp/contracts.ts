@@ -36,6 +36,14 @@ export type AcpClientOptions = {
   env?: NodeJS.ProcessEnv
   /** Per-request deadline in milliseconds. Defaults to 30s for control frames. */
   timeoutMs?: number
+  /**
+   * Identity the peer must report in the initialize handshake. A runtime fork can
+   * claim another runtime's name, so a caller that resolved a profile states what
+   * it expects and a mismatch refuses instead of routing the session.
+   */
+  expectedIdentity?: string
+  /** Profile id used in a refusal message; defaults to `expectedIdentity`. */
+  identityLabel?: string
 }
 
 export type AcpInitializeResult = {

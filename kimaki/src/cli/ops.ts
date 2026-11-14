@@ -8,6 +8,17 @@ function required(value: string | undefined, flag: string): string {
   return value
 }
 
+// A runtime profile decides which executable, store and environment a Jcode
+// family command runs under. An unknown id is refused here, so no command can
+// fall back to the stock binary just because a name looked plausible.
+async function resolveProfileOption(value: string | undefined) {
+  const { RUNTIME_PROFILES, RUNTIME_PROFILE_IDS, STOCK_JCODE_PROFILE } = await import('../ops/contracts.ts')
+  if (value === undefined) return STOCK_JCODE_PROFILE
+  const chosen = (RUNTIME_PROFILES as Record<string, typeof STOCK_JCODE_PROFILE | undefined>)[value]
+  if (chosen === undefined) return new ConfigError({ reason: `--profile must be ${RUNTIME_PROFILE_IDS.join(' or ')}, not ${value}` })
+  return chosen
+}
+
 // An explicit approval policy is opt-in: without it the client keeps refusing
 // server-initiated approval requests, so nothing is granted by default.
 function approvalDecision(value: string | undefined): 'accept' | 'acceptForSession' | 'decline' | 'cancel' | undefined {
@@ -99,6 +110,7 @@ export function registerOpsCommands(cli: Goke) {
     .option('--source <kind>', 'Runtime source: opencode (default) or jcode')
     .option('--service-file <path>', 'Explicit running OpenCode service file')
     .option('--jcode-home <path>', 'Explicit Jcode home for polling observation')
+    .option('--profile <id>', 'Runtime profile: jcode (stock, default) or kcode; a mismatched identity is refused')
     .option('--host <id>', 'Explicit runtime host identity')
     .option('--endpoint <id>', 'Explicit runtime endpoint identity')
     .option('--native-session <id>', 'Explicit native session ID')
@@ -136,7 +148,7 @@ export function registerOpsCommands(cli: Goke) {
           const { createJcodeObserver } = await import('../ops/runtime/jcode.ts')
           const { publishMetadataNotice } = await import('../ops/discord/publication.ts')
           const observer = createJcodeObserver({
-            jcodeHome, hostId: target.session.hostId, endpointId: target.session.endpointId,
+            jcodeHome, profile: options.profile, hostId: target.session.hostId, endpointId: target.session.endpointId,
             readDir: (path) => fs.readdir(path),
             readFile: (path) => fs.readFile(path, 'utf8'),
           })
@@ -233,6 +245,7 @@ export function registerOpsCommands(cli: Goke) {
     .option('--service-file <path>', 'Explicit running OpenCode service file, never start a service')
     .option('--codex-home <path>', 'Explicit Codex state directory for the app-server, never the default home')
     .option('--jcode-home <path>', 'Explicit Jcode home directory, never the default home')
+    .option('--profile <id>', 'Runtime profile: jcode (stock, default) or kcode; a mismatched identity is refused')
     .option('--limit <n>', 'Page size for jcode discovery (default: 50)')
     .option('--cursor <offset>', 'Opaque cursor from a previous jcode page')
     .option('--host <id>', 'Explicit native runtime host identity')
@@ -252,6 +265,7 @@ export function registerOpsCommands(cli: Goke) {
         const { createJcodeObserver } = await import('../ops/runtime/jcode.ts')
         const observer = createJcodeObserver({
           jcodeHome,
+          profile: options.profile,
           hostId,
           endpointId,
           readDir: (path) => fs.readdir(path),
@@ -390,7 +404,8 @@ export function registerOpsCommands(cli: Goke) {
   cli.command('ops jcode run', 'Run one prompt through the Jcode backend over ACP and stream its text')
     .option('--cwd <path>', 'Working directory for the Jcode ACP session')
     .option('--prompt <text>', 'Prompt text sent as one ACP session/prompt')
-    .option('--binary <path>', 'Jcode executable (default: jcode)')
+    .option('--binary <path>', 'Explicit Jcode executable; without it the profile resolves one')
+    .option('--profile <id>', 'Runtime profile: jcode (stock, default) or kcode; a mismatched identity is refused')
     .option('--model <id>', 'Model selected for the ACP session instead of the agent default')
     .option('--tool-profile <kind>', 'Jcode tool profile: none (default), minimal or full')
     .option('--timeout <ms>', 'Per-request ACP deadline in milliseconds')
@@ -404,7 +419,7 @@ export function registerOpsCommands(cli: Goke) {
       const timeoutMs = options.timeout === undefined ? undefined : Number(options.timeout)
       if (timeoutMs !== undefined && (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1)) fail(new ConfigError({ reason: '--timeout must be a positive integer in milliseconds' }))
       const { createJcodeBackend } = await import('../backend/jcode.ts')
-      const backend = createJcodeBackend({ binary: options.binary ?? 'jcode', cwd, model, toolProfile: toolProfile as 'none' | 'minimal' | 'full', timeoutMs })
+      const backend = createJcodeBackend({ binary: options.binary, profile: options.profile, cwd, model, toolProfile: toolProfile as 'none' | 'minimal' | 'full', timeoutMs })
       const started = await backend.start()
       if (started instanceof Error) {
         await backend.close()
@@ -429,7 +444,8 @@ export function registerOpsCommands(cli: Goke) {
 
   cli.command('ops jcode serve', 'Serve one Jcode session on loopback so several clients can watch the same turns')
     .option('--cwd <path>', 'Working directory for the Jcode ACP session')
-    .option('--binary <path>', 'Jcode executable (default: jcode)')
+    .option('--binary <path>', 'Explicit Jcode executable; without it the profile resolves one')
+    .option('--profile <id>', 'Runtime profile: jcode (stock, default) or kcode; a mismatched identity is refused')
     .option('--model <id>', 'Model selected for the ACP session instead of the agent default')
     .option('--tool-profile <kind>', 'Jcode tool profile: none (default), minimal or full')
     .option('--port <n>', 'Loopback port (default: 0, an ephemeral port)')
@@ -451,7 +467,7 @@ export function registerOpsCommands(cli: Goke) {
       const { createJcodeBackend } = await import('../backend/jcode.ts')
       const { createSessionHub } = await import('../backend/hub.ts')
       const { startHubServer } = await import('../backend/hub-server.ts')
-      const backend = createJcodeBackend({ binary: options.binary ?? 'jcode', cwd, model, toolProfile: toolProfile as 'none' | 'minimal' | 'full', timeoutMs })
+      const backend = createJcodeBackend({ binary: options.binary, profile: options.profile, cwd, model, toolProfile: toolProfile as 'none' | 'minimal' | 'full', timeoutMs })
       const hub = createSessionHub({ backend, model, logFile: options.log, ...(buffer === undefined ? {} : { bufferLimit: buffer }) })
       if (hub instanceof Error) {
         await backend.close()
@@ -620,7 +636,8 @@ export function registerOpsCommands(cli: Goke) {
   cli.command('ops jcode watch', 'Follow a live native Jcode session by polling session/load and emitting new messages')
     .option('--session <id>', 'ACP session id to follow')
     .option('--cwd <path>', 'Working directory the session belongs to')
-    .option('--binary <path>', 'Jcode executable (default: jcode)')
+    .option('--binary <path>', 'Explicit Jcode executable; without it the profile resolves one')
+    .option('--profile <id>', 'Runtime profile: jcode (stock, default) or kcode; a mismatched identity is refused')
     .option('--interval <ms>', 'Polling interval in milliseconds (default: 2000)')
     .option('--iterations <n>', 'Stop after this many polls; 0 keeps polling (default: 0)')
     .option('--emit-existing', 'Emit history already present at attach time')
@@ -637,6 +654,9 @@ export function registerOpsCommands(cli: Goke) {
       const iterations = options.iterations === undefined ? 0 : Number(options.iterations)
       if (!Number.isSafeInteger(iterations) || iterations < 0) fail(new ConfigError({ reason: '--iterations must be zero or a positive integer' }))
       const { createAcpClient } = await import('../backend/acp/client.ts')
+      const profile = await resolveProfileOption(options.profile)
+      if (profile instanceof Error) fail(profile)
+      const command = options.binary ?? profile.executable
       const discordRequested = [options.tenant, options.surface, options.state, options.token].some((value) => value !== undefined)
       if (discordRequested && (!options.tenant?.trim() || !options.surface?.trim() || !options.state?.trim() || !(options.token ?? process.env['KIMAKI_BOT_TOKEN'])?.trim())) fail(new ConfigError({ reason: 'Discord watch requires --tenant, --surface, --state and --token (or KIMAKI_BOT_TOKEN) together' }))
       let mirror: Exclude<Awaited<ReturnType<typeof import('../ops/discord/watch.ts').openNativeDiscordWatch>>, Error> | undefined
@@ -659,7 +679,7 @@ export function registerOpsCommands(cli: Goke) {
       let polls = 0
       let failure: Error | undefined
       for (;;) {
-        const client = createAcpClient({ command: options.binary ?? 'jcode', args: ['acp'], cwd })
+        const client = createAcpClient({ command, args: ['acp'], cwd, expectedIdentity: profile.expectedIdentity, identityLabel: profile.id })
         const initialized = await client.initialize()
         if (initialized instanceof Error) {
           await client.close()
@@ -863,7 +883,8 @@ export function registerOpsCommands(cli: Goke) {
   cli.command('ops jcode history', 'Load an existing Jcode session over ACP and print its replayed native history')
     .option('--session <id>', 'ACP session id to load')
     .option('--cwd <path>', 'Working directory the session belongs to')
-    .option('--binary <path>', 'Jcode executable (default: jcode)')
+    .option('--binary <path>', 'Explicit Jcode executable; without it the profile resolves one')
+    .option('--profile <id>', 'Runtime profile: jcode (stock, default) or kcode; a mismatched identity is refused')
     .option('--timeout <ms>', 'Per-request ACP deadline in milliseconds')
     .option('--allow-empty', 'Accept a session that replays no history')
     .option('--json', 'Print one JSON document instead of one line per message')
@@ -873,7 +894,9 @@ export function registerOpsCommands(cli: Goke) {
       const timeoutMs = options.timeout === undefined ? undefined : Number(options.timeout)
       if (timeoutMs !== undefined && (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1)) fail(new ConfigError({ reason: '--timeout must be a positive integer in milliseconds' }))
       const { createAcpClient } = await import('../backend/acp/client.ts')
-      const client = createAcpClient({ command: options.binary ?? 'jcode', args: ['acp'], cwd, timeoutMs })
+      const profile = await resolveProfileOption(options.profile)
+      if (profile instanceof Error) fail(profile)
+      const client = createAcpClient({ command: options.binary ?? profile.executable, args: ['acp'], cwd, timeoutMs, expectedIdentity: profile.expectedIdentity, identityLabel: profile.id })
       const initialized = await client.initialize()
       if (initialized instanceof Error) {
         await client.close()

@@ -142,7 +142,7 @@ const ok = <T>(value: T | Error): T => {
   return value
 }
 
-const startAgent = async (options: { timeoutMs?: number } = {}): Promise<AcpClient> => {
+const startAgent = async (options: { timeoutMs?: number; expectedIdentity?: string; identityLabel?: string } = {}): Promise<AcpClient> => {
   dir ??= await fs.mkdtemp(path.join(os.tmpdir(), 'kimaki-acp-'))
   const script = path.join(dir, `agent-${Math.random().toString(36).slice(2)}.cjs`)
   const pidFile = path.join(dir, `${path.basename(script)}.pid`)
@@ -151,6 +151,8 @@ const startAgent = async (options: { timeoutMs?: number } = {}): Promise<AcpClie
     command: process.execPath,
     args: [script, pidFile],
     timeoutMs: options.timeoutMs,
+    expectedIdentity: options.expectedIdentity,
+    identityLabel: options.identityLabel,
   })
   clients.push(client)
   return client
@@ -358,4 +360,23 @@ test('close terminates the child and is idempotent', async () => {
   expect(await waitForDead(pid)).toBe(true)
   const afterClose = await client.prompt({ sessionId: 'session_fox_1', text: 'hello' })
   expect(afterClose).toBeInstanceOf(ConfigError)
+})
+
+// A runtime fork reuses this ACP surface and can claim another runtime's name, so
+// a caller that resolved a profile states the identity it expects. The label is
+// evidence to check, never authority to route.
+test('a handshake that reports the expected identity is accepted', async () => {
+  const client = await startAgent({ expectedIdentity: 'jcode' })
+  const initialized = ok(await client.initialize())
+  expect(initialized.agentName).toBe('jcode')
+})
+
+test('a handshake that reports another identity is refused and names both sides', async () => {
+  const client = await startAgent({ expectedIdentity: 'kcode', identityLabel: 'kcode' })
+  const initialized = await client.initialize()
+  expect(initialized).toBeInstanceOf(ConfigError)
+  const message = (initialized as Error).message
+  expect(message).toContain("expects identity 'kcode'")
+  expect(message).toContain("reported 'jcode'")
+  expect(message).toContain('refusing to route a kcode session')
 })
