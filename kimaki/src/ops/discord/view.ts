@@ -5,6 +5,14 @@ import { ConfigError, DiscordError } from '../../errors.js'
 import { ackHub, openHubStream, readHubState } from '../../backend/hub-client.ts'
 import type { HubEvent } from '../../backend/hub.ts'
 
+// A view's hub identity is scoped to the channel it mirrors, not to the process
+// that happens to run it. Two views on one channel therefore claim the same id,
+// and the hub refuses the second one instead of letting both post every turn
+// twice. Views on different channels stay independent because the id differs.
+export function defaultViewClientId(channelId: string): string {
+  return `discord-view-${channelId}`
+}
+
 export async function openDiscordView({ rest, tenantId, channelId, clientId, cursor, statePath, baseUrl, signal, onPosted }: {
   rest: REST
   tenantId: string

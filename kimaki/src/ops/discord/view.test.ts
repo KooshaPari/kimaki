@@ -8,16 +8,19 @@ import { DigitalDiscord } from 'discord-digital-twin/src'
 import { createSessionHub, type HubBackend, type HubEvent } from '../../backend/hub.ts'
 import { startHubServer } from '../../backend/hub-server.ts'
 import { ConfigError } from '../../errors.js'
-import { openDiscordView } from './view.ts'
+import { defaultViewClientId, openDiscordView } from './view.ts'
 
 let discord: DigitalDiscord
 let channelId: string
+let otherChannelId: string
 const root = 'E:\\koosh\\Agents\\scratch\\discord-view'
 beforeAll(async () => {
   fs.mkdirSync(root, { recursive: true })
-  discord = new DigitalDiscord({ guild: { name: 'View Test' }, channels: [{ name: 'general', type: ChannelType.GuildText }] })
+  discord = new DigitalDiscord({ guild: { name: 'View Test' }, channels: [{ name: 'general', type: ChannelType.GuildText }, { name: 'second', type: ChannelType.GuildText }] })
   await discord.start()
-  channelId = (await discord.prisma.channel.findMany())[0]!.id
+  const channels = await discord.prisma.channel.findMany()
+  channelId = channels.find((channel) => channel.name === 'general')!.id
+  otherChannelId = channels.find((channel) => channel.name === 'second')!.id
 }, 30_000)
 afterAll(async () => { await discord?.stop() })
 
@@ -45,15 +48,28 @@ async function fixture(fail = false, bufferLimit?: number, api?: string, echo = 
   const server = await startHubServer({ hub, port: 0 })
   if (server instanceof Error) throw server
   const statePath = path.join(root, `view-${process.pid}-${++serial}.json`)
+  const extraStatePaths: string[] = []
   const rest = new REST({ api: api ?? discord.restUrl, version: '10', retries: 0, rejectOnRateLimit: () => true }).setToken(discord.botToken)
-  const start = (onPosted?: (seq: number) => void) => {
+  // Options are additive so every pre-existing call keeps the single-view shape:
+  // same channel, same state file, explicit 'view' client id.
+  const start = (onPosted?: (seq: number) => void, options: { clientId?: string; channel?: string; statePath?: string } = {}) => {
+    const clientId = options.clientId ?? 'view'
+    const channel = options.channel ?? channelId
+    const file = options.statePath ?? statePath
+    if (file !== statePath) extraStatePaths.push(file)
     const controller = new AbortController()
-    const run = openDiscordView({ rest, tenantId: discord.guildId, channelId, clientId: 'view', statePath, baseUrl: server.url, signal: controller.signal, onPosted })
+    const run = openDiscordView({ rest, tenantId: discord.guildId, channelId: channel, clientId, statePath: file, baseUrl: server.url, signal: controller.signal, onPosted })
     return { controller, run }
   }
-  return { hub, server, statePath, start, async close() { await server.close(); await hub.close(); fs.rmSync(statePath, { force: true }) } }
+  return { hub, server, statePath, start, async close() {
+    await server.close()
+    await hub.close()
+    fs.rmSync(statePath, { force: true })
+    for (const file of extraStatePaths) fs.rmSync(file, { force: true })
+  } }
 }
 const count = async () => (await discord.channel(channelId).getMessages()).length
+const countIn = async (channel: string) => (await discord.channel(channel).getMessages()).length
 async function waitFor(check: () => Promise<boolean>) {
   for (let i = 0; i < 100; i++) {
     if (await check()) return
@@ -61,6 +77,85 @@ async function waitFor(check: () => Promise<boolean>) {
   }
   throw new Error('Timed out waiting for Discord view')
 }
+
+test('the default client id is channel-scoped rather than process-scoped', () => {
+  // Same channel, same identity, no matter which process asks.
+  expect(defaultViewClientId(channelId)).toBe(defaultViewClientId(channelId))
+  expect(defaultViewClientId(channelId)).toBe(`discord-view-${channelId}`)
+  // Different channels must not collide, or one channel would block the other.
+  expect(defaultViewClientId(channelId)).not.toBe(defaultViewClientId(otherChannelId))
+})
+
+test('a second view on the same channel is refused and the turn posts once', async () => {
+  const f = await fixture(false, undefined, undefined, true)
+  const before = await count()
+  const firstState = path.join(root, `echo-first-${process.pid}-${++serial}.json`)
+  const secondState = path.join(root, `echo-second-${process.pid}-${++serial}.json`)
+  try {
+    const duplicate = defaultViewClientId(channelId)
+    let posted = 0
+    const first = f.start(() => { posted += 1 }, { clientId: duplicate, statePath: firstState })
+    await waitFor(async () => f.hub.snapshot().subscribers === 1)
+    // The hub itself refuses the duplicate id with a 400 and names the reason.
+    const raw = await fetch(`${f.server.url}/events?cursor=0&client=${encodeURIComponent(duplicate)}`)
+    expect(raw.status).toBe(400)
+    expect(await raw.text()).toMatch(/already attached/i)
+    // The channel is already mirrored under this id, so the hub refuses this one.
+    const second = f.start(undefined, { clientId: defaultViewClientId(channelId), statePath: secondState })
+    const refusal = await second.run
+    expect(refusal).toBeInstanceOf(Error)
+    expect((refusal as Error).message).toMatch(/400/)
+    expect(f.hub.snapshot().subscribers).toBe(1)
+    expect(f.hub.snapshot().clients.map((client) => client.clientId)).toEqual([duplicate])
+    // A refused view never got far enough to claim a cursor.
+    expect(fs.existsSync(secondState)).toBe(false)
+
+    expect(await f.hub.submit('duplicated channel turn')).not.toBeInstanceOf(Error)
+    await waitFor(async () => posted === 1)
+    // Two attached views would each post, so give a duplicate post time to land.
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    const messages = (await discord.channel(channelId).getMessages()).slice(before)
+    expect(messages.map((message) => message.content)).toEqual(['answer:duplicated channel turn'])
+    expect(posted).toBe(1)
+    first.controller.abort()
+    expect(await first.run).toBeUndefined()
+  } finally { await f.close() }
+})
+
+test('views on different channels keep independent ids and each posts the turn once', async () => {
+  const f = await fixture(false, undefined, undefined, true)
+  const beforeFirst = await countIn(channelId)
+  const beforeOther = await countIn(otherChannelId)
+  try {
+    let firstPosted = 0
+    let otherPosted = 0
+    const first = f.start(() => { firstPosted += 1 }, {
+      clientId: defaultViewClientId(channelId),
+      channel: channelId,
+      statePath: path.join(root, `split-first-${process.pid}-${++serial}.json`),
+    })
+    const other = f.start(() => { otherPosted += 1 }, {
+      clientId: defaultViewClientId(otherChannelId),
+      channel: otherChannelId,
+      statePath: path.join(root, `split-other-${process.pid}-${++serial}.json`),
+    })
+    await waitFor(async () => f.hub.snapshot().subscribers === 2)
+    expect(f.hub.snapshot().clients.map((client) => client.clientId).sort())
+      .toEqual([defaultViewClientId(channelId), defaultViewClientId(otherChannelId)].sort())
+
+    expect(await f.hub.submit('broadcast turn')).not.toBeInstanceOf(Error)
+    await waitFor(async () => firstPosted === 1 && otherPosted === 1)
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    expect((await discord.channel(channelId).getMessages()).slice(beforeFirst).map((message) => message.content))
+      .toEqual(['answer:broadcast turn'])
+    expect((await discord.channel(otherChannelId).getMessages()).slice(beforeOther).map((message) => message.content))
+      .toEqual(['answer:broadcast turn'])
+    first.controller.abort()
+    other.controller.abort()
+    expect(await first.run).toBeUndefined()
+    expect(await other.run).toBeUndefined()
+  } finally { await f.close() }
+})
 
 test('one finished turn posts exact text once and records the cursor', async () => {
   const f = await fixture()

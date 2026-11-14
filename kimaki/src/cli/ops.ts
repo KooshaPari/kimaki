@@ -903,7 +903,7 @@ export function registerOpsCommands(cli: Goke) {
     .option('--surface <id>', 'Channel id to post turns into')
     .option('--token <token>', 'Bot token (default: KIMAKI_BOT_TOKEN)')
     .option('--state <path>', 'Durable cursor file; a restart posts nothing twice')
-    .option('--client <id>', 'Client identity to register in hub presence (default: discord-view)')
+    .option('--client <id>', 'Client identity to register in hub presence (default: discord-view-<surface>, which refuses a second view of the same channel)')
     .option('--cursor <n>', 'Start from this cursor when the state file is missing')
     .option('--timeout <ms>', 'Maximum viewing duration in milliseconds (default: 0, unbounded)')
     .action(async (options) => {
@@ -917,7 +917,7 @@ export function registerOpsCommands(cli: Goke) {
       const timeout = options.timeout === undefined ? 0 : Number(options.timeout)
       if (!Number.isSafeInteger(timeout) || timeout < 0) fail(new ConfigError({ reason: '--timeout must be zero or a positive integer in milliseconds' }))
       const { REST } = await import('discord.js')
-      const { openDiscordView } = await import('../ops/discord/view.ts')
+      const { openDiscordView, defaultViewClientId } = await import('../ops/discord/view.ts')
       const rest = new REST({ ...(process.env['KIMAKI_DISCORD_REST_URL'] ? { api: process.env['KIMAKI_DISCORD_REST_URL'] } : {}), version: '10', retries: 0, rejectOnRateLimit: () => true }).setToken(token)
       const controller = new AbortController()
       const deadline = timeout === 0 ? null : setTimeout(() => controller.abort(), timeout)
@@ -925,9 +925,10 @@ export function registerOpsCommands(cli: Goke) {
         rest,
         tenantId: tenant,
         channelId: surface,
-        // The hub refuses a duplicate client id, so two views on one session must
-        // not share a default. A per-process id keeps separate surfaces independent.
-        clientId: options.client ?? `discord-view-${process.pid}`,
+        // The hub refuses a duplicate client id, so the default is scoped to the
+        // channel instead of the process: a second view on the same channel is
+        // refused (one post per turn) while another channel keeps its own id.
+        clientId: options.client ?? defaultViewClientId(surface),
         cursor,
         statePath,
         baseUrl: url,
