@@ -300,6 +300,24 @@ describe('createSessionHub', () => {
     }
   })
 
+  it('refuses a lease whose pid is alive, even when that pid is not a hub', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-hub-pidreuse-'))
+    const logFile = path.join(dir, 'events.jsonl')
+    const leaseFile = `${logFile}.lock`
+    try {
+      // A reused pid looks exactly like a live holder: the safe answer is refuse,
+      // never steal a lease from a process that is currently running.
+      fs.writeFileSync(leaseFile, JSON.stringify({ pid: process.pid, startedAt: '2020-01-01T00:00:00.000Z' }))
+      const hub = createSessionHub({ backend: fakeBackend().backend, logFile })
+      expect(hub).toBeInstanceOf(Error)
+      expect((hub as Error).message).toMatch(/lease/i)
+      // The holder's lease file is left untouched.
+      expect(JSON.parse(fs.readFileSync(leaseFile, 'utf8'))).toMatchObject({ pid: process.pid })
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
   it('takes over a lease left behind by a dead process', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-hub-stale-'))
     const logFile = path.join(dir, 'events.jsonl')
