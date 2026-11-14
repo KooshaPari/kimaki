@@ -1,5 +1,7 @@
 import fs from 'node:fs'
+import http from 'node:http'
 import path from 'node:path'
+import type { AddressInfo } from 'node:net'
 import { afterAll, beforeAll, expect, test } from 'vitest'
 import { ChannelType, REST } from 'discord.js'
 import { DigitalDiscord } from 'discord-digital-twin/src'
@@ -19,7 +21,7 @@ beforeAll(async () => {
 afterAll(async () => { await discord?.stop() })
 
 let serial = 0
-async function fixture(fail = false, bufferLimit?: number) {
+async function fixture(fail = false, bufferLimit?: number, api?: string) {
   const backend: HubBackend = {
     async start() { return { sessionId: 'view-session', model: null } },
     async prompt(_prompt, onChunk) {
@@ -36,7 +38,7 @@ async function fixture(fail = false, bufferLimit?: number) {
   const server = await startHubServer({ hub, port: 0 })
   if (server instanceof Error) throw server
   const statePath = path.join(root, `view-${process.pid}-${++serial}.json`)
-  const rest = new REST({ api: discord.restUrl, version: '10' }).setToken(discord.botToken)
+  const rest = new REST({ api: api ?? discord.restUrl, version: '10', retries: 0, rejectOnRateLimit: () => true }).setToken(discord.botToken)
   const start = (onPosted?: (seq: number) => void) => {
     const controller = new AbortController()
     const run = openDiscordView({ rest, tenantId: discord.guildId, channelId, clientId: 'view', statePath, baseUrl: server.url, signal: controller.signal, onPosted })
@@ -142,4 +144,39 @@ test('refuses a clipped replay instead of mirroring a partial history', async ()
     expect(await count()).toBe(before)
     expect(fs.existsSync(f.statePath)).toBe(false)
   } finally { await f.close() }
+})
+
+test('a 429 on the view post fails without advancing the cursor', async () => {
+  let posts = 0
+  const stub = http.createServer((request, response) => {
+    if (request.method === 'GET' && request.url === `/v10/channels/${channelId}`) {
+      response.writeHead(200, { 'content-type': 'application/json' })
+      response.end(JSON.stringify({ id: channelId, guild_id: discord.guildId, type: 0, name: 'general' }))
+      return
+    }
+    if (request.method === 'POST' && request.url === `/v10/channels/${channelId}/messages`) {
+      posts += 1
+      response.writeHead(429, { 'content-type': 'application/json', 'retry-after': '1' })
+      response.end(JSON.stringify({ message: 'You are being rate limited.', retry_after: 0.05, global: false }))
+      return
+    }
+    response.writeHead(404, { 'content-type': 'application/json' })
+    response.end('{}')
+  })
+  await new Promise<void>((resolve) => stub.listen(0, '127.0.0.1', () => resolve()))
+  const api = `http://127.0.0.1:${(stub.address() as AddressInfo).port}`
+  const f = await fixture(false, undefined, api)
+  try {
+    const view = f.start()
+    await waitFor(async () => f.hub.snapshot().subscribers === 1)
+    expect(await f.hub.submit('rate limited turn')).not.toBeInstanceOf(Error)
+    const result = await view.run
+    expect(result).toBeInstanceOf(Error)
+    // One attempt, and no cursor: a retry must start from the same sequence.
+    expect(posts).toBe(1)
+    expect(fs.existsSync(f.statePath)).toBe(false)
+  } finally {
+    await f.close()
+    await new Promise<void>((resolve) => stub.close(() => resolve()))
+  }
 })

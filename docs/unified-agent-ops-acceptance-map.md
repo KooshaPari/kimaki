@@ -98,6 +98,7 @@ fails, then restoring the file and re-running the suite green.
 | AC25 | removed `rejectOnRateLimit` from all four REST clients | the 429 test fails after 120103 ms: the retry loop never returns and `posts` is not 1 |
 | AC12 | the client renders an unknown `agent_message_retraction` as the text `<retracted>` | the test fails with `the sky is grenn<retracted>...`, so it detects fabrication |
 | AC13 | `if (ready.clipped)` disabled in `ops discord view` | the new clipped-replay test fails after 30013 ms: the view would mirror a partial turn instead of refusing |
+| AC25 | `rejectOnRateLimit` removed from the `ops follow` client only | the follow 429 test fails at its 300079 ms bound: the follow process never exits and never reports the failure |
 
 Restored state: `hub.test.ts`, `acp/client.test.ts`, `ops-publish.e2e.test.ts` and
 `discord/watch.test.ts` are 49 of 49 green, and `git status` is clean.
@@ -105,12 +106,14 @@ Restored state: `hub.test.ts`, `acp/client.test.ts`, `ops-publish.e2e.test.ts` a
 Coverage of the 429 path after this pass:
 
 - `ops publish`: proven by the stub test, and proven sensitive by the mutation above.
-- `ops follow`: `ops-follow.e2e.test.ts` now drives a real 429 through the Jcode follow
-  path. Observed: exactly one POST, exit code non-zero, no `sent` line, 29 s. Its
-  sensitivity rests on the same guarded construction as publish and on the assertion
-  that the process must exit; it was not separately mutated to avoid a ten-minute run.
+- `ops follow`: `ops-follow.e2e.test.ts` drives a real 429 through the Jcode follow
+  path. Observed: exactly one POST, exit code non-zero, no `sent` line, 29 s. Proven
+  sensitive by removing the guard from that client alone.
 - Native mirror: `discord/watch.test.ts` covers a 429 leaving the cursor unadvanced.
-- `ops discord view`: uses the same guarded client; not separately 429-tested.
+- `ops discord view`: `view.test.ts` asserts that a 429 makes the view fail with no
+  cursor written and a single POST. That test supplies its own guarded client, so it
+  proves view behaviour, not the CLI's construction; the CLI guard itself is proven by
+  the publish and follow tests.
 - 5xx: measured before the fix at four POST attempts for one call, now exactly one, pinned
   by the 500 test.
 
