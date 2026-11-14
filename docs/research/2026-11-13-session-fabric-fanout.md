@@ -267,7 +267,7 @@ reproduces exactly the multi-writer ambiguity that fact 3 makes real.
 
 ## 8. Update: the hub now exists
 
-The first phased increment in this note is implemented. `kimaki/src/backend/hub.ts` owns one backend session and one writer, publishes an ordered event stream into a bounded replay buffer, and hands clients a cursor. `kimaki/src/backend/hub-server.ts` exposes it on loopback with `GET /state`, `POST /prompt`, `POST /cancel` and `GET /events?cursor=N` over server-sent events. `ops jcode serve` wires those to a real `jcode acp` child.
+The first phased increment in this note is implemented. `kimaki/src/backend/hub.ts` owns one backend session and one writer, publishes an ordered event stream into a bounded replay buffer, and hands clients a cursor. `kimaki/src/backend/hub-server.ts` exposes it on loopback with `GET /state`, `POST /prompt`, `POST /cancel` and `GET /events?cursor=N` over server-sent events. `ops jcode serve` wires those to a real `jcode acp` child, and `ops jcode attach` is a first-party client that reads the stream from its own cursor, can prompt, can watch with `--watch`, and can acknowledge with `--ack`. Two independent attach processes on one hub were measured receiving identical events and identical text.
 
 Measured: two independent clients attached to one hub received an identical sequence (1 to 4) and identical assistant text for a real turn against jcode 0.99.1. Coverage at that point: 11 hub unit tests and 6 server tests, plus one opt-in real acceptance (`KIMAKI_JCODE_HUB_E2E=1`). Current totals after the durability, presence and ack work: 22 hub unit tests, 8 server tests, and three opt-in real acceptance cases.
 

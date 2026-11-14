@@ -384,4 +384,119 @@ export function registerOpsCommands(cli: Goke) {
       // Stay attached until a signal arrives.
       await new Promise<void>(() => {})
     })
+
+  cli.command('ops jcode attach', 'Attach to a running hub, stream its events, optionally prompt and acknowledge')
+    .option('--url <url>', 'Explicit hub URL, as printed by ops jcode serve')
+    .option('--client <id>', 'Client identity to register in hub presence')
+    .option('--cursor <n>', 'Start from this cursor (default: 0)')
+    .option('--prompt <text>', 'Submit one prompt after attaching')
+    .option('--ack', 'Acknowledge the last sequence once a turn finishes')
+    .option('--watch <ms>', 'Stream without prompting for at most this long, then detach')
+    .option('--timeout <ms>', 'Maximum attach duration in milliseconds (default: 120000)')
+    .option('--json', 'Print a JSON summary instead of streamed text')
+    .action(async (options) => {
+      const url = required(options.url, 'url')
+      const cursor = options.cursor === undefined ? 0 : Number(options.cursor)
+      if (!Number.isSafeInteger(cursor) || cursor < 0) fail(new ConfigError({ reason: '--cursor must be a non-negative integer' }))
+      const timeout = options.timeout === undefined ? 120_000 : Number(options.timeout)
+      if (!Number.isSafeInteger(timeout) || timeout < 1) fail(new ConfigError({ reason: '--timeout must be a positive integer in milliseconds' }))
+      const { openHubStream, promptHub, ackHub, readHubState } = await import('../backend/hub-client.ts')
+
+      const state = await readHubState({ baseUrl: url })
+      if (state instanceof Error) fail(state)
+
+      const controller = new AbortController()
+      const deadline = setTimeout(() => controller.abort(), timeout)
+      const chunks: string[] = []
+      const events: Array<{ seq: number; type: string }> = []
+      let lastSeq = cursor
+      let outcome: { stopReason?: string; error?: string } = {}
+      let settle: (() => void) | undefined
+      const finished = new Promise<void>((resolve) => {
+        settle = resolve
+      })
+
+      const attach = openHubStream({
+        baseUrl: url,
+        clientId: options.client,
+        cursor,
+        signal: controller.signal,
+        onEvent: (event) => {
+          lastSeq = event.seq
+          events.push({ seq: event.seq, type: event.type })
+          if (event.type === 'prompt.chunk') {
+            chunks.push(event.text)
+            if (!options.json) process.stdout.write(event.text)
+          }
+          if (event.type === 'prompt.finished') {
+            outcome = { stopReason: event.stopReason }
+            settle?.()
+          }
+          if (event.type === 'prompt.failed') {
+            outcome = { error: event.reason }
+            settle?.()
+          }
+        },
+      })
+
+      // Give the subscription a moment to register before prompting.
+      await new Promise((resolve) => setTimeout(resolve, 200))
+      const watch = options.watch === undefined ? undefined : Number(options.watch)
+      if (watch !== undefined && (!Number.isSafeInteger(watch) || watch < 1)) {
+        controller.abort()
+        await attach
+        clearTimeout(deadline)
+        fail(new ConfigError({ reason: '--watch must be a positive integer in milliseconds' }))
+      }
+      if (options.prompt === undefined && watch === undefined) {
+        // Nothing to wait for: report the hub state and detach.
+        controller.abort()
+        await attach
+        clearTimeout(deadline)
+        if (options.json) printJson({ state, events })
+        else process.stdout.write(`attached to ${url} at seq ${state.seq}\n`)
+        return
+      }
+
+      if (options.prompt !== undefined) {
+        const submitted = await promptHub({ baseUrl: url, text: options.prompt })
+        if (submitted instanceof Error) {
+          controller.abort()
+          await attach
+          clearTimeout(deadline)
+          fail(submitted)
+        }
+      }
+
+      if (watch === undefined) {
+        await finished
+      } else {
+        await Promise.race([finished, new Promise<void>((resolve) => setTimeout(resolve, watch))])
+      }
+
+      // Acknowledge before detaching: presence ends with the connection, so an
+      // ack sent after the stream closes is correctly unroutable.
+      let acked: number | undefined
+      if (options.ack && options.client !== undefined) {
+        const result = await ackHub({ baseUrl: url, clientId: options.client, seq: lastSeq })
+        if (result instanceof Error) {
+          controller.abort()
+          await attach
+          clearTimeout(deadline)
+          fail(result)
+        }
+        acked = result.acked
+      }
+
+      controller.abort()
+      await attach
+      clearTimeout(deadline)
+
+      if (options.json) {
+        printJson({ events, characters: chunks.join('').length, stopReason: outcome.stopReason, error: outcome.error, acked, cursor: lastSeq })
+      } else {
+        process.stdout.write(`\n${outcome.error ?? outcome.stopReason ?? 'no result'}\n`)
+      }
+      if (outcome.error !== undefined) fail(new ConfigError({ reason: outcome.error }))
+    })
 }
