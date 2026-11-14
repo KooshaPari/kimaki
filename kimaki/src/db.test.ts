@@ -11,6 +11,7 @@ import { createClient, type Client } from '@libsql/client'
 import { afterEach, expect, test } from 'vitest'
 
 import { openDb, verbosityFromV1, verbosityToV1 } from './db.ts'
+import { DbError } from './errors.ts'
 import { LEGACY_DB_FILE } from './migrations.ts'
 
 const tempDirs: string[] = []
@@ -75,6 +76,16 @@ async function writeLegacyDb({ dataDir, sql }: { dataDir: string; sql: string })
   await legacy.executeMultiple(sql)
   legacy.close()
   return file
+}
+
+// libSQL keeps its file handles until its prepared statements are garbage
+// collected (see the --expose-gc note in vitest.config.ts). A fixture written
+// with libSQL must let go of them before the code under test renames that file,
+// exactly like the external process that wrote it exiting.
+async function releaseLibsqlHandles(): Promise<void> {
+  global.gc?.()
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  global.gc?.()
 }
 
 test('ops table upgrade is additive and only startup migrates an old-shaped database', async () => {
@@ -142,7 +153,9 @@ test('first start imports the V1 database once and leaves it unchanged', async (
 
   const opened = await openDb({ dataDir, migrate: true })
   if (opened instanceof Error) throw opened
-  expect(fs.statSync(dataDir).mode & 0o777).toBe(0o700)
+  // chmod only toggles the read-only bit on Windows, so the POSIX mode is only
+  // observable elsewhere.
+  if (process.platform !== 'win32') expect(fs.statSync(dataDir).mode & 0o777).toBe(0o700)
   // The import opened the V1 file read-only: neither file changed.
   expect({ db: fileHash(legacyFile), wal: fileHash(`${legacyFile}-wal`) }).toEqual(before)
   v1.close()
@@ -228,6 +241,7 @@ test('a stray kimaki.db without the version marker does not block the V1 import'
   await stray.execute(`CREATE TABLE notes (text TEXT)`)
   await stray.execute(`INSERT INTO notes VALUES ('keep me')`)
   stray.close()
+  await releaseLibsqlHandles()
 
   const opened = await openDb({ dataDir, migrate: true })
   if (opened instanceof Error) throw opened
@@ -288,6 +302,91 @@ test('a kimaki.db that is not an SQLite file is set aside before the V1 import',
   opened.close()
   expect(fs.readdirSync(dataDir).filter((name) => name.startsWith('kimaki.db.unknown-'))).toHaveLength(1)
 })
+
+test('a failed import leaves no partial database and the next start imports', async () => {
+  const dataDir = tempDataDir()
+  const legacyFile = path.join(dataDir, LEGACY_DB_FILE)
+  // A V1 file SQLite cannot read: the import fails once the target exists.
+  const garbage = 'not a database, just text that is long enough to have a header'.repeat(10)
+  fs.writeFileSync(legacyFile, garbage)
+
+  const failed = await openDb({ dataDir, migrate: true })
+  expect(failed).toBeInstanceOf(DbError)
+  expect((failed as DbError).message).toMatch(/^Database import .*discord-sessions\.db failed$/)
+  // All or nothing: no half-imported kimaki.db, no leftover import file, and
+  // the V1 file is byte for byte what it was.
+  expect(fs.readdirSync(dataDir).filter((name) => name.startsWith('kimaki'))).toEqual([])
+  expect(fs.readFileSync(legacyFile, 'utf8')).toBe(garbage)
+
+  // A re-run with a readable V1 file imports normally.
+  fs.rmSync(legacyFile)
+  const schemaSql = fs.readFileSync(path.join(import.meta.dirname, 'fixtures/v1-schema.sql'), 'utf8')
+  await writeLegacyDb({ dataDir, sql: `${schemaSql}\n${V1_ROWS}` })
+  const opened = await openDb({ dataDir, migrate: true })
+  if (opened instanceof Error) throw opened
+  expect((await opened.db.query.bot_tokens.findMany({ orderBy: { app_id: 'asc' } })).map((row) => row.app_id)).toEqual([
+    '1422625037164350001',
+    '1477605701202481173',
+  ])
+  opened.close()
+  expect(fs.readdirSync(dataDir).filter((name) => name.includes('.import'))).toEqual([])
+})
+
+// Windows refuses to rename a database file another connection still holds
+// (EBUSY); POSIX allows it, so the retry path can only be exercised here.
+test.skipIf(process.platform !== 'win32')(
+  'a destination held by another connection is retried, then reported, and the next start imports',
+  async () => {
+    const dataDir = tempDataDir()
+    const schemaSql = fs.readFileSync(path.join(import.meta.dirname, 'fixtures/v1-schema.sql'), 'utf8')
+    await writeLegacyDb({ dataDir, sql: `${schemaSql}\n${V1_ROWS}` })
+
+    // Another tool left an unmarked kimaki.db in WAL mode and its connection is
+    // still open: the import has to move that file (and its -wal) aside.
+    const stray = createClient({ url: `file:${path.join(dataDir, 'kimaki.db')}` })
+    await stray.execute('PRAGMA journal_mode = WAL')
+    await stray.execute('PRAGMA wal_autocheckpoint = 0')
+    await stray.execute(`CREATE TABLE notes (text TEXT)`)
+    await stray.execute(`INSERT INTO notes VALUES ('keep me')`)
+    const held = fs.readdirSync(dataDir).filter((name) => name.startsWith('kimaki.db')).sort()
+    expect(held).toEqual(['kimaki.db', 'kimaki.db-shm', 'kimaki.db-wal'])
+
+    const started = Date.now()
+    const failed = await openDb({ dataDir, migrate: true })
+    const elapsed = Date.now() - started
+
+    expect(failed).toBeInstanceOf(DbError)
+    const error = failed as DbError
+    // The named error still surfaces, with the underlying fs code.
+    expect(error.message).toMatch(/^Database rename .*kimaki\.db(-wal)? \((EBUSY|EPERM|EACCES)\) failed$/)
+    expect(['EBUSY', 'EPERM', 'EACCES']).toContain((error.cause as NodeJS.ErrnoException).code)
+    // It retried instead of giving up on the first attempt (20+40+60+80ms).
+    expect(elapsed).toBeGreaterThanOrEqual(150)
+    // All or nothing: no import file, nothing moved aside, the held database
+    // files are still where they were.
+    expect(fs.readdirSync(dataDir).filter((name) => name.includes('.import'))).toEqual([])
+    expect(fs.readdirSync(dataDir).filter((name) => name.startsWith('kimaki.db.unknown-'))).toEqual([])
+    expect(fs.readdirSync(dataDir).filter((name) => name.startsWith('kimaki.db')).sort()).toEqual(held)
+
+    // Releasing the connection lets the next start set the stray file aside and
+    // import the V1 rows.
+    stray.close()
+    await releaseLibsqlHandles()
+    const opened = await openDb({ dataDir, migrate: true })
+    if (opened instanceof Error) throw opened
+    expect((await opened.db.query.bot_tokens.findMany({ orderBy: { app_id: 'asc' } })).map((row) => row.app_id)).toEqual([
+      '1422625037164350001',
+      '1477605701202481173',
+    ])
+    opened.close()
+    // The stray file is renamed, never deleted, and keeps its rows.
+    const aside = fs.readdirSync(dataDir).filter((name) => name.startsWith('kimaki.db.unknown-') && !name.endsWith('-wal') && !name.endsWith('-shm'))
+    expect(aside).toHaveLength(1)
+    const kept = createClient({ url: `file:${path.join(dataDir, aside[0] ?? '')}` })
+    expect((await kept.execute('SELECT text FROM notes')).rows.map((row) => row.text)).toEqual(['keep me'])
+    kept.close()
+  },
+)
 
 test('a V1 database from an older version imports with defaults for missing columns', async () => {
   const dataDir = tempDataDir()
