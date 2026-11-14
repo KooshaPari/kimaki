@@ -135,6 +135,35 @@ test('a 429 on the send fails once instead of retrying or claiming a send', asyn
   }
 }, 300_000)
 
+test('an unknown Discord surface fails before any send', async () => {
+  let posts = 0
+  const server = http.createServer((request, response) => {
+    if (request.method === 'GET') {
+      response.writeHead(404, { 'content-type': 'application/json' })
+      response.end(JSON.stringify({ message: 'Unknown Channel', code: 10003 }))
+      return
+    }
+    posts += 1
+    response.writeHead(200, { 'content-type': 'application/json' })
+    response.end('{}')
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()))
+  const port = (server.address() as AddressInfo).port
+  try {
+    const failure = await exec(process.execPath, ['--import', 'tsx', path.resolve('src/cli.ts'), 'ops', 'publish', ...args(), '--consent'], {
+      timeout: 120_000,
+      env: { ...process.env, KIMAKI_BOT_TOKEN: 'stub', KIMAKI_DISCORD_REST_URL: `http://127.0.0.1:${port}` },
+    }).then(() => null, (error: Error & { stdout?: string; stderr?: string }) => error)
+    expect(failure).toBeInstanceOf(Error)
+    expect(posts).toBe(0)
+    const output = `${failure?.stdout ?? ''}${failure?.stderr ?? ''}`
+    expect(output).not.toContain('"kind":"sent"')
+    expect(output.trim().length).toBeGreaterThan(0)
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+  }
+}, 300_000)
+
 test('a 429 on the channel lookup posts nothing', async () => {
   let posts = 0
   const server = http.createServer((request, response) => {

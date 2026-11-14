@@ -237,4 +237,11 @@ harness before the passing run above.
 | AC25 transient send failure | `503` on the send | exit non-zero after exactly **one** POST, no retry |
 | AC12 prompt-time echo | a `user_message_chunk` arriving during a prompt | excluded from the assistant text (test asserts `ab`, not `atyped-midturnb`); the mutation that folds it in fails the test |
 | Rebind with a damaged cursor | corrupt view state file | refused with an error naming the state, and nothing posted |
+
+Third pass additions:
+
+| Area | What was checked | Observed |
+| --- | --- | --- |
+| AC13 durable replay through the CLI | `ops jcode serve --buffer 1 --log events.jsonl`, one real ACP turn (7 log events), hub stopped and restarted on the same log | `ops jcode attach --cursor 0` replayed all **7** events with `"ready":{"cursor":0,"clipped":false,"source":"log"}`. A one-event buffer is not a gap when the log covers the history |
+| AC25 unknown surface | `ops publish` against a stub that answers the channel lookup with `404 Unknown Channel` | exit non-zero, **zero** POSTs, no `sent` line; publish suite now 9 of 9 |
 | Rebind with a cursor ahead of the hub | state `{sessionId: <real>, seq: <seq + 500>}` | **defect found and fixed**: the view exited 0 with `{"kind":"closed"}` and `attach --cursor 500` also exited 0 with no events. The hub wrote SSE headers before subscribing, so its refusal arrived as a 200 whose JSON body the client read as an empty stream, and `attach` ignored the `Error` that `openHubStream` resolves. The server now subscribes before writing headers (400 with `Hub cursor is ahead of the stream`) and the CLI fails on a refused attach. Re-verified: raw fetch returns 400, and `attach --cursor 500` exits 1 |
