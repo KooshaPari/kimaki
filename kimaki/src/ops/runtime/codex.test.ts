@@ -65,6 +65,73 @@ describe('Codex control surface', () => {
     })
     expect(JSON.stringify(started)).not.toContain('private')
     expect(calls).toEqual([{ method: 'thread/start', params: { cwd: 'C:/work' } }])
+  })
+
+  it('resumes an existing thread in a new app-server process', async () => {
+    const { controller, calls } = harness((call) => call.method === 'thread/resume'
+      ? { thread: { id: 'thread-9', preview: 'private prompt' }, model: 'm' }
+      : {})
+    // turn/start rejects a thread that the fresh process has not resumed.
+    expect(await controller.resumeThread({ threadId: 'thread-9', cwd: 'C:/work' })).toEqual({
+      threadId: 'thread-9',
+      key: { hostId: 'host', endpointId: 'endpoint', backendKind: 'codex', nativeSessionId: 'thread-9' },
+    })
+    expect(calls).toEqual([{ method: 'thread/resume', params: { threadId: 'thread-9', cwd: 'C:/work' } }])
+  })
+
+  it('refuses a resume that answers with a different thread', async () => {
+    const { controller } = harness(() => ({ thread: { id: 'thread-other' } }))
+    const resumed = await controller.resumeThread({ threadId: 'thread-9' })
+    expect(resumed).toBeInstanceOf(Error)
+    expect((resumed as Error).message).toMatch(/different thread/i)
+  })
+
+  it('reads a thread as user and agent messages using the observed item shapes', async () => {
+    const { controller } = harness(() => ({
+      thread: {
+        id: 'thread-9',
+        turns: [
+          {
+            id: 'turn-1',
+            status: 'completed',
+            items: [
+              { type: 'userMessage', content: [{ type: 'text', text: 'first ' }, { type: 'text', text: 'ask' }] },
+              { type: 'agentMessage', text: 'first answer' },
+              { type: 'reasoning', text: 'private reasoning' },
+            ],
+          },
+          { id: 'turn-2', status: 'interrupted', items: [{ type: 'agentMessage', text: '' }] },
+        ],
+      },
+    }))
+    const read = await controller.readThread({ threadId: 'thread-9' })
+    expect(read).toMatchObject({
+      threadId: 'thread-9',
+      turns: [
+        { id: 'turn-1', status: 'completed', messages: [{ role: 'user', text: 'first ask' }, { role: 'agent', text: 'first answer' }] },
+        { id: 'turn-2', status: 'interrupted', messages: [] },
+      ],
+    })
+    expect(JSON.stringify(read)).not.toContain('private reasoning')
+  })
+
+  it('refuses a read that answers about another thread', async () => {
+    const { controller } = harness(() => ({ thread: { id: 'thread-other', turns: [] } }))
+    const read = await controller.readThread({ threadId: 'thread-9' })
+    expect(read).toBeInstanceOf(Error)
+  })
+
+  it('starts a thread with an explicit cwd and returns only the key', async () => {
+    const { controller, calls } = harness((call) => call.method === 'thread/start'
+      ? { thread: { id: 'thread-1', preview: 'private prompt', cwd: 'private path' }, model: 'private' }
+      : {})
+    const started = await controller.startThread({ cwd: 'C:/work' })
+    expect(started).toEqual({
+      threadId: 'thread-1',
+      key: { hostId: 'host', endpointId: 'endpoint', backendKind: 'codex', nativeSessionId: 'thread-1' },
+    })
+    expect(JSON.stringify(started)).not.toContain('private')
+    expect(calls).toEqual([{ method: 'thread/start', params: { cwd: 'C:/work' } }])
     expect(await controller.startThread()).toEqual({
       threadId: 'thread-1',
       key: { hostId: 'host', endpointId: 'endpoint', backendKind: 'codex', nativeSessionId: 'thread-1' },

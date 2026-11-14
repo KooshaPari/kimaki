@@ -15,12 +15,16 @@ export function registerOpsCommands(cli: Goke) {
     .option('--prompt <text>', 'Text for one turn')
     .option('--cwd <dir>', 'Working directory for the new thread')
     .option('--timeout-ms <n>', 'Request and turn timeout in milliseconds')
+    .option('--cancel-after <ms>', 'Interrupt the turn after this many milliseconds')
+    .option('--thread <id>', 'Send this turn on an existing thread instead of starting one')
     .action(async (options) => {
       const binary = required(options.binary, 'binary')
       const codexHome = required(options.codexHome, 'codex-home')
       const prompt = required(options.prompt, 'prompt')
       const timeoutMs = options.timeoutMs === undefined ? undefined : Number(options.timeoutMs)
       if (timeoutMs !== undefined && (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1)) fail(new ConfigError({ reason: '--timeout-ms must be a positive integer' }))
+      const cancelAfter = options.cancelAfter === undefined ? undefined : Number(options.cancelAfter)
+      if (cancelAfter !== undefined && (!Number.isSafeInteger(cancelAfter) || cancelAfter < 1)) fail(new ConfigError({ reason: '--cancel-after must be a positive integer in milliseconds' }))
       const { startCodexAppServer } = await import('../ops/runtime/codex-app-server.ts')
       const { createCodexController } = await import('../ops/runtime/codex.ts')
       const server = await startCodexAppServer({ binary, codexHome, timeoutMs })
@@ -29,9 +33,17 @@ export function registerOpsCommands(cli: Goke) {
         const controller = createCodexController({ hostId: 'local', endpointId: 'explicit-app-server', request: server.request, subscribe: server.subscribe, timeoutMs, turnTimeoutMs: timeoutMs })
         if (controller instanceof Error) fail(controller)
         try {
-          const started = await controller.startThread(options.cwd === undefined ? {} : { cwd: options.cwd })
+          const started = options.thread === undefined
+            ? await controller.startThread(options.cwd === undefined ? {} : { cwd: options.cwd })
+            : await controller.resumeThread(options.cwd === undefined ? { threadId: options.thread } : { threadId: options.thread, cwd: options.cwd })
           if (started instanceof Error) fail(started)
+          const interrupt = cancelAfter === undefined ? null : setTimeout(() => {
+            const cancelled = controller.cancel({ threadId: started.threadId })
+            if (cancelled instanceof Error) printJson({ kind: 'cancel-failed', reason: cancelled.message })
+            else printJson({ kind: 'cancel-requested', afterMs: cancelAfter })
+          }, cancelAfter)
           const result = await controller.sendTurn({ threadId: started.threadId, text: prompt, onDelta: ({ text }) => printJson({ kind: 'delta', text }) })
+          if (interrupt) clearTimeout(interrupt)
           if (result instanceof Error) fail(result)
           printJson({ kind: 'turn', status: result.status, threadId: result.threadId, turnId: result.turnId, text: result.text })
         } finally { controller.close() }
@@ -611,6 +623,41 @@ export function registerOpsCommands(cli: Goke) {
       }
       if (failure) fail(failure)
       printJson({ kind: 'stopped', polls, messages: seen })
+    })
+
+  cli.command('ops codex history', 'Read an existing Codex thread through the app-server and print its messages')
+    .option('--binary <path>', 'Explicit Codex executable')
+    .option('--codex-home <dir>', 'Explicit isolated Codex state directory')
+    .option('--thread <id>', 'Thread id to read')
+    .option('--timeout-ms <n>', 'Request timeout in milliseconds')
+    .option('--json', 'Print one JSON document instead of one line per message')
+    .action(async (options) => {
+      const binary = required(options.binary, 'binary')
+      const codexHome = required(options.codexHome, 'codex-home')
+      const threadId = required(options.thread, 'thread')
+      const timeoutMs = options.timeoutMs === undefined ? undefined : Number(options.timeoutMs)
+      if (timeoutMs !== undefined && (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1)) fail(new ConfigError({ reason: '--timeout-ms must be a positive integer' }))
+      const { startCodexAppServer } = await import('../ops/runtime/codex-app-server.ts')
+      const { createCodexController } = await import('../ops/runtime/codex.ts')
+      const server = await startCodexAppServer({ binary, codexHome, timeoutMs })
+      if (server instanceof Error) fail(server)
+      try {
+        const controller = createCodexController({ hostId: 'local', endpointId: 'explicit-app-server', request: server.request, subscribe: server.subscribe, timeoutMs, turnTimeoutMs: timeoutMs })
+        if (controller instanceof Error) fail(controller)
+        try {
+          const read = await controller.readThread({ threadId })
+          if (read instanceof Error) fail(read)
+          const messages = read.turns.flatMap((turn) => turn.messages.map((message) => ({ ...message, turnId: turn.id, status: turn.status })))
+          if (messages.length === 0 && options.json !== true) {
+            fail(new ConfigError({ reason: 'The thread contains no readable user or agent messages' }))
+          }
+          if (options.json) printJson({ threadId: read.threadId, turns: read.turns.length, messages })
+          else {
+            for (const message of messages) process.stdout.write(`${message.role}: ${message.text}\n`)
+            process.stdout.write(`\n${read.turns.length} turns, ${messages.length} messages\n`)
+          }
+        } finally { controller.close() }
+      } finally { await server.close() }
     })
 
   cli.command('ops jcode history', 'Load an existing Jcode session over ACP and print its replayed native history')

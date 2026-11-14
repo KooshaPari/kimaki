@@ -29,7 +29,7 @@ const thread = (value: unknown): value is NativeThread => record(value) && typeo
 // Server-initiated approval requests (item/commandExecution/requestApproval,
 // item/fileChange/requestApproval, item/tool/requestUserInput, ...) are NOT
 // answered by this client, so `answerApproval` stays unsupported.
-export type CodexControlMethod = 'thread/start' | 'turn/start' | 'turn/interrupt'
+export type CodexControlMethod = 'thread/start' | 'thread/resume' | 'thread/read' | 'turn/start' | 'turn/interrupt'
 export type CodexControlRequest = (method: CodexControlMethod, params: Record<string, unknown>) => Promise<unknown>
 export type CodexNotification = { method: string; params?: unknown; id?: number }
 export type CodexNotificationListener = (notification: CodexNotification) => void
@@ -218,6 +218,66 @@ export function createCodexController({
       if (!record(result) || !thread(result.thread)) return malformed('thread/start')
       return { threadId: result.thread.id, key: keyFor(result.thread.id) }
     },
+    // A thread lives on disk but not in a fresh app-server process, so a second
+    // process must resume it before turn/start will accept the id.
+    async resumeThread(input: { threadId: string; cwd?: string }) {
+      const checked = validateThreadId(input.threadId)
+      if (checked instanceof Error) return checked
+      if (input.cwd !== undefined && (typeof input.cwd !== 'string' || !input.cwd.trim())) {
+        return new ConfigError({ reason: 'Thread cwd must be a nonblank string' })
+      }
+      const params: Record<string, unknown> = { threadId: input.threadId }
+      if (input.cwd !== undefined) params['cwd'] = input.cwd
+      const result = await bounded(
+        'thread/resume',
+        timeoutMs,
+        () => request('thread/resume', params),
+        (value) => value,
+      )
+      if (result instanceof Error) return result
+      if (!record(result) || !thread(result.thread)) return malformed('thread/resume')
+      if (result.thread.id !== input.threadId) return new ConfigError({ reason: 'The agent resumed a different thread than the one requested' })
+      return { threadId: result.thread.id, key: keyFor(result.thread.id) }
+    },
+    // The only read surface codex offers for a thread this process did not start.
+    // Shapes verified against codex 0.169: userMessage content is an array of
+    // { type: 'text', text }, agentMessage text is a plain string.
+    async readThread(input: { threadId: string; includeTurns?: boolean }) {
+      const checked = validateThreadId(input.threadId)
+      if (checked instanceof Error) return checked
+      const params: Record<string, unknown> = { threadId: input.threadId, includeTurns: input.includeTurns !== false }
+      const result = await bounded(
+        'thread/read',
+        timeoutMs,
+        () => request('thread/read', params),
+        (value) => value,
+      )
+      if (result instanceof Error) return result
+      if (!record(result) || !record(result.thread)) return malformed('thread/read')
+      const readThread = result.thread
+      if (typeof readThread.id !== 'string' || readThread.id !== input.threadId) return malformed('thread/read')
+      const turns: Array<{ id: string; status: string; messages: Array<{ role: 'user' | 'agent'; text: string }> }> = []
+      const rawTurns = Array.isArray(readThread.turns) ? readThread.turns : []
+      for (const rawTurn of rawTurns) {
+        if (!record(rawTurn) || typeof rawTurn.id !== 'string') continue
+        const messages: Array<{ role: 'user' | 'agent'; text: string }> = []
+        for (const rawItem of Array.isArray(rawTurn.items) ? rawTurn.items : []) {
+          if (!record(rawItem)) continue
+          if (rawItem.type === 'userMessage') {
+            const parts = Array.isArray(rawItem.content) ? rawItem.content : []
+            let text = ''
+            for (const part of parts) {
+              if (record(part) && part.type === 'text' && typeof part.text === 'string') text += part.text
+            }
+            if (text) messages.push({ role: 'user', text })
+          } else if (rawItem.type === 'agentMessage' && typeof rawItem.text === 'string' && rawItem.text) {
+            messages.push({ role: 'agent', text: rawItem.text })
+          }
+        }
+        turns.push({ id: rawTurn.id, status: typeof rawTurn.status === 'string' ? rawTurn.status : 'unknown', messages })
+      }
+      return { threadId: readThread.id, turns, key: keyFor(readThread.id) }
+    },
     async sendTurn({ threadId, text, onDelta }: { threadId: string; text: string; onDelta?: (delta: CodexTurnDelta) => void }) {
       const checked = validateThreadId(threadId)
       if (checked instanceof Error) return checked
@@ -310,7 +370,7 @@ export function createCodexObserver({ hostId, endpointId, request }: { hostId: s
     capabilities: {
       ...passiveCapabilities,
       snapshot: { kind: 'supported' as const },
-      observe: { kind: 'unsupported' as const, reason: 'Reading or resuming a historical thread does not attach to an external live session' },
+      observe: { kind: 'unsupported' as const, reason: 'A thread can be read on demand with thread/read, but no live notification stream is offered for turns another process runs, so this is not an observe surface' },
       replay: { kind: 'unsupported' as const, reason: 'Metadata reads do not provide a durable event cursor' },
       exclusiveControl: { kind: 'unsupported' as const, reason: 'No exclusive writer lease is established' },
     },
