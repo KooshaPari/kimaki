@@ -13,6 +13,14 @@ export class CodexRuntimeError extends errore.createTaggedError({
   message: 'Codex app-server request $operation failed',
 }) {}
 
+// Approval refusals are user-facing: the reason has to survive into the message,
+// because "turn/start failed" cannot tell an operator whether an answer was a
+// replay, a stale id, or a gate.
+export class CodexApprovalError extends errore.createTaggedError({
+  name: 'CodexApprovalError',
+  message: 'Approval request $requestId refused: $reason',
+}) {}
+
 type Request = (method: 'thread/list' | 'thread/read', params: Record<string, unknown>) => Promise<unknown>
 type NativeThread = Record<string, unknown> & { id: string }
 const record = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -30,6 +38,10 @@ const thread = (value: unknown): value is NativeThread => record(value) && typeo
 // item/fileChange/requestApproval, item/tool/requestUserInput, ...) are NOT
 // answered by this client, so `answerApproval` stays unsupported.
 export type CodexControlMethod = 'thread/start' | 'thread/resume' | 'thread/read' | 'turn/start' | 'turn/interrupt'
+// `AskForApproval` in the generated schema, minus the granular variant this
+// client does not configure.
+export type CodexApprovalPolicyName = 'untrusted' | 'on-request' | 'never'
+const approvalPolicyNames: readonly string[] = ['untrusted', 'on-request', 'never']
 export type CodexControlRequest = (method: CodexControlMethod, params: Record<string, unknown>) => Promise<unknown>
 export type CodexNotification = { method: string; params?: unknown; id?: number }
 export type CodexNotificationListener = (notification: CodexNotification) => void
@@ -65,6 +77,23 @@ export const codexControlCapabilities = {
 
 export type CodexTurnDelta = { threadId: string; turnId: string; itemId: string; text: string }
 export type CodexTurnResult = { threadId: string; turnId: string; status: 'completed' | 'interrupted'; text: string }
+
+// Approval requests the app-server raises mid-turn. Shapes are from
+// `codex app-server generate-ts` for 0.169: the answer is the JSON-RPC result
+// `{ decision }`, where command decisions also admit `acceptForSession` and
+// both variants admit `cancel`.
+export type CodexApprovalDecision = 'accept' | 'acceptForSession' | 'decline' | 'cancel'
+export type CodexApprovalRequest = {
+  requestId: number
+  method: 'item/commandExecution/requestApproval' | 'item/fileChange/requestApproval'
+  threadId: string
+  turnId: string | null
+  itemId: string | null
+  /** The command under review, when the runtime names one. */
+  command: string | null
+  reason: string | null
+}
+export type CodexApprovalPolicy = (request: CodexApprovalRequest) => CodexApprovalDecision | null
 type TurnSettlement = CodexTurnResult | Error
 
 type PendingTurn = {
@@ -113,6 +142,8 @@ export function createCodexController({
   subscribe,
   timeoutMs = 30_000,
   turnTimeoutMs = 600_000,
+  serverRequests,
+  approvals,
 }: {
   hostId: string
   endpointId: string
@@ -120,17 +151,101 @@ export function createCodexController({
   subscribe: CodexSubscribe
   timeoutMs?: number
   turnTimeoutMs?: number
+  /**
+   * Delivers the two possible JSON-RPC answers to a server-initiated request.
+   * Required for any approval surface: the transport must be started with
+   * `holdServerRequests` so this client, not the transport, owns the answer.
+   */
+  serverRequests?: {
+    result: (requestId: number, result: unknown) => boolean
+    error: (requestId: number, code: number, message: string) => boolean
+  }
+  approvals?: {
+    /** Automatic answer. `null` leaves the request open for a client. */
+    policy?: CodexApprovalPolicy
+    onRequest?: (request: CodexApprovalRequest) => void
+  }
 }) {
   const valid = sessionKeyId({ hostId, endpointId, backendKind: 'codex', nativeSessionId: 'validation' })
   if (valid instanceof Error) return valid
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return new ConfigError({ reason: 'timeoutMs must be a positive number' })
   if (!Number.isFinite(turnTimeoutMs) || turnTimeoutMs <= 0) return new ConfigError({ reason: 'turnTimeoutMs must be a positive number' })
+  if (approvals !== undefined && (typeof serverRequests?.result !== 'function' || typeof serverRequests?.error !== 'function')) {
+    return new ConfigError({ reason: 'An approval surface needs a result and an error channel for server-initiated requests' })
+  }
   const source = Object.freeze({ hostId, endpointId, backendKind: 'codex' as const })
   const keyFor = (nativeSessionId: string): SessionKey => ({ ...source, nativeSessionId })
   const pending = new Map<string, PendingTurn>()
 
+  // Approvals are keyed by the JSON-RPC request id, which the runtime allocates
+  // and never reuses within a connection. `settled` is what makes a replay
+  // visible: an id that has been answered reports that, instead of looking like
+  // an id that never existed.
+  const openApprovals = new Map<number, CodexApprovalRequest>()
+  const settledApprovals = new Set<number>()
+
+  const approvalFrom = (notification: CodexNotification): CodexApprovalRequest | null => {
+    if (typeof notification.id !== 'number') return null
+    const params = notification.params
+    if (!record(params) || typeof params.threadId !== 'string') return null
+    if (notification.method !== 'item/commandExecution/requestApproval' && notification.method !== 'item/fileChange/requestApproval') return null
+    return {
+      requestId: notification.id,
+      method: notification.method,
+      threadId: params.threadId,
+      turnId: typeof params.turnId === 'string' && params.turnId ? params.turnId : null,
+      itemId: typeof params.itemId === 'string' && params.itemId ? params.itemId : null,
+      command: typeof params.command === 'string' && params.command ? params.command : null,
+      reason: typeof params.reason === 'string' && params.reason ? params.reason : null,
+    }
+  }
+
+  // One place answers, so "first answer wins" is a property of the code and not
+  // of whichever caller happens to run first.
+  const settleApproval = (requestId: number, decision: CodexApprovalDecision): Error | { requestId: number; decision: CodexApprovalDecision } => {
+    const request = openApprovals.get(requestId)
+    if (!request) {
+      return settledApprovals.has(requestId)
+        ? new CodexApprovalError({ requestId: String(requestId), reason: 'it was already answered, so a repeated answer cannot change the decision' })
+        : new CodexApprovalError({ requestId: String(requestId), reason: 'no approval request with this id is open' })
+    }
+    if (!serverRequests!.result(requestId, { decision })) {
+      openApprovals.delete(requestId)
+      return new CodexApprovalError({ requestId: String(requestId), reason: 'the app-server no longer had this request open' })
+    }
+    openApprovals.delete(requestId)
+    settledApprovals.add(requestId)
+    return { requestId, decision }
+  }
+
   const onNotification = (notification: CodexNotification) => {
     if (!record(notification) || typeof notification.method !== 'string') return
+    // Server-initiated requests arrive with an id and are not thread events: the
+    // app-server is waiting on this client, so an unanswerable one is failed
+    // rather than left to hang the turn.
+    if (typeof notification.id === 'number') {
+      const approval = approvalFrom(notification)
+      if (!approval) {
+        if (serverRequests) serverRequests.error(notification.id, -32601, `Server-initiated request ${notification.method} unsupported`)
+        return
+      }
+      openApprovals.set(approval.requestId, approval)
+      try {
+        approvals?.onRequest?.(approval)
+      } catch {
+        // A consumer callback must not break the stream.
+      }
+      const policy = approvals?.policy
+      if (!policy) return
+      let decision: CodexApprovalDecision | null = null
+      try {
+        decision = policy(approval)
+      } catch {
+        decision = 'decline'
+      }
+      if (decision !== null) settleApproval(approval.requestId, decision)
+      return
+    }
     const params = notification.params
     if (!record(params) || typeof params.threadId !== 'string') return
     const entry = pending.get(params.threadId)
@@ -190,6 +305,7 @@ export function createCodexController({
       pending.delete(threadId)
       entry.settle(new ConfigError({ reason: 'Codex controller closed before the turn completed' }))
     }
+    openApprovals.clear()
     unsubscribe?.()
     unsubscribe = null
   }
@@ -200,18 +316,35 @@ export function createCodexController({
     return checked instanceof Error ? checked : threadId
   }
 
+  // The declared surface follows what this instance can actually do: an approval
+  // channel turns `answerApproval` from a documented refusal into a real operation.
+  const capabilities: CodexControlCapabilities = approvals === undefined
+    ? codexControlCapabilities
+    : {
+        ...codexControlCapabilities,
+        control: { ...codexControlCapabilities.control, answerApproval: { kind: 'supported' } },
+      }
+
   return {
-    capabilities: codexControlCapabilities,
+    capabilities,
     source,
     keyFor,
-    async startThread(input: { cwd?: string } = {}) {
+    /** Approvals that are still waiting for an answer, oldest first. */
+    pendingApprovals: () => [...openApprovals.values()],
+    async startThread(input: { cwd?: string; approvalPolicy?: CodexApprovalPolicyName } = {}) {
       if (input.cwd !== undefined && (typeof input.cwd !== 'string' || !input.cwd.trim())) {
         return new ConfigError({ reason: 'Thread cwd must be a nonblank string' })
       }
+      if (input.approvalPolicy !== undefined && !approvalPolicyNames.includes(input.approvalPolicy)) {
+        return new ConfigError({ reason: `approvalPolicy must be one of ${approvalPolicyNames.join(', ')}` })
+      }
+      const params: Record<string, unknown> = {}
+      if (input.cwd !== undefined) params['cwd'] = input.cwd
+      if (input.approvalPolicy !== undefined) params['approvalPolicy'] = input.approvalPolicy
       const result = await bounded(
         'thread/start',
         timeoutMs,
-        () => request('thread/start', input.cwd === undefined ? {} : { cwd: input.cwd }),
+        () => request('thread/start', params),
         (value) => value,
       )
       if (result instanceof Error) return result
@@ -220,14 +353,18 @@ export function createCodexController({
     },
     // A thread lives on disk but not in a fresh app-server process, so a second
     // process must resume it before turn/start will accept the id.
-    async resumeThread(input: { threadId: string; cwd?: string }) {
+    async resumeThread(input: { threadId: string; cwd?: string; approvalPolicy?: CodexApprovalPolicyName }) {
       const checked = validateThreadId(input.threadId)
       if (checked instanceof Error) return checked
       if (input.cwd !== undefined && (typeof input.cwd !== 'string' || !input.cwd.trim())) {
         return new ConfigError({ reason: 'Thread cwd must be a nonblank string' })
       }
+      if (input.approvalPolicy !== undefined && !approvalPolicyNames.includes(input.approvalPolicy)) {
+        return new ConfigError({ reason: `approvalPolicy must be one of ${approvalPolicyNames.join(', ')}` })
+      }
       const params: Record<string, unknown> = { threadId: input.threadId }
       if (input.cwd !== undefined) params['cwd'] = input.cwd
+      if (input.approvalPolicy !== undefined) params['approvalPolicy'] = input.approvalPolicy
       const result = await bounded(
         'thread/resume',
         timeoutMs,
@@ -344,6 +481,19 @@ export function createCodexController({
       if (result instanceof Error) return result
       if (!record(result)) return malformed('turn/interrupt')
       return { threadId, turnId: resolvedTurnId }
+    },
+    /**
+     * Answers one approval request. The first answer wins: a repeated or stale
+     * id is refused by name rather than forwarded, so a replayed answer cannot
+     * re-open a decision the runtime already made.
+     */
+    answerApproval({ requestId, decision }: { requestId: number; decision: CodexApprovalDecision }) {
+      if (approvals === undefined) {
+        return new ConfigError({ reason: 'This controller was started without an approval channel' })
+      }
+      if (!Number.isSafeInteger(requestId) || requestId <= 0) return new ConfigError({ reason: 'Approval request id must be a positive integer' })
+      if (!['accept', 'acceptForSession', 'decline', 'cancel'].includes(decision)) return new ConfigError({ reason: `Unknown approval decision ${String(decision)}` })
+      return settleApproval(requestId, decision)
     },
     close,
   }

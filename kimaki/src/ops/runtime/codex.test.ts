@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { createCodexController, createCodexObserver } from './codex.js'
-import type { CodexControlMethod, CodexNotification } from './codex.js'
+import type { CodexApprovalPolicy, CodexApprovalRequest, CodexControlMethod, CodexNotification } from './codex.js'
 
 type Call = { method: CodexControlMethod; params: Record<string, unknown> }
 
@@ -277,6 +277,144 @@ describe('Codex control surface', () => {
       subscribe: () => { throw new Error('closed') },
     })
     expect(threw).toBeInstanceOf(Error)
+  })
+})
+
+// A transport stand-in that behaves like `startCodexAppServer` with
+// holdServerRequests: a request id stays open until exactly one answer is
+// written, and a second write reports false instead of being silently dropped.
+function approvalHarness(policy?: CodexApprovalPolicy, withApprovals = true) {
+  const listeners = new Set<(notification: CodexNotification) => void>()
+  const open = new Set<number>()
+  const results: Array<{ id: number; result: unknown }> = []
+  const failures: Array<{ id: number; code: number; message: string }> = []
+  const requests: CodexApprovalRequest[] = []
+  const controller = createCodexController({
+    hostId: 'host',
+    endpointId: 'endpoint',
+    request: async () => ({}),
+    subscribe: (listener) => {
+      listeners.add(listener)
+      return () => { listeners.delete(listener) }
+    },
+    timeoutMs: 50,
+    turnTimeoutMs: 50,
+    serverRequests: {
+      result: (id, result) => {
+        if (!open.delete(id)) return false
+        results.push({ id, result })
+        return true
+      },
+      error: (id, code, message) => {
+        if (!open.delete(id)) return false
+        failures.push({ id, code, message })
+        return true
+      },
+    },
+    ...(withApprovals ? { approvals: { policy, onRequest: (request: CodexApprovalRequest) => { requests.push(request) } } } : {}),
+  })
+  if (controller instanceof Error) throw controller
+  // Mirrors the transport: an id is open before its request is delivered, so an
+  // answer to it is forwarded exactly once.
+  const request = (id: number, method: string, params: Record<string, unknown> = {}) => {
+    open.add(id)
+    for (const listener of [...listeners]) {
+      listener({ id, method, params })
+    }
+  }
+  const ask = (id: number, params: Record<string, unknown> = {}) =>
+    request(id, 'item/commandExecution/requestApproval', { threadId: 'thread-1', turnId: 'turn-1', itemId: 'item-1', command: 'rm -rf /tmp/x', ...params })
+  // Simulates the transport losing an id, which is what a closed connection does.
+  const drop = (id: number) => { open.delete(id) }
+  return { controller, requests, results, failures, ask, drop, request }
+}
+
+describe('Codex approval surface', () => {
+  it('declares answerApproval supported only when an approval channel exists', () => {
+    const { controller } = approvalHarness(undefined, false)
+    expect(controller.capabilities.control.answerApproval.kind).toBe('unsupported')
+    expect(controller.answerApproval({ requestId: 1, decision: 'accept' })).toBeInstanceOf(Error)
+    const configured = approvalHarness(() => 'accept')
+    expect(configured.controller.capabilities.control.answerApproval.kind).toBe('supported')
+  })
+
+  it('refuses an approval surface without a result and error channel', () => {
+    const controller = createCodexController({
+      hostId: 'host',
+      endpointId: 'endpoint',
+      request: async () => ({}),
+      subscribe: () => () => {},
+      approvals: { policy: () => 'accept' },
+    })
+    expect(controller).toBeInstanceOf(Error)
+    expect((controller as Error).message).toMatch(/result and an error channel/)
+  })
+
+  it('answers a policy-approved command once and surfaces the request', () => {
+    const { controller, results, requests, ask } = approvalHarness(() => 'accept')
+    ask(41)
+    expect(requests).toHaveLength(1)
+    expect(requests[0]).toMatchObject({ requestId: 41, method: 'item/commandExecution/requestApproval', command: 'rm -rf /tmp/x', threadId: 'thread-1', turnId: 'turn-1' })
+    expect(results).toEqual([{ id: 41, result: { decision: 'accept' } }])
+    expect(controller.pendingApprovals()).toEqual([])
+  })
+
+  it('leaves a request open without a policy and then answers it by id', () => {
+    const { controller, results, ask } = approvalHarness()
+    ask(7)
+    expect(controller.pendingApprovals()).toHaveLength(1)
+    expect(results).toEqual([])
+    expect(controller.answerApproval({ requestId: 7, decision: 'decline' })).toEqual({ requestId: 7, decision: 'decline' })
+    expect(results).toEqual([{ id: 7, result: { decision: 'decline' } }])
+    expect(controller.pendingApprovals()).toEqual([])
+  })
+
+  it('refuses a replayed answer instead of forwarding it twice', () => {
+    const { controller, results, ask } = approvalHarness()
+    ask(9)
+    expect(controller.answerApproval({ requestId: 9, decision: 'accept' })).toEqual({ requestId: 9, decision: 'accept' })
+    const replay = controller.answerApproval({ requestId: 9, decision: 'decline' })
+    expect(replay).toBeInstanceOf(Error)
+    expect((replay as Error).message).toMatch(/already answered/)
+    expect(results).toEqual([{ id: 9, result: { decision: 'accept' } }])
+  })
+
+  it('gives the first of two racing answers the request and refuses the loser', () => {
+    const { controller, results, ask } = approvalHarness()
+    ask(11)
+    const first = controller.answerApproval({ requestId: 11, decision: 'accept' })
+    const second = controller.answerApproval({ requestId: 11, decision: 'acceptForSession' })
+    expect(first).toEqual({ requestId: 11, decision: 'accept' })
+    expect(second).toBeInstanceOf(Error)
+    expect(results).toHaveLength(1)
+  })
+
+  it('refuses an id that was never issued and an id the app-server dropped', () => {
+    const { controller, results } = approvalHarness()
+    const unknown = controller.answerApproval({ requestId: 99, decision: 'accept' })
+    expect(unknown).toBeInstanceOf(Error)
+    expect((unknown as Error).message).toMatch(/no approval request with this id is open/)
+    // The transport can lose the id first (closed connection); the answer then
+    // reports that instead of pretending it was delivered.
+    const losing = approvalHarness()
+    losing.ask(5)
+    losing.drop(5)
+    const dropped = losing.controller.answerApproval({ requestId: 5, decision: 'accept' })
+    expect(dropped).toBeInstanceOf(Error)
+    expect((dropped as Error).message).toMatch(/no longer had this request open/)
+    expect(results).toEqual([])
+  })
+
+  it('fails an unexpected server request rather than leaving the turn hanging', () => {
+    const { failures, request } = approvalHarness()
+    request(12, 'item/tool/requestUserInput', { threadId: 'thread-1' })
+    expect(failures).toEqual([{ id: 12, code: -32601, message: 'Server-initiated request item/tool/requestUserInput unsupported' }])
+  })
+
+  it('declines when a policy throws instead of granting by accident', () => {
+    const { results, ask } = approvalHarness(() => { throw new Error('policy bug') })
+    ask(13)
+    expect(results).toEqual([{ id: 13, result: { decision: 'decline' } }])
   })
 })
 

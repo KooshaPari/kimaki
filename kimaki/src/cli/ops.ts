@@ -26,6 +26,7 @@ export function registerOpsCommands(cli: Goke) {
     .option('--cancel-after <ms>', 'Interrupt the turn after this many milliseconds')
     .option('--thread <id>', 'Send this turn on an existing thread instead of starting one')
     .option('--approval <decision>', 'Answer approval requests: accept, acceptForSession, decline or cancel (default: refuse them)')
+    .option('--approval-policy <policy>', 'Codex approval policy for the new thread: untrusted, on-request or never')
     .action(async (options) => {
       const binary = required(options.binary, 'binary')
       const codexHome = required(options.codexHome, 'codex-home')
@@ -35,6 +36,10 @@ export function registerOpsCommands(cli: Goke) {
       const cancelAfter = options.cancelAfter === undefined ? undefined : Number(options.cancelAfter)
       if (cancelAfter !== undefined && (!Number.isSafeInteger(cancelAfter) || cancelAfter < 1)) fail(new ConfigError({ reason: '--cancel-after must be a positive integer in milliseconds' }))
       const approval = approvalDecision(options.approval)
+      const approvalPolicy = options.approvalPolicy === undefined
+        ? undefined
+        : (['untrusted', 'on-request', 'never'] as const).find((policy) => policy === options.approvalPolicy)
+      if (options.approvalPolicy !== undefined && approvalPolicy === undefined) fail(new ConfigError({ reason: '--approval-policy must be untrusted, on-request or never' }))
       const { startCodexAppServer } = await import('../ops/runtime/codex-app-server.ts')
       const { createCodexController } = await import('../ops/runtime/codex.ts')
       const server = await startCodexAppServer({ binary, codexHome, timeoutMs, holdServerRequests: approval !== undefined })
@@ -65,8 +70,15 @@ export function registerOpsCommands(cli: Goke) {
         if (controller instanceof Error) fail(controller)
         try {
           const started = options.thread === undefined
-            ? await controller.startThread(options.cwd === undefined ? {} : { cwd: options.cwd })
-            : await controller.resumeThread(options.cwd === undefined ? { threadId: options.thread } : { threadId: options.thread, cwd: options.cwd })
+            ? await controller.startThread({
+                ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
+                ...(approvalPolicy === undefined ? {} : { approvalPolicy }),
+              })
+            : await controller.resumeThread({
+                threadId: options.thread,
+                ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
+                ...(approvalPolicy === undefined ? {} : { approvalPolicy }),
+              })
           if (started instanceof Error) fail(started)
           const interrupt = cancelAfter === undefined ? null : setTimeout(() => {
             const cancelled = controller.cancel({ threadId: started.threadId })
