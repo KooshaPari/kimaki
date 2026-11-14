@@ -305,6 +305,14 @@ Fifth pass:
 | AC25 watch mirror failure | `ops jcode watch --discord --emit-existing` against a stub that 429s every post | printed `Discord publish native watch message failed` and exited non-zero, and **no state file was written**, so the cursor did not advance. The same `0xC0000409` teardown abort appeared here too, which confirms the exit-abort is repo-wide on Discord REST failures rather than specific to the view's tenant check |
 | Operator trap found | the same watch command without `KIMAKI_DISCORD_REST_URL` | it reached the real Discord API with the stub token and failed `401: Unauthorized`. Expected behaviour, worth knowing: the REST URL override is an environment variable, not a flag |
 
+Sixth pass:
+
+| Area | What was checked | Observed |
+| --- | --- | --- |
+| AC12/AC03 load independence | `ops jcode history --session session_vole_... --cwd <different directory>` | the history still replayed the prompt and reply, so binding a view does not require the session's original working directory |
+| Rebind upgrade safety | a state file in the older `{seq}` shape, with a live view then a new turn | resumed rather than refused, posted exactly the new turn, and the file was upgraded in place to include `sessionId`, so an upgrade does not silently stall existing views |
+| AC13 concurrent cursors | one subscriber at cursor 0 (clipped) and one at the head, then a second live turn | the clipped subscriber held the tail `3,4` plus the live `5,6,7`, the live subscriber held only `5,6,7`, and the hub reported two subscribers, so replay choice does not leak between clients |
+
 Backup restore and live rebind, 2026-11-14:
 
 | Case | Evidence |
