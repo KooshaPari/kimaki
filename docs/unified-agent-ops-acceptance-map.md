@@ -82,7 +82,7 @@ AC03, AC04, AC06, AC07, AC13, AC14, AC17, AC23 and AC25 are closed. Every other 
 ## What would move the most cases
 
 1. A live Discord view bound to an external session closes AC03, AC06 and part of AC07, AC26.
-2. Codex control through the app-server closes AC03, AC04, AC17, AC18 for the second runtime.
+2. Codex control is now exercised for AC03, AC04 and AC17. AC18 stays open: an approval request is answered with a JSON-RPC error, so there is no approval to race or replay.
 3. A Paperclip external-session entity closes AC29 and unblocks AC30, AC22.
 4. Failure-path cases (AC07, AC13, AC14, AC16, AC23, AC25, AC37) are cheap and need no new environment.
 
