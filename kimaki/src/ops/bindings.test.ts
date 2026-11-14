@@ -3,13 +3,17 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { afterEach, expect, test } from 'vitest'
-import { openDb, type OpenedDb } from '../db.ts'
+import { openDb, type KimakiDb, type OpenedDb } from '../db.ts'
 import { removeTempDirs } from '../test/cleanup.ts'
 import {
   bindSurface, detachBinding, exportBindings, importBindings, listBindings,
   createSyncBackLedger, listWorkerResultSyncBacks, recordWorkerResultSyncBack, reconcileSyncBack,
   type BindingBackup, type SurfaceBinding,
 } from './bindings.ts'
+import {
+  abortCutover, beginCutover, completeCutover, createCutoverLedger, listCutoverRefusals,
+  readSurface, writeSurface,
+} from './cutover.ts'
 
 const opened: OpenedDb[] = []
 const dirs: string[] = []
@@ -471,4 +475,162 @@ test('a second reconciliation in flight is refused instead of delivering twice',
   if (done instanceof Error) throw done
   expect(done).toMatchObject({ status: 'synced', delivered: true })
   expect(calls).toBe(1)
+})
+
+// Connector cutover: AC34. A cutover moves surface ownership between bindings.
+// No real connector is rerouted here. Losing the pause, the generation fence,
+// the single-flight guard, the abort or the retirement must break these tests.
+
+async function rowOf(db: KimakiDb, id: string) {
+  const row = await db.query.ops_surface_bindings.findFirst({ where: { id } })
+  if (!row) throw new Error(`binding ${id} is missing`)
+  return row
+}
+
+function surfaceOwner(db: KimakiDb, surfaceId = 'thread-1') {
+  return readSurface({ db, tenantId: input.tenantId, surfaceId })
+}
+
+// One active source with a cutover already begun against a second endpoint.
+async function cutoverFixture() {
+  const { db, client } = await database()
+  const source = await bindSurface({ db, ...input })
+  if (source instanceof Error) throw source
+  const begun = await beginCutover({ db, sourceId: source.id, target: { ...key, endpointId: 'runtime-b' }, idempotencyKey: 'cutover-1' })
+  return { db, client, source, begun }
+}
+
+test('cutover pauses the source, hands the surface to the target, then retires the source', async () => {
+  const { db, source, begun } = await cutoverFixture()
+  if (begun instanceof Error) throw begun
+  expect(begun).toMatchObject({ phase: 'in-progress', source_state: 'paused', target_state: 'staged', generation: 2 })
+  // During the pause the surface still has exactly one owner: the paused source.
+  const paused = await surfaceOwner(db)
+  if (paused instanceof Error) throw paused
+  expect(paused).toMatchObject({ id: source.id, state: 'paused', generation: 1 })
+  const done = await completeCutover({ db, sourceId: source.id })
+  if (done instanceof Error) throw done
+  expect(done).toMatchObject({ phase: 'complete', source_state: 'retired', target_state: 'active', generation: 2 })
+  expect(await rowOf(db, source.id)).toMatchObject({ state: 'retired', generation: 1 })
+  expect(await rowOf(db, done.target_id)).toMatchObject({ state: 'active', generation: 2, endpoint_id: 'runtime-b' })
+  const owner = await surfaceOwner(db)
+  if (owner instanceof Error) throw owner
+  expect(owner.id).toBe(done.target_id)
+  const rows = await listBindings({ db, tenantId: input.tenantId })
+  if (rows instanceof Error) throw rows
+  expect(rows.filter((row) => row.state === 'active')).toHaveLength(1)
+})
+
+test('a competing consumer write at the superseded generation is refused and never reaches the target', async () => {
+  const { db } = await database()
+  const source = await bindSurface({ db, ...input })
+  if (source instanceof Error) throw source
+  const ledger = createCutoverLedger()
+  // The owner accepts writes at the generation it actually holds.
+  expect(await writeSurface({ db, ledger, bindingId: source.id, generation: 1 })).toMatchObject({ accepted: true, surface_generation: 1 })
+  const begun = await beginCutover({ db, sourceId: source.id, target: { ...key, endpointId: 'runtime-b' }, idempotencyKey: 'cutover-1' })
+  if (begun instanceof Error) throw begun
+  const targetBefore = await rowOf(db, begun.target_id)
+  const refused = await writeSurface({ db, ledger, bindingId: source.id, generation: 1 })
+  if (refused instanceof Error) throw refused
+  if (refused.accepted) throw new Error('the superseded generation was accepted')
+  expect(refused).toMatchObject({ accepted: false, generation: 1, surface_generation: 2 })
+  expect(refused.reason).toMatch(/superseded/)
+  // The staged target cannot absorb the same write either, and is unchanged by it.
+  const toTarget = await writeSurface({ db, ledger, bindingId: begun.target_id, generation: 2 })
+  if (toTarget instanceof Error) throw toTarget
+  if (toTarget.accepted) throw new Error('the staged target absorbed a write')
+  expect(toTarget).toMatchObject({ accepted: false })
+  expect(toTarget.reason).toMatch(/staged/)
+  expect(await rowOf(db, begun.target_id)).toEqual(targetBefore)
+  const refusals = listCutoverRefusals({ ledger })
+  expect(refusals.map((refusal) => [refusal.binding_id, refusal.generation, refusal.surface_generation])).toEqual([
+    [source.id, 1, 2],
+    [begun.target_id, 2, 2],
+  ])
+  expect(refusals[0]?.reason).toMatch(/superseded by generation 2/)
+  // The surface still reads exactly one owner: the paused source.
+  expect(await surfaceOwner(db)).toMatchObject({ id: source.id, state: 'paused' })
+})
+
+test('a second cutover for the same surface is refused by name while the first is in progress', async () => {
+  const { db, source, begun } = await cutoverFixture()
+  if (begun instanceof Error) throw begun
+  const second = await beginCutover({ db, sourceId: source.id, target: { ...key, endpointId: 'runtime-c' }, idempotencyKey: 'cutover-2' })
+  expect(second).toBeInstanceOf(Error)
+  expect((second as Error).message).toMatch(/already in progress/)
+  expect((second as Error).message).toContain('discord:guild-1:thread-1')
+  const rows = await listBindings({ db, tenantId: input.tenantId })
+  if (rows instanceof Error) throw rows
+  expect(rows).toHaveLength(2)
+  expect(rows.filter((row) => (row.state as string) === 'staged')).toHaveLength(1)
+  // Binding the surface again would create a second owner while the source is
+  // paused, so it is refused until the cutover settles.
+  const rebind = await bindSurface({ db, ...input, idempotencyKey: 'request-9' })
+  expect(rebind).toBeInstanceOf(Error)
+  expect((rebind as Error).message).toMatch(/mid-cutover/)
+})
+
+test('abort restores the source at the same generation and never activates the target', async () => {
+  const { db, source, begun } = await cutoverFixture()
+  if (begun instanceof Error) throw begun
+  const targetBefore = await rowOf(db, begun.target_id)
+  const aborted = await abortCutover({ db, sourceId: source.id })
+  if (aborted instanceof Error) throw aborted
+  expect(aborted).toMatchObject({ phase: 'aborted', source_state: 'active', target_state: 'detached' })
+  expect(await rowOf(db, source.id)).toMatchObject({ state: 'active', generation: 1 })
+  const targetAfter = await rowOf(db, begun.target_id)
+  // Identity, route and generation survive; the target never gains ownership.
+  expect(targetAfter).toMatchObject({
+    id: targetBefore.id, generation: 2, endpoint_id: 'runtime-b',
+    native_session_id: targetBefore.native_session_id, idempotency_key: 'cutover-1', state: 'detached',
+  })
+  expect(await surfaceOwner(db)).toMatchObject({ id: source.id, state: 'active' })
+  // Not stranded: the restored owner writes at its own generation again, even
+  // though the abandoned target row still records generation 2.
+  const ledger = createCutoverLedger()
+  expect(await writeSurface({ db, ledger, bindingId: source.id, generation: 1 })).toMatchObject({ accepted: true, surface_generation: 1 })
+  // The surface is not stranded: a fresh cutover can start on the same source.
+  const retry = await beginCutover({ db, sourceId: source.id, target: { ...key, endpointId: 'runtime-b' }, idempotencyKey: 'cutover-2' })
+  expect(retry).not.toBeInstanceOf(Error)
+})
+
+test('completing a cutover twice is idempotent', async () => {
+  const { db, source, begun } = await cutoverFixture()
+  if (begun instanceof Error) throw begun
+  const first = await completeCutover({ db, sourceId: source.id })
+  if (first instanceof Error) throw first
+  const rows = await listBindings({ db, tenantId: input.tenantId })
+  if (rows instanceof Error) throw rows
+  const second = await completeCutover({ db, sourceId: source.id })
+  if (second instanceof Error) throw second
+  expect(second).toEqual(first)
+  expect(await listBindings({ db, tenantId: input.tenantId })).toEqual(rows)
+})
+
+test('cutover refuses a non-observe source, a superseded source and a stray completion by name', async () => {
+  const { db, client } = await database()
+  const source = await bindSurface({ db, ...input })
+  if (source instanceof Error) throw source
+  // The mode gate is defensive: bindSurface only writes observe rows.
+  await client.execute({ sql: "UPDATE ops_surface_bindings SET mode = 'control' WHERE id = ?", args: [source.id] })
+  const control = await beginCutover({ db, sourceId: source.id, target: { ...key, endpointId: 'runtime-b' }, idempotencyKey: 'cutover-1' })
+  expect(control).toBeInstanceOf(Error)
+  expect((control as Error).message).toMatch(/only moves an observe binding/)
+  await client.execute({ sql: "UPDATE ops_surface_bindings SET mode = 'observe' WHERE id = ?", args: [source.id] })
+  // A detach plus a rebind leaves the first binding a generation behind.
+  const detached = await detachBinding({ db, bindingId: source.id, tenantId: input.tenantId })
+  if (detached instanceof Error) throw detached
+  const live = await bindSurface({ db, ...input, idempotencyKey: 'request-2' })
+  if (live instanceof Error) throw live
+  expect(live.generation).toBe(2)
+  const ahead = await beginCutover({ db, sourceId: source.id, target: { ...key, endpointId: 'runtime-b' }, idempotencyKey: 'cutover-2' })
+  expect(ahead).toBeInstanceOf(Error)
+  expect((ahead as Error).message).toMatch(/A superseded binding cannot be cut over/)
+  // Completing or aborting a cutover that never began names the reason.
+  expect(await completeCutover({ db, sourceId: live.id })).toBeInstanceOf(Error)
+  expect(((await completeCutover({ db, sourceId: live.id })) as Error).message).toMatch(/Only a paused source/)
+  expect(((await abortCutover({ db, sourceId: live.id })) as Error).message).toMatch(/nothing to abort/)
+  expect(((await completeCutover({ db, sourceId: 'missing-binding' })) as Error).message).toMatch(/No binding missing-binding/)
+  expect(await readSurface({ db, tenantId: 'guild-9', surfaceId: 'thread-9' })).toBeInstanceOf(Error)
 })

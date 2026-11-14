@@ -43,7 +43,8 @@ const IDENTIFIER_FIELDS = [
   'service_kind', 'tenant_id', 'surface_id', 'idempotency_key',
 ] as const satisfies readonly (keyof SurfaceBinding)[]
 
-function validIdentifiers(values: unknown[]): boolean {
+// Shared with the cutover module (ops/cutover.ts) so identity checks stay one rule.
+export function validIdentifiers(values: unknown[]): boolean {
   return values.every((value) => typeof value === 'string' && value.trim().length > 0 && value.length <= 2048 && !value.includes('\0'))
 }
 
@@ -199,6 +200,18 @@ export async function bindSurface(input: BindSurfaceInput): Promise<SurfaceBindi
   }
   if (input.mode !== undefined && input.mode !== 'observe') {
     return new ConfigError({ reason: 'Only metadata-only observe bindings are supported. Runtime control and transcript publication are disabled' })
+  }
+  // A surface mid-cutover already has an owner: its paused source. Binding here
+  // would create a second owner, so the cutover must complete or abort first.
+  const midCutover = await db.select({ id: bindings.id }).from(bindings).where(orm.and(
+    orm.eq(bindings.service_kind, serviceKind),
+    orm.eq(bindings.tenant_id, tenantId),
+    orm.eq(bindings.surface_id, surfaceId),
+    orm.sql`${bindings.state} IN ('paused', 'staged')`,
+  )).limit(1).catch((cause) => new DbError({ operation: 'read cutover state', cause }))
+  if (midCutover instanceof Error) return midCutover
+  if (midCutover.length > 0) {
+    return new ConfigError({ reason: `Surface ${surfaceId} is mid-cutover. Complete or abort the cutover before binding it again` })
   }
   // Unique constraints and generation allocation execute in one SQLite statement, including across processes.
   const inserted = await db.insert(bindings).values({
