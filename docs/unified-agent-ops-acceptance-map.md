@@ -13,11 +13,11 @@ Checksums from the bundle's own `SHA256SUMS.txt`: 7 of 7 documents match.
 | Status | Cases |
 | --- | --- |
 | Closed at the plan's standard | 9 |
-| Partial | 13 |
-| Not started | 18 |
+| Partial | 14 |
+| Not started | 17 |
 | Total | 40 |
 
-AC03, AC04, AC06, AC07, AC13, AC14, AC17, AC23 and AC25 are closed. Every other case still lacks both a real native surface and a live service path in the same piece of evidence, which is the standard the plan sets.
+AC03, AC04, AC06, AC07, AC13, AC14, AC17, AC23 and AC25 are closed. Every other case still lacks both a real native surface and a live service path in the same piece of evidence, which is the standard the plan sets. AC18 moved from not started to partial: the approval race and replay paths now exist and are tested at the controller and transport layers, but no real Codex 0.169 approval request has been driven end to end.
 
 ## Acceptance cases
 
@@ -40,7 +40,7 @@ AC03, AC04, AC06, AC07, AC13, AC14, AC17, AC23 and AC25 are closed. Every other 
 | AC15 | Crash after launch before ACK | not started | no crash-after-launch-before-ack case |
 | AC16 | Competing managed launch paths | partial | the hub lease refuses a second writer; no Paperclip launcher fencing |
 | AC17 | Cancel request | closed | a real codex 0.169 app-server turn was interrupted mid-flight through `ops codex turn --cancel-after 2500` against a deliberately slow local model: the CLI printed `cancel-requested` and the turn settled with `"status": "interrupted"` and empty text, which is the native turn state. The hub also accepts a cancel and stays inert when idle |
-| AC18 | Approval race/replay | not started | no approval race or replay case |
+| AC18 | Approval race/replay | partial | `startCodexAppServer` can hold a server-initiated request instead of failing it with `-32601`; `createCodexController` surfaces the request, applies an opt-in policy, and answers it exactly once. A replay, an id that was never issued, an id the transport dropped, and a second racing answer are each refused by name; `close` releases anything still held. 30 controller tests and 4 transport tests pass, `tsc` is clean, commit `8450f029`. The transport tests use a fake app-server child, so the real-native half is still missing: no Codex 0.169 approval request has been driven through a real binary |
 | AC19 | Artifact changed after approval | not started | no artifact digest/revision mismatch case |
 | AC20 | Credential revocation | partial | consent revoked mid-flight blocks publication; credential revocation is not exercised |
 | AC21 | Prompt injection through chat/output | not started | no prompt-injection-through-output case |
@@ -72,17 +72,17 @@ AC03, AC04, AC06, AC07, AC13, AC14, AC17, AC23 and AC25 are closed. Every other 
 | WP1 | Minimal native-session/binding contract | mostly | `SessionKey`, capability matrix and fail-closed identity comparison; enroll and control operations are absent |
 | WP2 | Kimaki boundary and external observations | partial | ops CLI kept separate from the bot and OpenCode path untouched; no binding path into the live bot |
 | WP3 | HERDR/native discovery | partial | real herdr 0.9.3 discovery and metadata binding with fencing; no capture into a Discord view |
-| WP4 | Codex adapter | mostly | real-binary evidence now exists for create, submit, stream, interrupt, resume and read. Against codex 0.169 with a local Responses-API model provider (no account credentials): `ops codex turn` streamed `stub-model-reply items=4` and reported `"status":"completed"`; `--cancel-after 2500` on a slow turn produced `"status":"interrupted"`; a second process resumed the same thread with `thread/resume` and ran a turn that carried six input items instead of four, proving history continuity; `ops codex history` read the thread in a fresh process and printed the user and agent messages in order. Default-provider credentials are still absent: pointing at an isolated home with no auth exits 1 at turn/start with `401 Unauthorized`. Approval answering stays declared unsupported |
+| WP4 | Codex adapter | mostly | real-binary evidence now exists for create, submit, stream, interrupt, resume and read. Against codex 0.169 with a local Responses-API model provider (no account credentials): `ops codex turn` streamed `stub-model-reply items=4` and reported `"status":"completed"`; `--cancel-after 2500` on a slow turn produced `"status":"interrupted"`; a second process resumed the same thread with `thread/resume` and ran a turn that carried six input items instead of four, proving history continuity; `ops codex history` read the thread in a fresh process and printed the user and agent messages in order. Default-provider credentials are still absent: pointing at an isolated home with no auth exits 1 at turn/start with `401 Unauthorized`. Approval answering is now supported when an approval channel is configured; without one the client still refuses by default. The race/replay paths are tested, but no real-binary approval request has been driven yet |
 | WP5 | JCode/KCode adapters | partial | ACP backend, CLI, hub, durable stream, presence, ack and a Discord view of a live session verified; KCode identity absent and Jcode exposes no retraction or correction surface |
 | WP6 | Paperclip plugin and runtime adapter | partial | run metadata read and a local-command managed run; no entity projection or enrollment, model-backed run blocked |
 | WP7 | Discord comparison and route ownership | partial | consent-gated metadata publication, a live channel view of a hub session (`ops discord view`) with durable resume, and a native-session mirror (`ops jcode watch --tenant/--surface/--state`) that posted four real messages from a terminal session it did not start, with a durable index; no in-bot wiring, route ownership or cutover |
-| WP8 | Reliability and acceptance witnesses | partial | 61 backend tests plus 27 hub, 15 ACP client, 21 Codex control, 2 Codex transport, 4 Codex hub, 6 publication, 8 Discord view, 7 native mirror and 8 binding tests; three real witnesses (three clients on one jcode hub, native terminal mirrored into a channel, real Codex thread served and mirrored); test-suite gate baseline recorded in `docs/release-gate-2026-11-14.md` |
+| WP8 | Reliability and acceptance witnesses | partial | 61 backend tests plus 27 hub, 15 ACP client, 30 Codex control, 4 Codex transport, 4 Codex hub, 6 publication, 8 Discord view, 7 native mirror and 8 binding tests; three real witnesses (three clients on one jcode hub, native terminal mirrored into a channel, real Codex thread served and mirrored); test-suite gate baseline recorded in `docs/release-gate-2026-11-14.md` |
 | WP9 | Migration and retirement | not started | decision matrix and rollback rehearsal only; nothing drained or retired |
 
 ## What would move the most cases
 
 1. A live Discord view bound to an external session closes AC03, AC06 and part of AC07, AC26.
-2. Codex control is now exercised for AC03, AC04 and AC17. AC18 stays open: an approval request is answered with a JSON-RPC error, so there is no approval to race or replay.
+2. Codex control is now exercised for AC03, AC04 and AC17. AC18 is partial: the approval race and replay paths exist and are tested, but a real Codex approval request is still needed to close it.
 3. A Paperclip external-session entity closes AC29 and unblocks AC30, AC22.
 4. Failure-path cases (AC07, AC13, AC14, AC16, AC23, AC25, AC37) are cheap and need no new environment.
 
@@ -200,12 +200,18 @@ previous turn's result, exiting before its own turn ran. A prompting attach now 
 at the hub's current sequence; verified by a turn that returned `"cursor": 10` for its
 own completion instead of a stale `4`.
 
-Approval requests, measured instead of assumed: the transport answers a
-server-initiated request such as `item/commandExecution/requestApproval` with JSON-RPC
-error `-32601` on a microtask and the turn still settles. The capability reason said
-such a turn "stalls until interrupted", which was wrong and is corrected: an
-approval-gated action fails rather than being granted. A test drives that path with a
-fake app-server that asks for approval mid-turn and echoes the answer back.
+Approval requests are a first-class opt-in. Without an approval channel the transport still answers a server-initiated request such as `item/commandExecution/requestApproval` with JSON-RPC error `-32601` on a microtask and the turn settles: an approval-gated action fails rather than being granted. With `--approval`, the transport holds the request instead, the controller surfaces it, and the first answer wins. A replay, an unknown id, an id the transport dropped, and a second racing answer are each refused by name. The tests use a fake app-server child for the transport half, so the real-binary approval request remains the open half of AC18.
+
+| Check | Observed |
+| --- | --- |
+| Policy auto-answer | `accept` delivered once as `{decision:"accept"}`; request surfaced with its command |
+| No policy | request stays open in `pendingApprovals()` until answered by id |
+| Replay | second answer refused as already answered; transport saw one answer |
+| Race | first of two answers wins; loser refused; one answer delivered |
+| Unknown / dropped id | refused with a named reason; no answer forwarded |
+| Policy throws | decision becomes `decline`, never an accidental grant |
+| Close with held request | `close` releases it with `-32601`; later answers return false |
+| Unsupported server request | failed with `-32601` so the turn cannot hang |
 
 Codex parity with the jcode fabric, measured end to end:
 
