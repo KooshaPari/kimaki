@@ -57,12 +57,13 @@ export function registerOpsCommands(cli: Goke) {
             serverRequests: { result: server.respond, error: server.respondError },
             approvals: {
               policy: () => approval,
-              onRequest: (request: { requestId: number; method: string; command: string | null; reason: string | null }) => printJson({
+              onRequest: (request: { requestId: number; method: string; command: string | null; reason: string | null; digest: string }) => printJson({
                 kind: 'approval-request',
                 requestId: request.requestId,
                 method: request.method,
                 command: request.command,
                 reason: request.reason,
+                digest: request.digest,
                 decision: approval,
               }),
             },
@@ -741,12 +742,13 @@ export function registerOpsCommands(cli: Goke) {
           serverRequests: { result: server.respond, error: server.respondError },
           approvals: {
             policy: () => approval,
-            onRequest: (request: { requestId: number; method: string; command: string | null; reason: string | null }) => printJson({
+            onRequest: (request: { requestId: number; method: string; command: string | null; reason: string | null; digest: string }) => printJson({
               kind: 'approval-request',
               requestId: request.requestId,
               method: request.method,
               command: request.command,
               reason: request.reason,
+              digest: request.digest,
               decision: approval,
             }),
           },

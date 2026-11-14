@@ -3,6 +3,7 @@
 // observer nor the controller launches a process, reads credentials, or
 // resumes a historical thread. Streaming requires the caller to forward the
 // transport's notification stream; see `createCodexController`.
+import { createHash } from 'node:crypto'
 import * as errore from 'errore'
 import { ConfigError } from '../../errors.js'
 import type { SessionKey } from '../contracts.js'
@@ -121,11 +122,28 @@ export type CodexApprovalRequest = {
   kind: string | null
   /** Stable runtime id for this approval, when one is supplied. */
   approvalId: string | null
+  /**
+   * SHA-256 of the approval payload this client actually read, so an answer can
+   * prove it approves the artifact it saw instead of whatever occupies the id
+   * now. `requestId` and `startedAtMs` are excluded: they describe the transport
+   * envelope, not the artifact under review.
+   */
+  digest: string
   /** When the runtime started the approval clock, in epoch milliseconds. */
   startedAtMs: number | null
 }
 export type CodexApprovalPolicy = (request: CodexApprovalRequest) => CodexApprovalDecision | null
 type TurnSettlement = CodexTurnResult | Error
+
+// The digest field order is fixed here instead of being inherited from object
+// insertion order, and the payload is an ordered list of [name, value] pairs, so
+// a `null` field cannot collide with the string "null" and two processes agree
+// on the same bytes for the same artifact.
+const approvalDigestFields = ['method', 'threadId', 'turnId', 'itemId', 'command', 'cwd', 'kind', 'grantRoot', 'approvalId', 'reason'] as const
+const approvalDigest = (approval: Omit<CodexApprovalRequest, 'digest'>): string => {
+  const payload = approvalDigestFields.map((name) => [name, approval[name]])
+  return `sha256:${createHash('sha256').update(JSON.stringify(payload), 'utf8').digest('hex')}`
+}
 
 type PendingTurn = {
   state: {
@@ -237,9 +255,10 @@ export function createCodexController({
     // The schema admits `command | writeStdin | humanCommand` and older servers
     // omit it entirely, which means a plain command.
     const kind = text(params.kind) ?? (notification.method === 'item/commandExecution/requestApproval' ? 'command' : null)
-    return {
+    const approval = {
       requestId: notification.id,
-      method: notification.method,
+      // The two method checks above already proved this literal union.
+      method: notification.method as CodexApprovalRequest['method'],
       threadId: params.threadId,
       turnId: text(params.turnId),
       itemId: text(params.itemId),
@@ -251,11 +270,16 @@ export function createCodexController({
       approvalId: text(params.approvalId),
       startedAtMs: typeof params.startedAtMs === 'number' && Number.isFinite(params.startedAtMs) ? params.startedAtMs : null,
     }
+    return { ...approval, digest: approvalDigest(approval) }
   }
 
   // One place answers, so "first answer wins" is a property of the code and not
   // of whichever caller happens to run first.
-  const settleApproval = (requestId: number, decision: CodexApprovalDecision): Error | { requestId: number; decision: CodexApprovalDecision } => {
+  const settleApproval = (
+    requestId: number,
+    decision: CodexApprovalDecision,
+    expectedDigest?: string,
+  ): Error | { requestId: number; decision: CodexApprovalDecision } => {
     // Defence in depth: `answerApproval` already validates, but this is the only
     // function that writes an answer, so it never forwards an unchecked value.
     if (!isApprovalDecision(decision)) {
@@ -266,6 +290,24 @@ export function createCodexController({
       return settledApprovals.has(requestId)
         ? new CodexApprovalError({ requestId: String(requestId), reason: 'it was already answered, so a repeated answer cannot change the decision' })
         : new CodexApprovalError({ requestId: String(requestId), reason: 'no approval request with this id is open' })
+    }
+    // The id survives a payload swap, so an answer that would move the runtime
+    // has to name the artifact it read. A mismatch is checked before the answer
+    // is forwarded, which is what closes "the artifact changed after approval".
+    if (expectedDigest !== undefined && (typeof expectedDigest !== 'string' || !expectedDigest.trim())) {
+      return new CodexApprovalError({ requestId: String(requestId), reason: 'the supplied digest is not a nonblank string' })
+    }
+    if ((decision === 'accept' || decision === 'acceptForSession') && expectedDigest === undefined) {
+      return new CodexApprovalError({
+        requestId: String(requestId),
+        reason: `an ${decision} needs the payload digest from pendingApprovals, because the answer must name the artifact it approves`,
+      })
+    }
+    if (expectedDigest !== undefined && expectedDigest !== request.digest) {
+      return new CodexApprovalError({
+        requestId: String(requestId),
+        reason: `the supplied digest ${expectedDigest} does not match the payload now under review (${request.digest}), so it changed after it was read`,
+      })
     }
     // A human command has no session-wide grant to extend, so the runtime's
     // session answer is not a valid decision for it.
@@ -309,7 +351,9 @@ export function createCodexController({
       // A policy can return anything at runtime. `null` means "leave it open";
       // every other unrecognised value fails closed instead of reaching the wire.
       if (decision !== null && (!isApprovalDecision(decision) || !isDecisionValidFor(approval, decision))) decision = 'decline'
-      if (decision !== null) settleApproval(approval.requestId, decision)
+      // The policy path answers through the same settle function with the digest
+      // of the request it was handed, so it cannot answer a changed payload.
+      if (decision !== null) settleApproval(approval.requestId, decision, approval.digest)
       return
     }
     const params = notification.params
@@ -555,14 +599,23 @@ export function createCodexController({
      * Answers one approval request. The first answer wins: a repeated or stale
      * id is refused by name rather than forwarded, so a replayed answer cannot
      * re-open a decision the runtime already made.
+     *
+     * `expectedDigest` is the `digest` of the request the caller actually read.
+     * An `accept` or `acceptForSession` must supply it, and every supplied digest
+     * must match the payload now under review, so a command swapped under the
+     * same id after the caller looked is refused instead of approved. `decline`
+     * and `cancel` may omit it because they move nothing.
      */
-    answerApproval({ requestId, decision }: { requestId: number; decision: CodexApprovalDecision }) {
+    answerApproval({ requestId, decision, expectedDigest }: { requestId: number; decision: CodexApprovalDecision; expectedDigest?: string }) {
       if (approvals === undefined) {
         return new ConfigError({ reason: 'This controller was started without an approval channel' })
       }
       if (!Number.isSafeInteger(requestId) || requestId <= 0) return new ConfigError({ reason: 'Approval request id must be a positive integer' })
       if (!isApprovalDecision(decision)) return new ConfigError({ reason: `Unknown approval decision ${String(decision)}` })
-      return settleApproval(requestId, decision)
+      if (expectedDigest !== undefined && typeof expectedDigest !== 'string') {
+        return new ConfigError({ reason: 'Approval digest must be a string' })
+      }
+      return settleApproval(requestId, decision, expectedDigest)
     },
     close,
   }

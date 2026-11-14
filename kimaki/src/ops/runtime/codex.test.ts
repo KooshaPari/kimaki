@@ -332,6 +332,13 @@ function approvalHarness(policy?: CodexApprovalPolicy, withApprovals = true) {
   return { controller, requests, results, failures, ask, drop, request }
 }
 
+// The digest a reviewer would have read from pendingApprovals before answering.
+const digestOf = (controller: ReturnType<typeof approvalHarness>['controller'], requestId: number): string => {
+  const request = controller.pendingApprovals().find((candidate) => candidate.requestId === requestId)
+  if (!request) throw new Error(`approval ${requestId} is not pending`)
+  return request.digest
+}
+
 describe('Codex approval surface', () => {
   it('declares answerApproval supported only when an approval channel exists', () => {
     const { controller } = approvalHarness(undefined, false)
@@ -378,6 +385,7 @@ describe('Codex approval surface', () => {
     ask(41)
     expect(requests).toHaveLength(1)
     expect(requests[0]).toMatchObject({ requestId: 41, method: 'item/commandExecution/requestApproval', command: 'rm -rf /tmp/x', threadId: 'thread-1', turnId: 'turn-1' })
+    expect(requests[0]?.digest).toMatch(/^sha256:[0-9a-f]{64}$/)
     expect(results).toEqual([{ id: 41, result: { decision: 'accept' } }])
     expect(controller.pendingApprovals()).toEqual([])
   })
@@ -395,7 +403,7 @@ describe('Codex approval surface', () => {
   it('refuses a replayed answer instead of forwarding it twice', () => {
     const { controller, results, ask } = approvalHarness()
     ask(9)
-    expect(controller.answerApproval({ requestId: 9, decision: 'accept' })).toEqual({ requestId: 9, decision: 'accept' })
+    expect(controller.answerApproval({ requestId: 9, decision: 'accept', expectedDigest: digestOf(controller, 9) })).toEqual({ requestId: 9, decision: 'accept' })
     const replay = controller.answerApproval({ requestId: 9, decision: 'decline' })
     expect(replay).toBeInstanceOf(Error)
     expect((replay as Error).message).toMatch(/already answered/)
@@ -405,8 +413,9 @@ describe('Codex approval surface', () => {
   it('gives the first of two racing answers the request and refuses the loser', () => {
     const { controller, results, ask } = approvalHarness()
     ask(11)
-    const first = controller.answerApproval({ requestId: 11, decision: 'accept' })
-    const second = controller.answerApproval({ requestId: 11, decision: 'acceptForSession' })
+    const expectedDigest = digestOf(controller, 11)
+    const first = controller.answerApproval({ requestId: 11, decision: 'accept', expectedDigest })
+    const second = controller.answerApproval({ requestId: 11, decision: 'acceptForSession', expectedDigest })
     expect(first).toEqual({ requestId: 11, decision: 'accept' })
     expect(second).toBeInstanceOf(Error)
     expect(results).toHaveLength(1)
@@ -414,15 +423,16 @@ describe('Codex approval surface', () => {
 
   it('refuses an id that was never issued and an id the app-server dropped', () => {
     const { controller, results } = approvalHarness()
-    const unknown = controller.answerApproval({ requestId: 99, decision: 'accept' })
+    const unknown = controller.answerApproval({ requestId: 99, decision: 'accept', expectedDigest: `sha256:${'0'.repeat(64)}` })
     expect(unknown).toBeInstanceOf(Error)
     expect((unknown as Error).message).toMatch(/no approval request with this id is open/)
     // The transport can lose the id first (closed connection); the answer then
     // reports that instead of pretending it was delivered.
     const losing = approvalHarness()
     losing.ask(5)
+    const expectedDigest = digestOf(losing.controller, 5)
     losing.drop(5)
-    const dropped = losing.controller.answerApproval({ requestId: 5, decision: 'accept' })
+    const dropped = losing.controller.answerApproval({ requestId: 5, decision: 'accept', expectedDigest })
     expect(dropped).toBeInstanceOf(Error)
     expect((dropped as Error).message).toMatch(/no longer had this request open/)
     expect(results).toEqual([])
@@ -438,7 +448,11 @@ describe('Codex approval surface', () => {
     const seen: CodexApprovalRequest[] = []
     const { ask } = approvalHarness((request) => { seen.push(request); return 'accept' })
     ask(21, { cwd: 'E:/work', kind: 'command', approvalId: 'apr-1', startedAtMs: 1_700_000_000_000 })
-    expect(seen).toEqual([{
+    expect(seen).toHaveLength(1)
+    const firstRequest = seen[0]
+    if (!firstRequest) throw new Error('expected one command approval request')
+    const { digest, ...artifact } = firstRequest
+    expect(artifact).toEqual({
       requestId: 21,
       method: 'item/commandExecution/requestApproval',
       threadId: 'thread-1',
@@ -451,7 +465,8 @@ describe('Codex approval surface', () => {
       kind: 'command',
       approvalId: 'apr-1',
       startedAtMs: 1_700_000_000_000,
-    }])
+    })
+    expect(digest).toMatch(/^sha256:[0-9a-f]{64}$/)
   })
 
   it('surfaces a file-change grant root to the policy', () => {
@@ -464,7 +479,11 @@ describe('Codex approval surface', () => {
       grantRoot: 'E:/work/repo',
       reason: 'write outside workspace',
     })
-    expect(seen).toEqual([{
+    expect(seen).toHaveLength(1)
+    const firstRequest = seen[0]
+    if (!firstRequest) throw new Error('expected one file-change approval request')
+    const { digest, ...artifact } = firstRequest
+    expect(artifact).toEqual({
       requestId: 22,
       method: 'item/fileChange/requestApproval',
       threadId: 'thread-1',
@@ -477,7 +496,8 @@ describe('Codex approval surface', () => {
       kind: null,
       approvalId: null,
       startedAtMs: null,
-    }])
+    })
+    expect(digest).toMatch(/^sha256:[0-9a-f]{64}$/)
   })
 
   it('drops blank scope fields and non-finite timestamps', () => {
@@ -515,12 +535,13 @@ describe('Codex approval surface', () => {
     // valid answer can still be given afterwards.
     const explicit = approvalHarness()
     explicit.ask(42, { kind: 'humanCommand' })
-    const refused = explicit.controller.answerApproval({ requestId: 42, decision: 'acceptForSession' })
+    const digest = digestOf(explicit.controller, 42)
+    const refused = explicit.controller.answerApproval({ requestId: 42, decision: 'acceptForSession', expectedDigest: digest })
     expect(refused).toBeInstanceOf(Error)
     expect((refused as Error).message).toMatch(/humanCommand/)
     expect(explicit.results).toEqual([])
     expect(explicit.controller.pendingApprovals()).toHaveLength(1)
-    expect(explicit.controller.answerApproval({ requestId: 42, decision: 'accept' })).toEqual({ requestId: 42, decision: 'accept' })
+    expect(explicit.controller.answerApproval({ requestId: 42, decision: 'accept', expectedDigest: digest })).toEqual({ requestId: 42, decision: 'accept' })
     expect(explicit.results).toEqual([{ id: 42, result: { decision: 'accept' } }])
 
     // Other command kinds still admit the session answer.
@@ -533,6 +554,87 @@ describe('Codex approval surface', () => {
     const { results, ask } = approvalHarness(() => { throw new Error('policy bug') })
     ask(13)
     expect(results).toEqual([{ id: 13, result: { decision: 'decline' } }])
+  })
+
+  it('answers an accept only for the digest that was actually read', () => {
+    const { controller, results, ask } = approvalHarness()
+    ask(51, { cwd: 'E:/work', approvalId: 'apr-51' })
+    const [pending] = controller.pendingApprovals()
+    if (!pending) throw new Error('expected one pending approval')
+    expect(pending.digest).toMatch(/^sha256:[0-9a-f]{64}$/)
+    expect(controller.answerApproval({ requestId: 51, decision: 'accept', expectedDigest: pending.digest })).toEqual({ requestId: 51, decision: 'accept' })
+    expect(results).toEqual([{ id: 51, result: { decision: 'accept' } }])
+  })
+
+  it('refuses a mismatched digest and forwards nothing', () => {
+    const { controller, results, ask } = approvalHarness()
+    ask(52)
+    const [pending] = controller.pendingApprovals()
+    if (!pending) throw new Error('expected one pending approval')
+    const refused = controller.answerApproval({ requestId: 52, decision: 'accept', expectedDigest: `sha256:${'0'.repeat(64)}` })
+    expect(refused).toBeInstanceOf(Error)
+    expect((refused as Error).message).toMatch(/digest/)
+    expect(results).toEqual([])
+    expect(controller.pendingApprovals()).toHaveLength(1)
+    // The refusal consumed nothing, so the digest that was read still answers.
+    expect(controller.answerApproval({ requestId: 52, decision: 'accept', expectedDigest: pending.digest })).toEqual({ requestId: 52, decision: 'accept' })
+    expect(results).toEqual([{ id: 52, result: { decision: 'accept' } }])
+  })
+
+  it('requires a digest for accept and acceptForSession', () => {
+    const { controller, results, ask } = approvalHarness()
+    ask(53)
+    const accepted = controller.answerApproval({ requestId: 53, decision: 'accept' })
+    expect(accepted).toBeInstanceOf(Error)
+    expect((accepted as Error).message).toMatch(/digest/)
+    const session = controller.answerApproval({ requestId: 53, decision: 'acceptForSession' })
+    expect(session).toBeInstanceOf(Error)
+    expect((session as Error).message).toMatch(/digest/)
+    expect(results).toEqual([])
+    expect(controller.pendingApprovals()).toHaveLength(1)
+  })
+
+  it('answers decline and cancel without a digest but refuses a wrong one', () => {
+    const { controller, results, ask } = approvalHarness()
+    ask(54)
+    expect(controller.answerApproval({ requestId: 54, decision: 'decline' })).toEqual({ requestId: 54, decision: 'decline' })
+    ask(55)
+    expect(controller.answerApproval({ requestId: 55, decision: 'cancel' })).toEqual({ requestId: 55, decision: 'cancel' })
+    ask(56)
+    const wrong = controller.answerApproval({ requestId: 56, decision: 'decline', expectedDigest: `sha256:${'1'.repeat(64)}` })
+    expect(wrong).toBeInstanceOf(Error)
+    expect((wrong as Error).message).toMatch(/digest/)
+    expect(results).toEqual([
+      { id: 54, result: { decision: 'decline' } },
+      { id: 55, result: { decision: 'cancel' } },
+    ])
+  })
+
+  it('refuses an answer whose artifact changed under the same request id', () => {
+    const { controller, results, ask } = approvalHarness()
+    ask(57)
+    const stale = digestOf(controller, 57)
+    // Same transport id, different artifact: the command the runtime now wants.
+    ask(57, { command: 'rm -rf /' })
+    const changed = digestOf(controller, 57)
+    expect(changed).not.toBe(stale)
+    const refused = controller.answerApproval({ requestId: 57, decision: 'accept', expectedDigest: stale })
+    expect(refused).toBeInstanceOf(Error)
+    expect((refused as Error).message).toMatch(/digest/)
+    expect(results).toEqual([])
+    expect(controller.answerApproval({ requestId: 57, decision: 'accept', expectedDigest: changed })).toEqual({ requestId: 57, decision: 'accept' })
+    expect(results).toEqual([{ id: 57, result: { decision: 'accept' } }])
+  })
+
+  it('digests the artifact and not the transport envelope', () => {
+    const { controller, ask } = approvalHarness()
+    ask(61, { startedAtMs: 1 })
+    const first = digestOf(controller, 61)
+    // requestId and startedAtMs differ; the artifact is identical.
+    ask(62, { startedAtMs: 2 })
+    expect(digestOf(controller, 62)).toBe(first)
+    ask(63, { command: 'rm -rf /tmp/y' })
+    expect(digestOf(controller, 63)).not.toBe(first)
   })
 })
 
