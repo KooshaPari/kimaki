@@ -85,3 +85,31 @@ AC03, AC04, AC06, AC13, AC14, AC23 and AC25 are closed. Every other case still l
 2. Codex control through the app-server closes AC03, AC04, AC17, AC18 for the second runtime.
 3. A Paperclip external-session entity closes AC29 and unblocks AC30, AC22.
 4. Failure-path cases (AC07, AC13, AC14, AC16, AC23, AC25, AC37) are cheap and need no new environment.
+
+## Mutation validation (2026-11-14)
+
+Each closed case below was re-checked by breaking the behaviour, confirming the test
+fails, then restoring the file and re-running the suite green.
+
+| Case | Mutation | Observed |
+| --- | --- | --- |
+| AC13 | `clipped = false` in the no-log branch | 3 tests fail, including two AC13 tests asserting the honest gap |
+| AC13 | `clipped = true` in the log branch | 2 tests fail, including the full-log replay case |
+| AC25 | removed `rejectOnRateLimit` from all four REST clients | the 429 test fails after 120103 ms: the retry loop never returns and `posts` is not 1 |
+| AC12 | the client renders an unknown `agent_message_retraction` as the text `<retracted>` | the test fails with `the sky is grenn<retracted>...`, so it detects fabrication |
+
+Restored state: `hub.test.ts`, `acp/client.test.ts`, `ops-publish.e2e.test.ts` and
+`discord/watch.test.ts` are 49 of 49 green, and `git status` is clean.
+
+Coverage of the 429 path after this pass:
+
+- `ops publish`: proven by the stub test, and proven sensitive by the mutation above.
+- `ops follow`: `ops-follow.e2e.test.ts` now drives a real 429 through the Jcode follow
+  path. Observed: exactly one POST, exit code non-zero, no `sent` line, 29 s. Its
+  sensitivity rests on the same guarded construction as publish and on the assertion
+  that the process must exit; it was not separately mutated to avoid a ten-minute run.
+- Native mirror: `discord/watch.test.ts` covers a 429 leaving the cursor unadvanced.
+- `ops discord view`: uses the same guarded client; not separately 429-tested.
+
+The AC12 probe was reproduced on jcode 0.99.1: 14 `agent_message_chunk` updates plus
+`available_commands_update` and `usage_update`, and no correction kind.
