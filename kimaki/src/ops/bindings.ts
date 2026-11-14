@@ -18,8 +18,178 @@ export type BindSurfaceInput = {
   mode?: string
 }
 
+// Versioned, metadata-only backup. Rows carry identity, generations and route
+// ownership; they never carry control or publication authority.
+export type BindingBackup = {
+  version: 1
+  exportedAt: number
+  rows: SurfaceBinding[]
+}
+
+export type ImportBindingsResult = {
+  imported: number
+  skipped: number
+}
+
+// Every stored column participates: a row is "identical" only when all of them match.
+const BINDING_FIELDS = [
+  'id', 'host_id', 'endpoint_id', 'backend_kind', 'native_session_id',
+  'service_kind', 'tenant_id', 'surface_id', 'mode', 'publication_policy',
+  'state', 'generation', 'idempotency_key', 'created_at',
+] as const satisfies readonly (keyof SurfaceBinding)[]
+
+const IDENTIFIER_FIELDS = [
+  'id', 'host_id', 'endpoint_id', 'backend_kind', 'native_session_id',
+  'service_kind', 'tenant_id', 'surface_id', 'idempotency_key',
+] as const satisfies readonly (keyof SurfaceBinding)[]
+
 function validIdentifiers(values: unknown[]): boolean {
   return values.every((value) => typeof value === 'string' && value.trim().length > 0 && value.length <= 2048 && !value.includes('\0'))
+}
+
+function sameBinding(left: SurfaceBinding, right: SurfaceBinding): boolean {
+  return BINDING_FIELDS.every((field) => left[field] === right[field])
+}
+
+// Rebuilds a row field by field so unknown properties in an untrusted backup can
+// never reach the insert, and rejects values that would widen authority.
+function validateBackupRow(value: unknown): SurfaceBinding | ConfigError {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return new ConfigError({ reason: 'Every backup row must be an object' })
+  }
+  const row = value as Record<string, unknown>
+  const label = typeof row['id'] === 'string' && row['id'].trim() ? `Backup row ${row['id']}` : 'Every backup row'
+  for (const field of IDENTIFIER_FIELDS) {
+    if (!validIdentifiers([row[field]])) {
+      return new ConfigError({ reason: `${label} must have a nonblank ${field} of at most 2048 characters` })
+    }
+  }
+  if (row['mode'] !== 'observe') {
+    return new ConfigError({ reason: `${label} has mode ${String(row['mode'])}. Only metadata-only observe bindings can be restored` })
+  }
+  if (row['publication_policy'] !== 'none') {
+    return new ConfigError({ reason: `${label} has publication policy ${String(row['publication_policy'])}. Restored bindings cannot publish transcripts` })
+  }
+  if (row['state'] !== 'active' && row['state'] !== 'detached') {
+    return new ConfigError({ reason: `${label} has state ${String(row['state'])}. Only active or detached bindings can be restored` })
+  }
+  if (typeof row['generation'] !== 'number' || !Number.isSafeInteger(row['generation']) || row['generation'] <= 0) {
+    return new ConfigError({ reason: `${label} must have a positive integer generation` })
+  }
+  if (typeof row['created_at'] !== 'number' || !Number.isFinite(row['created_at']) || !Number.isSafeInteger(row['created_at']) || row['created_at'] < 0) {
+    return new ConfigError({ reason: `${label} must have a finite creation timestamp` })
+  }
+  return {
+    id: row['id'] as string,
+    host_id: row['host_id'] as string,
+    endpoint_id: row['endpoint_id'] as string,
+    backend_kind: row['backend_kind'] as string,
+    native_session_id: row['native_session_id'] as string,
+    service_kind: row['service_kind'] as string,
+    tenant_id: row['tenant_id'] as string,
+    surface_id: row['surface_id'] as string,
+    mode: row['mode'],
+    publication_policy: row['publication_policy'],
+    state: row['state'],
+    generation: row['generation'],
+    idempotency_key: row['idempotency_key'] as string,
+    created_at: row['created_at'],
+  }
+}
+
+export async function exportBindings({ db, tenantId, serviceKind }: {
+  db: KimakiDb
+  tenantId?: string
+  serviceKind?: string
+}): Promise<BindingBackup | ConfigError | DbError> {
+  const supplied = [tenantId, serviceKind].filter((value) => value !== undefined)
+  if (!validIdentifiers(supplied)) return new ConfigError({ reason: 'Supply nonblank --tenant and service IDs when scoping a backup' })
+  const conditions: orm.SQL[] = []
+  if (tenantId !== undefined) conditions.push(orm.eq(bindings.tenant_id, tenantId))
+  if (serviceKind !== undefined) conditions.push(orm.eq(bindings.service_kind, serviceKind))
+  const rows = await db.select().from(bindings)
+    .where(conditions.length > 0 ? orm.and(...conditions) : undefined)
+    .orderBy(orm.asc(bindings.created_at), orm.asc(bindings.id))
+    .catch((cause) => new DbError({ operation: 'export metadata bindings', cause }))
+  if (rows instanceof Error) return rows
+  return { version: 1, exportedAt: Date.now(), rows }
+}
+
+// Restore is atomic: validation happens before the transaction, and any same-id
+// difference or unique-index collision aborts the transaction before commit.
+export async function importBindings({ db, backup }: {
+  db: KimakiDb
+  backup: unknown
+}): Promise<ImportBindingsResult | ConfigError | DbError> {
+  if (typeof backup !== 'object' || backup === null || Array.isArray(backup)) {
+    return new ConfigError({ reason: 'Backup must be a versioned binding backup object' })
+  }
+  const envelope = backup as Record<string, unknown>
+  if (envelope['version'] !== 1) {
+    return new ConfigError({ reason: `Unsupported binding backup version ${String(envelope['version'])}. Only version 1 can be restored` })
+  }
+  if (typeof envelope['exportedAt'] !== 'number' || !Number.isFinite(envelope['exportedAt'])) {
+    return new ConfigError({ reason: 'Backup exportedAt must be a finite timestamp' })
+  }
+  if (!Array.isArray(envelope['rows'])) return new ConfigError({ reason: 'Backup rows must be an array' })
+
+  const rows: SurfaceBinding[] = []
+  const seen = new Map<string, SurfaceBinding>()
+  for (const value of envelope['rows']) {
+    const row = validateBackupRow(value)
+    if (row instanceof Error) return row
+    const earlier = seen.get(row.id)
+    if (earlier && !sameBinding(earlier, row)) {
+      return new ConfigError({ reason: `Backup contains conflicting rows with id ${row.id}` })
+    }
+    if (!earlier) seen.set(row.id, row)
+    rows.push(row)
+  }
+
+  return db.transaction(async (tx) => {
+    let imported = 0
+    let skipped = 0
+    for (const row of rows) {
+      const existing = await tx.select().from(bindings).where(orm.eq(bindings.id, row.id)).limit(1)
+      const current = existing[0]
+      if (current) {
+        if (sameBinding(current, row)) {
+          skipped += 1
+          continue
+        }
+        throw new ConfigError({ reason: `Binding ${row.id} already exists with different state, generation, route or request ID. Restore into a clean database instead of overwriting it` })
+      }
+      const keyed = await tx.select().from(bindings).where(orm.and(
+        orm.eq(bindings.service_kind, row.service_kind),
+        orm.eq(bindings.tenant_id, row.tenant_id),
+        orm.eq(bindings.idempotency_key, row.idempotency_key),
+      )).limit(1)
+      if (keyed[0]) {
+        throw new ConfigError({ reason: `Binding ${row.id} would collide with request ID ${row.idempotency_key} in tenant ${row.tenant_id}` })
+      }
+      if (row.state === 'active') {
+        const occupied = await tx.select().from(bindings).where(orm.and(
+          orm.eq(bindings.service_kind, row.service_kind),
+          orm.eq(bindings.tenant_id, row.tenant_id),
+          orm.eq(bindings.surface_id, row.surface_id),
+          orm.eq(bindings.state, 'active'),
+        )).limit(1)
+        if (occupied[0]) {
+          throw new ConfigError({ reason: `Binding ${row.id} would collide with the active binding of surface ${row.surface_id} in tenant ${row.tenant_id}` })
+        }
+      }
+      try {
+        await tx.insert(bindings).values(row)
+      } catch (cause) {
+        if (cause instanceof Error && /UNIQUE constraint failed/i.test(cause.message)) {
+          throw new ConfigError({ reason: `Binding ${row.id} collides with an existing unique binding index. Restore into a clean database instead of partially importing` })
+        }
+        throw cause
+      }
+      imported += 1
+    }
+    return { imported, skipped }
+  }).catch((cause) => cause instanceof ConfigError ? cause : new DbError({ operation: 'restore metadata bindings', cause }))
 }
 
 export async function bindSurface(input: BindSurfaceInput): Promise<SurfaceBinding | ConfigError | DbError> {
