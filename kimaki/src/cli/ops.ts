@@ -8,6 +8,14 @@ function required(value: string | undefined, flag: string): string {
   return value
 }
 
+// An explicit approval policy is opt-in: without it the client keeps refusing
+// server-initiated approval requests, so nothing is granted by default.
+function approvalDecision(value: string | undefined): 'accept' | 'acceptForSession' | 'decline' | 'cancel' | undefined {
+  if (value === undefined) return undefined
+  if (value === 'accept' || value === 'acceptForSession' || value === 'decline' || value === 'cancel') return value
+  return fail(new ConfigError({ reason: '--approval must be accept, acceptForSession, decline or cancel' }))
+}
+
 export function registerOpsCommands(cli: Goke) {
   cli.command('ops codex turn', 'Run one explicit Codex app-server turn and stream text deltas')
     .option('--binary <path>', 'Explicit Codex executable')
@@ -17,6 +25,7 @@ export function registerOpsCommands(cli: Goke) {
     .option('--timeout-ms <n>', 'Request and turn timeout in milliseconds')
     .option('--cancel-after <ms>', 'Interrupt the turn after this many milliseconds')
     .option('--thread <id>', 'Send this turn on an existing thread instead of starting one')
+    .option('--approval <decision>', 'Answer approval requests: accept, acceptForSession, decline or cancel (default: refuse them)')
     .action(async (options) => {
       const binary = required(options.binary, 'binary')
       const codexHome = required(options.codexHome, 'codex-home')
@@ -25,12 +34,34 @@ export function registerOpsCommands(cli: Goke) {
       if (timeoutMs !== undefined && (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1)) fail(new ConfigError({ reason: '--timeout-ms must be a positive integer' }))
       const cancelAfter = options.cancelAfter === undefined ? undefined : Number(options.cancelAfter)
       if (cancelAfter !== undefined && (!Number.isSafeInteger(cancelAfter) || cancelAfter < 1)) fail(new ConfigError({ reason: '--cancel-after must be a positive integer in milliseconds' }))
+      const approval = approvalDecision(options.approval)
       const { startCodexAppServer } = await import('../ops/runtime/codex-app-server.ts')
       const { createCodexController } = await import('../ops/runtime/codex.ts')
-      const server = await startCodexAppServer({ binary, codexHome, timeoutMs })
+      const server = await startCodexAppServer({ binary, codexHome, timeoutMs, holdServerRequests: approval !== undefined })
       if (server instanceof Error) fail(server)
       try {
-        const controller = createCodexController({ hostId: 'local', endpointId: 'explicit-app-server', request: server.request, subscribe: server.subscribe, timeoutMs, turnTimeoutMs: timeoutMs })
+        const controller = createCodexController({
+          hostId: 'local',
+          endpointId: 'explicit-app-server',
+          request: server.request,
+          subscribe: server.subscribe,
+          timeoutMs,
+          turnTimeoutMs: timeoutMs,
+          ...(approval === undefined ? {} : {
+            serverRequests: { result: server.respond, error: server.respondError },
+            approvals: {
+              policy: () => approval,
+              onRequest: (request: { requestId: number; method: string; command: string | null; reason: string | null }) => printJson({
+                kind: 'approval-request',
+                requestId: request.requestId,
+                method: request.method,
+                command: request.command,
+                reason: request.reason,
+                decision: approval,
+              }),
+            },
+          }),
+        })
         if (controller instanceof Error) fail(controller)
         try {
           const started = options.thread === undefined
@@ -501,17 +532,27 @@ export function registerOpsCommands(cli: Goke) {
 
       // Give the subscription a moment to register before prompting.
       await new Promise((resolve) => setTimeout(resolve, 200))
+      // `openHubStream` resolves an Error when the hub refuses the attachment (for
+      // example a cursor ahead of the stream). Ignoring it made a refused attach look
+      // like a successful empty replay.
+      const settled = async (): Promise<void> => {
+        const result = await attach
+        if (result instanceof Error) {
+          clearTimeout(deadline)
+          fail(result)
+        }
+      }
       const watch = options.watch === undefined ? undefined : Number(options.watch)
       if (watch !== undefined && (!Number.isSafeInteger(watch) || watch < 1)) {
         controller.abort()
-        await attach
+        await settled()
         clearTimeout(deadline)
         fail(new ConfigError({ reason: '--watch must be a positive integer in milliseconds' }))
       }
       if (options.prompt === undefined && watch === undefined) {
         // Nothing to wait for: report the hub state and detach.
         controller.abort()
-        await attach
+        await settled()
         clearTimeout(deadline)
         // `ready` carries the hub's own statement about whether the replay is
         // complete, so a caller never has to infer it from the event list.
@@ -524,7 +565,7 @@ export function registerOpsCommands(cli: Goke) {
         const submitted = await promptHub({ baseUrl: url, text: options.prompt, requestId: options.requestId })
         if (submitted instanceof Error) {
           controller.abort()
-          await attach
+          await settled()
           clearTimeout(deadline)
           fail(submitted)
         }
@@ -543,7 +584,7 @@ export function registerOpsCommands(cli: Goke) {
         const result = await ackHub({ baseUrl: url, clientId: options.client, seq: lastSeq })
         if (result instanceof Error) {
           controller.abort()
-          await attach
+          await settled()
           clearTimeout(deadline)
           fail(result)
         }
@@ -551,7 +592,7 @@ export function registerOpsCommands(cli: Goke) {
       }
 
       controller.abort()
-      await attach
+      await settled()
       clearTimeout(deadline)
 
       if (options.json) {
@@ -653,6 +694,7 @@ export function registerOpsCommands(cli: Goke) {
     .option('--token <token>', 'Optional shared token required in the x-kimaki-hub header')
     .option('--log <path>', 'Append-only JSONL event log; enables resume across restarts and takes a writer lease')
     .option('--timeout-ms <n>', 'Request and turn timeout in milliseconds')
+    .option('--approval <decision>', 'Answer approval requests on the served thread: accept, acceptForSession, decline or cancel')
     .action(async (options) => {
       const binary = required(options.binary, 'binary')
       const codexHome = required(options.codexHome, 'codex-home')
@@ -661,14 +703,36 @@ export function registerOpsCommands(cli: Goke) {
       if (!Number.isSafeInteger(port) || port < 0 || port > 65535) fail(new ConfigError({ reason: '--port must be an integer between 0 and 65535' }))
       const timeoutMs = options.timeoutMs === undefined ? undefined : Number(options.timeoutMs)
       if (timeoutMs !== undefined && (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1)) fail(new ConfigError({ reason: '--timeout-ms must be a positive integer' }))
+      const approval = approvalDecision(options.approval)
       const { startCodexAppServer } = await import('../ops/runtime/codex-app-server.ts')
       const { createCodexController } = await import('../ops/runtime/codex.ts')
       const { createCodexHubBackend } = await import('../ops/runtime/codex-hub.ts')
       const { createSessionHub } = await import('../backend/hub.ts')
       const { startHubServer } = await import('../backend/hub-server.ts')
-      const server = await startCodexAppServer({ binary, codexHome, timeoutMs })
+      const server = await startCodexAppServer({ binary, codexHome, timeoutMs, holdServerRequests: approval !== undefined })
       if (server instanceof Error) fail(server)
-      const controller = createCodexController({ hostId: 'local', endpointId: 'explicit-app-server', request: server.request, subscribe: server.subscribe, timeoutMs, turnTimeoutMs: timeoutMs })
+      const controller = createCodexController({
+        hostId: 'local',
+        endpointId: 'explicit-app-server',
+        request: server.request,
+        subscribe: server.subscribe,
+        timeoutMs,
+        turnTimeoutMs: timeoutMs,
+        ...(approval === undefined ? {} : {
+          serverRequests: { result: server.respond, error: server.respondError },
+          approvals: {
+            policy: () => approval,
+            onRequest: (request: { requestId: number; method: string; command: string | null; reason: string | null }) => printJson({
+              kind: 'approval-request',
+              requestId: request.requestId,
+              method: request.method,
+              command: request.command,
+              reason: request.reason,
+              decision: approval,
+            }),
+          },
+        }),
+      })
       if (controller instanceof Error) {
         await server.close()
         fail(controller)
