@@ -299,4 +299,44 @@ export function registerOpsCommands(cli: Goke) {
       if (result instanceof Error) fail(result)
       printJson(result)
     })
+
+  cli.command('ops jcode run', 'Run one prompt through the Jcode backend over ACP and stream its text')
+    .option('--cwd <path>', 'Working directory for the Jcode ACP session')
+    .option('--prompt <text>', 'Prompt text sent as one ACP session/prompt')
+    .option('--binary <path>', 'Jcode executable (default: jcode)')
+    .option('--model <id>', 'Model selected for the ACP session instead of the agent default')
+    .option('--tool-profile <kind>', 'Jcode tool profile: none (default), minimal or full')
+    .option('--timeout <ms>', 'Per-request ACP deadline in milliseconds')
+    .option('--json', 'Print the final summary as JSON')
+    .action(async (options) => {
+      const cwd = required(options.cwd, 'cwd')
+      const prompt = required(options.prompt, 'prompt')
+      const model = options.model?.trim() ? options.model : undefined
+      const toolProfile = options.toolProfile ?? 'none'
+      if (!['none', 'minimal', 'full'].includes(toolProfile)) fail(new ConfigError({ reason: 'Supply --tool-profile none, minimal or full' }))
+      const timeoutMs = options.timeout === undefined ? undefined : Number(options.timeout)
+      if (timeoutMs !== undefined && (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1)) fail(new ConfigError({ reason: '--timeout must be a positive integer in milliseconds' }))
+      const { createJcodeBackend } = await import('../backend/jcode.ts')
+      const backend = createJcodeBackend({ binary: options.binary ?? 'jcode', cwd, model, toolProfile: toolProfile as 'none' | 'minimal' | 'full', timeoutMs })
+      const started = await backend.start()
+      if (started instanceof Error) {
+        await backend.close()
+        fail(started)
+      }
+      // With --json the summary owns stdout, so streamed chunks are suppressed
+      // rather than glued in front of the document.
+      const stream = options.json === true ? undefined : (text: string) => { process.stdout.write(text) }
+      const result = await backend.prompt(prompt, stream)
+      await backend.close()
+      if (result instanceof Error) fail(result)
+      if (options.json) printJson({
+        sessionId: started.sessionId,
+        model: started.model,
+        stopReason: result.stopReason,
+        updateCount: result.updateCount,
+        characters: result.text.length,
+        ...(result.usage === undefined ? {} : { usage: result.usage }),
+      })
+      else process.stdout.write(`\n${result.stopReason}\n`)
+    })
 }
