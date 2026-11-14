@@ -530,4 +530,44 @@ export function registerOpsCommands(cli: Goke) {
       }
       if (outcome.error !== undefined) fail(new ConfigError({ reason: outcome.error }))
     })
+
+  cli.command('ops discord view', 'Mirror one hub session into a Discord channel, resuming from a durable cursor')
+    .option('--url <url>', 'Explicit hub URL, as printed by ops jcode serve')
+    .option('--tenant <id>', 'Guild id the channel must belong to')
+    .option('--surface <id>', 'Channel id to post turns into')
+    .option('--token <token>', 'Bot token (default: KIMAKI_BOT_TOKEN)')
+    .option('--state <path>', 'Durable cursor file; a restart posts nothing twice')
+    .option('--client <id>', 'Client identity to register in hub presence (default: discord-view)')
+    .option('--cursor <n>', 'Start from this cursor when the state file is missing')
+    .option('--timeout <ms>', 'Maximum viewing duration in milliseconds (default: 0, unbounded)')
+    .action(async (options) => {
+      const url = required(options.url, 'url')
+      const tenant = required(options.tenant, 'tenant')
+      const surface = required(options.surface, 'surface')
+      const token = required(options.token ?? process.env['KIMAKI_BOT_TOKEN'], 'token')
+      const statePath = required(options.state, 'state')
+      const cursor = options.cursor === undefined ? undefined : Number(options.cursor)
+      if (cursor !== undefined && (!Number.isSafeInteger(cursor) || cursor < 0)) fail(new ConfigError({ reason: '--cursor must be a non-negative integer' }))
+      const timeout = options.timeout === undefined ? 0 : Number(options.timeout)
+      if (!Number.isSafeInteger(timeout) || timeout < 0) fail(new ConfigError({ reason: '--timeout must be zero or a positive integer in milliseconds' }))
+      const { REST } = await import('discord.js')
+      const { openDiscordView } = await import('../ops/discord/view.ts')
+      const rest = new REST({ ...(process.env['KIMAKI_DISCORD_REST_URL'] ? { api: process.env['KIMAKI_DISCORD_REST_URL'] } : {}), version: '10', rejectOnRateLimit: () => true }).setToken(token)
+      const controller = new AbortController()
+      const deadline = timeout === 0 ? null : setTimeout(() => controller.abort(), timeout)
+      const failure = await openDiscordView({
+        rest,
+        tenantId: tenant,
+        channelId: surface,
+        clientId: options.client ?? 'discord-view',
+        cursor,
+        statePath,
+        baseUrl: url,
+        signal: controller.signal,
+        onPosted: (seq) => printJson({ kind: 'posted', seq }),
+      })
+      if (deadline) clearTimeout(deadline)
+      if (failure instanceof Error) fail(failure)
+      printJson({ kind: 'closed' })
+    })
 }
