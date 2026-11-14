@@ -113,7 +113,7 @@ test.skipIf(!ENABLED)('fans one real jcode turn out to two clients', async () =>
     expect(posted.status, `prompt refused: ${stderr}`).toBe(202)
     expect(await posted.json()).toEqual({ accepted: true, characters: PROMPT.length })
 
-    const [first, second] = await Promise.all(streams)
+    const [first, second] = (await Promise.all(streams)) as [Awaited<ReturnType<typeof collect>>, Awaited<ReturnType<typeof collect>>]
     for (const stream of [first, second]) {
       expect(stream.ready, `${stream.client} never got a ready frame`).toMatchObject({ cursor: 0, clipped: false })
       const types = stream.events.map((event) => event.type)
@@ -140,3 +140,52 @@ test.skipIf(!ENABLED)('fans one real jcode turn out to two clients', async () =>
 test.skipIf(ENABLED)('stays dormant without the opt-in flag', () => {
   expect(process.env['KIMAKI_JCODE_HUB_E2E']).not.toBe('1')
 })
+
+// A durable hub keeps its stream across a restart: the sequence, the session it
+// recorded, and the events a client already saw are all readable again from the
+// log, without replaying the turn or prompting the agent.
+test.skipIf(!ENABLED)('resumes the same stream after the hub restarts', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'kimaki-jcode-hub-restart-'))
+  const logFile = path.join(dir, 'events.jsonl')
+  const startServe = () =>
+    spawn(
+      process.execPath,
+      ['--import', 'tsx', CLI, 'ops', 'jcode', 'serve', '--cwd', dir, '--model', MODEL, '--log', logFile, '--timeout', '180000'],
+      { cwd: PACKAGE_ROOT, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true },
+    )
+  let current: ChildProcess | undefined
+  try {
+    current = startServe()
+    const firstUrl = await waitForUrl(current)
+    const firstStream = collect(firstUrl, 'first-run')
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    const posted = await fetch(`${firstUrl}/prompt`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ text: PROMPT }),
+    })
+    expect(posted.status).toBe(202)
+    const firstTurn = await firstStream
+    expect(firstTurn.events.map((event) => event.seq)).toEqual([1, 2, 3, 4])
+    const beforeRestart = (await (await fetch(`${firstUrl}/state`)).json()) as { sessionId: unknown; seq: unknown; durable: unknown }
+    expect(beforeRestart).toMatchObject({ durable: true, seq: 4 })
+    expect(beforeRestart.sessionId).toEqual(expect.any(String))
+
+    killTree(current)
+    await new Promise((resolve) => setTimeout(resolve, 500))
+
+    current = startServe()
+    const secondUrl = await waitForUrl(current)
+    const afterRestart = (await (await fetch(`${secondUrl}/state`)).json()) as { sessionId: unknown; seq: unknown; durable: unknown; busy: unknown }
+    expect(afterRestart).toMatchObject({ durable: true, seq: 4, busy: false })
+    // The log carries the session identity forward rather than inventing a new one.
+    expect(afterRestart.sessionId).toBe(beforeRestart.sessionId)
+
+    const replayed = await collect(secondUrl, 'after-restart')
+    expect(replayed.events.map((event) => event.seq)).toEqual([1, 2, 3, 4])
+    expect(replayed.ready).toMatchObject({ cursor: 0, clipped: false })
+  } finally {
+    if (current !== undefined) killTree(current)
+    await removeTempDirs([dir])
+  }
+}, 240_000)

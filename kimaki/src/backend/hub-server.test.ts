@@ -99,7 +99,7 @@ describe('startHubServer', () => {
     expect(await posted.json()).toEqual({ accepted: true, characters: 5 })
 
     for (const result of [await first, await second]) {
-      expect(result.ready).toEqual({ cursor: 0, clipped: false })
+      expect(result.ready).toMatchObject({ cursor: 0, clipped: false, source: 'none' })
       expect(result.events.map((event) => event.type)).toEqual([
         'session.started',
         'prompt.started',

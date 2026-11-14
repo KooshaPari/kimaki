@@ -1,3 +1,6 @@
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { createSessionHub, type HubBackend, type HubEvent } from './hub.ts'
 
@@ -191,5 +194,106 @@ describe('createSessionHub', () => {
       'prompt.finished',
     ])
     expect(hub.snapshot().subscribers).toBe(1)
+  })
+
+  it('appends a durable log and restores sequence and session after restart', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-hub-log-'))
+    const logFile = path.join(dir, 'events.jsonl')
+    try {
+      const first = createSessionHub({ backend: fakeBackend().backend, logFile })
+      if (first instanceof Error) throw first
+      await first.submit('hello')
+      await wait(10)
+      expect(first.snapshot()).toMatchObject({ seq: 4, durable: true, sessionId: 'session-1' })
+      const lines = fs.readFileSync(logFile, 'utf8').trim().split('\n')
+      expect(lines).toHaveLength(4)
+      expect(JSON.parse(lines[3]!)).toMatchObject({ seq: 4, type: 'prompt.finished' })
+      await first.close()
+
+      // A second hub on the same log continues the sequence and keeps the session.
+      const second = createSessionHub({ backend: fakeBackend().backend, logFile })
+      if (second instanceof Error) throw second
+      expect(second.snapshot()).toMatchObject({ seq: 4, sessionId: 'session-1', model: null, durable: true })
+      const replayed: HubEvent[] = []
+      const subscription = second.subscribe({ cursor: 0, onEvent: (event) => replayed.push(event) })
+      if (subscription instanceof Error) throw subscription
+      expect(replayed.map((event) => event.seq)).toEqual([1, 2, 3, 4])
+      expect(subscription.clipped).toBe(false)
+      await second.close()
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('replays from the log when the cursor predates the buffer', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-hub-log-replay-'))
+    const logFile = path.join(dir, 'events.jsonl')
+    try {
+      const hub = createSessionHub({ backend: fakeBackend().backend, logFile, bufferLimit: 2 })
+      if (hub instanceof Error) throw hub
+      await hub.submit('hello')
+      await wait(10)
+      const seen: HubEvent[] = []
+      const subscription = hub.subscribe({ cursor: 0, onEvent: (event) => seen.push(event) })
+      if (subscription instanceof Error) throw subscription
+      expect(subscription.clipped).toBe(false)
+      expect(subscription.source).toBe('log')
+      expect(seen.map((event) => event.seq)).toEqual([1, 2, 3, 4])
+      await hub.close()
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('tolerates a corrupt log line instead of failing the replay', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-hub-log-corrupt-'))
+    const logFile = path.join(dir, 'events.jsonl')
+    try {
+      fs.writeFileSync(logFile, `${JSON.stringify({ seq: 1, type: 'prompt.started', characters: 5 })}\n{not json}\n`)
+      const hub = createSessionHub({ backend: fakeBackend().backend, logFile })
+      if (hub instanceof Error) throw hub
+      expect(hub.snapshot().seq).toBe(1)
+      const seen: HubEvent[] = []
+      hub.subscribe({ cursor: 0, onEvent: (event) => seen.push(event) })
+      expect(seen.map((event) => event.seq)).toEqual([1])
+      await hub.close()
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('refuses a second hub while the lease is held, then allows it after release', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-hub-lease-'))
+    const logFile = path.join(dir, 'events.jsonl')
+    try {
+      const first = createSessionHub({ backend: fakeBackend().backend, logFile })
+      if (first instanceof Error) throw first
+      const blocked = createSessionHub({ backend: fakeBackend().backend, logFile })
+      expect(blocked).toBeInstanceOf(Error)
+      await first.close()
+      const allowed = createSessionHub({ backend: fakeBackend().backend, logFile })
+      expect(allowed).not.toBeInstanceOf(Error)
+      if (allowed instanceof Error) throw allowed
+      await allowed.close()
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('takes over a lease left behind by a dead process', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-hub-stale-'))
+    const logFile = path.join(dir, 'events.jsonl')
+    const leaseFile = `${logFile}.lock`
+    try {
+      fs.writeFileSync(leaseFile, JSON.stringify({ pid: 999_999, startedAt: '2020-01-01T00:00:00.000Z' }))
+      const hub = createSessionHub({ backend: fakeBackend().backend, logFile })
+      expect(hub).not.toBeInstanceOf(Error)
+      if (hub instanceof Error) throw hub
+      expect(JSON.parse(fs.readFileSync(leaseFile, 'utf8'))).toMatchObject({ pid: process.pid })
+      await hub.close()
+      expect(fs.existsSync(leaseFile)).toBe(false)
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
   })
 })

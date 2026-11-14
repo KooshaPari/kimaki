@@ -271,5 +271,5 @@ The first phased increment in this note is implemented. `kimaki/src/backend/hub.
 
 Measured: two independent clients attached to one hub received an identical sequence (1 to 4) and identical assistant text for a real turn against jcode 0.99.1. Coverage: 11 hub unit tests, 6 server tests, and one opt-in real acceptance (`KIMAKI_JCODE_HUB_E2E=1`).
 
-What this increment does not change, from section 2: ordering and replay are per process, so a restarted hub loses its stream; the single writer is enforced by the hub rather than by a runtime lease; there is no delivery acknowledgement from a client beyond its cursor; and presence is just a subscriber count.
+A later increment added durability. With `--log <path>` the hub appends every event to a JSONL file, restores its sequence and session identity on restart, replays from that file when a cursor predates the in-memory window, and takes an advisory lease so a second hub refuses to write the same session. Measured: after a hard restart the hub resumed at sequence 4 with the same session id, and a fresh client replayed all four events without prompting the agent again. Still missing, from section 2: a shared broker across machines, client delivery acknowledgement beyond the cursor, and real per-client presence rather than a subscriber count.
 

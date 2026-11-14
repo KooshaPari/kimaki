@@ -347,6 +347,7 @@ export function registerOpsCommands(cli: Goke) {
     .option('--tool-profile <kind>', 'Jcode tool profile: none (default), minimal or full')
     .option('--port <n>', 'Loopback port (default: 0, an ephemeral port)')
     .option('--token <token>', 'Optional shared token required in the x-kimaki-hub header')
+    .option('--log <path>', 'Append-only JSONL event log; enables resume across restarts and takes a writer lease')
     .option('--timeout <ms>', 'Per-request ACP deadline in milliseconds')
     .action(async (options) => {
       const cwd = required(options.cwd, 'cwd')
@@ -361,7 +362,7 @@ export function registerOpsCommands(cli: Goke) {
       const { createSessionHub } = await import('../backend/hub.ts')
       const { startHubServer } = await import('../backend/hub-server.ts')
       const backend = createJcodeBackend({ binary: options.binary ?? 'jcode', cwd, model, toolProfile: toolProfile as 'none' | 'minimal' | 'full', timeoutMs })
-      const hub = createSessionHub({ backend, model })
+      const hub = createSessionHub({ backend, model, logFile: options.log })
       if (hub instanceof Error) {
         await backend.close()
         fail(hub)

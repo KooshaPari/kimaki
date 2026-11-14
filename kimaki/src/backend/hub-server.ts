@@ -74,7 +74,7 @@ export async function startHubServer({
         if (!Number.isSafeInteger(cursor) || cursor < 0) {
           return json(response, 400, { error: 'cursor must be a non-negative integer' })
         }
-        const write = (event: HubEvent): void => {
+        const writeFrame = (event: HubEvent): void => {
           response.write(`event: ${EVENT_NAME}\ndata: ${JSON.stringify(event)}\n\n`)
         }
         response.writeHead(200, {
@@ -82,13 +82,26 @@ export async function startHubServer({
           'cache-control': 'no-cache',
           connection: 'keep-alive',
         })
-        const subscription = hub.subscribe({ cursor, onEvent: write })
+        // The hub replays synchronously inside subscribe, so hold replayed events
+        // until the ready frame is out. Otherwise a client cannot tell whether its
+        // replay was clipped until after it has already consumed it.
+        const pending: HubEvent[] = []
+        let readySent = false
+        const subscription = hub.subscribe({
+          cursor,
+          onEvent: (event) => {
+            if (readySent) writeFrame(event)
+            else pending.push(event)
+          },
+        })
         if (subscription instanceof Error) {
           return json(response, 400, { error: subscription.message })
         }
         clients.add(response)
-        // Tell the client where it resumed from and whether events were lost.
-        response.write(`event: ready\ndata: ${JSON.stringify({ cursor, clipped: subscription.clipped })}\n\n`)
+        readySent = true
+        response.write(`event: ready\ndata: ${JSON.stringify({ cursor, clipped: subscription.clipped, source: subscription.source })}\n\n`)
+        for (const event of pending) writeFrame(event)
+        pending.length = 0
         const cleanup = (): void => {
           subscription.unsubscribe()
           clients.delete(response)
