@@ -65,6 +65,27 @@ describe('reconcileDiscovery', () => {
     })
   })
 
+  test('AC01: compares counts even when the inventory has no pid metadata', () => {
+    const withoutProcesses = reconcileDiscovery({
+      inventory: inventory([
+        { sessionId: 'opencode-session', process: null },
+        { sessionId: 'codex-thread', process: null },
+        { sessionId: 'jcode-session', process: null },
+      ]),
+      snapshot: table([identity(11), identity(12)]),
+    })
+    expect(withoutProcesses).toMatchObject({
+      inventory: { count: 3 },
+      oracle: { count: 2 },
+      countsAgree: false,
+      reconciled: false,
+    })
+    // Every identity remains unknown: a count mismatch is visible, but the
+    // missing per-session pid is never invented to make the numbers match.
+    expect(withoutProcesses instanceof Error ? [] : withoutProcesses.matches.map((match) => match.kind))
+      .toEqual(['unknown', 'unknown', 'unknown'])
+  })
+
   test('reports an observable process that no inventory entry claims', () => {
     const result = reconcileDiscovery({
       inventory: inventory([{ sessionId: 'jcode-session', process: identity(101) }]),
