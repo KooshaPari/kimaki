@@ -13,11 +13,11 @@ Checksums from the bundle's own `SHA256SUMS.txt`: 7 of 7 documents match.
 | Status | Cases |
 | --- | --- |
 | Closed at the plan's standard | 10 |
-| Partial | 14 |
-| Not started | 16 |
+| Partial | 16 |
+| Not started | 14 |
 | Total | 40 |
 
-AC03, AC04, AC06, AC07, AC13, AC14, AC17, AC18, AC23 and AC25 are closed. Every other case still lacks both a real native surface and a live service path in the same piece of evidence, which is the standard the plan sets. AC18 closed when a real Codex 0.169 app-server raised an approval request and the client's answer changed what the runtime executed. AC19 is partial: a payload digest pins an answer to the artifact the caller read, but fileChange content is not covered and no real-binary digest witness exists. AC20 is partial: a stub 401 and an emptied token fail closed, but no live Discord credential was revoked.
+AC03, AC04, AC06, AC07, AC13, AC14, AC17, AC18, AC23 and AC25 are closed. Every other case still lacks both a real native surface and a live service path in the same piece of evidence, which is the standard the plan sets. AC18 closed when a real Codex 0.169 app-server raised an approval request and the client's answer changed what the runtime executed. AC19 is partial: a payload digest pins an answer to the artifact the caller read, but fileChange content is not covered and no real-binary digest witness exists. AC20 is partial: a stub 401 and an emptied token fail closed, but no live Discord credential was revoked. AC33 is partial: a local JSON backup restores binding ids, generations, state and route ownership, but not an external store or a live cutover. AC38 is partial: the view guard is proven against a live session change from a fake hub, not a real `createSessionHub` rebind path.
 
 ## Acceptance cases
 
@@ -55,13 +55,13 @@ AC03, AC04, AC06, AC07, AC13, AC14, AC17, AC18, AC23 and AC25 are closed. Every 
 | AC30 | Explicit enrollment | not started | no explicit enrollment record |
 | AC31 | Task done without engineering proof | not started | AgilePlus acceptance is outside this repository |
 | AC32 | Engineering done without product proof | not started | Tracera acceptance is outside this repository |
-| AC33 | Backup restore | not started | no backup/restore case for ids, cursors or route ownership |
+| AC33 | Backup restore | partial | `exportBindings` writes a versioned metadata-only JSON backup; `importBindings` restores ids, generations, states, created_at and route ownership in one transaction, skips byte-identical rows, and refuses same-id differences or active-surface/idempotency collisions without partial writes. 17 real-libSQL tests pass, `tsc` clean, commit `58cd9136`. The backup is a local JSON file, not an external object store; bindings carry no cursor, and no live route cutover is exercised |
 | AC34 | Actual connector cutover | not started | no real connector cutover and no competing-consumer pause proof |
 | AC35 | Clean restart | partial | hub restart from a stopped state is verified; the full bot stack restart is not |
 | AC36 | Host/platform difference | partial | all evidence is Windows-only and no Linux success is claimed |
 | AC37 | Persisted session mistaken for live | partial | real CLI run over a temp Jcode home: the persisted session was discovered with its title, message bodies never appeared, the home's file hashes and mtimes were unchanged after discovery, a missing home failed instead of inventing sessions, and unit tests show the observer exposes only read operations. The concurrent revival race is not exercised |
-| AC38 | Rebind during activity | not started | no rebind-during-activity case |
-| AC39 | KCode reporter says jcode | not started | KCode identity is not implemented or tested |
+| AC38 | Rebind during activity | partial | A view live on session A posts A's turn, then a fake hub emits `session.started` for B and a full B turn. The view returns a ConfigError naming both sessions, aborts, posts no B message, and leaves the cursor on A/4; a repeated `session.started` for A still posts A's turn once. 13 view tests pass, `tsc` clean, commit `2e0ff50d`. The event source is a local fake hub because `createSessionHub` has no rebind path, so the live-service half is not exercised |
+| AC39 | KCode reporter says jcode | not started | Design only: KCode is the KooshaPari/KCode fork of Jcode, with its own executable (`w6-install\bin\kcode.exe`), store (`~/.kcode`) and `KCODE_*` environment, but the same ACP surface. AC39 is a negative requirement: the KCode reporter claims `jcode`, and kimaki must resolve executable/store/socket and refuse rather than route by that label. Minimal surface: RuntimeProfile plus provenance, de-hardcoding in `ops/runtime/jcode.ts`, `--profile`/`--binary`, handshake verification, publication-label decision. Blockers: notice wording, profile-vs-family `backendKind` with binding relabel, unmeasured KCode ACP handshake, missing profile-to-executable registry, ACP-only versus SDK/socket scope |
 | AC40 | Collector outage | not started | no collector-outage or source-health case |
 
 ## Work packages
@@ -76,7 +76,7 @@ AC03, AC04, AC06, AC07, AC13, AC14, AC17, AC18, AC23 and AC25 are closed. Every 
 | WP5 | JCode/KCode adapters | partial | ACP backend, CLI, hub, durable stream, presence, ack and a Discord view of a live session verified; KCode identity absent and Jcode exposes no retraction or correction surface |
 | WP6 | Paperclip plugin and runtime adapter | partial | run metadata read and a local-command managed run; no entity projection or enrollment, model-backed run blocked |
 | WP7 | Discord comparison and route ownership | partial | consent-gated metadata publication, a live channel view of a hub session (`ops discord view`) with durable resume, and a native-session mirror (`ops jcode watch --tenant/--surface/--state`) that posted four real messages from a terminal session it did not start, with a durable index; no in-bot wiring, route ownership or cutover |
-| WP8 | Reliability and acceptance witnesses | partial | 61 backend tests plus 27 hub, 15 ACP client, 43 Codex control, 5 Codex transport, 4 Codex hub, 9 publication, 8 Discord view, 7 native mirror and 8 binding tests; three real witnesses (three clients on one jcode hub, native terminal mirrored into a channel, real Codex thread served and mirrored); test-suite gate baseline recorded in `docs/release-gate-2026-11-14.md` |
+| WP8 | Reliability and acceptance witnesses | partial | 61 backend tests plus 27 hub, 15 ACP client, 43 Codex control, 5 Codex transport, 4 Codex hub, 9 publication, 13 Discord view, 7 native mirror and 17 binding tests; three real witnesses (three clients on one jcode hub, native terminal mirrored into a channel, real Codex thread served and mirrored); test-suite gate baseline recorded in `docs/release-gate-2026-11-14.md` |
 | WP9 | Migration and retirement | not started | decision matrix and rollback rehearsal only; nothing drained or retired |
 
 ## What would move the most cases
@@ -304,3 +304,16 @@ Fifth pass:
 | AC03/AC12 interop | a session kimaki itself created over ACP (`ops jcode run` reported `session_vole_...`), read back with `ops jcode history` | the load replayed `user: Reply with exactly: acp-created-session` and `agent: acp-created-session`, so observation covers kimaki's own sessions and not only sessions started by a native client |
 | AC25 watch mirror failure | `ops jcode watch --discord --emit-existing` against a stub that 429s every post | printed `Discord publish native watch message failed` and exited non-zero, and **no state file was written**, so the cursor did not advance. The same `0xC0000409` teardown abort appeared here too, which confirms the exit-abort is repo-wide on Discord REST failures rather than specific to the view's tenant check |
 | Operator trap found | the same watch command without `KIMAKI_DISCORD_REST_URL` | it reached the real Discord API with the stub token and failed `401: Unauthorized`. Expected behaviour, worth knowing: the REST URL override is an environment variable, not a flag |
+
+Backup restore and live rebind, 2026-11-14:
+
+| Case | Evidence |
+| --- | --- |
+| AC33 | `exportBindings`/`importBindings` round-trip into a fresh real libSQL DB preserves ids, generations, states, routes and timestamps; a second import is a no-op; same-id differences and active-surface/idempotency collisions refuse the whole import; malformed or authority-widening rows write nothing. 17 tests, commit `58cd9136`. Local JSON only; no external store or live cutover |
+| AC38 | A live view bound to session A fails closed when a fake hub emits `session.started` for B and a full B turn: ConfigError naming both sessions, no B post, cursor stays A/4. A repeated `session.started` for A is a resume and still posts once. 13 tests, commit `2e0ff50d`. The fake hub is used because `createSessionHub` has no rebind path |
+
+## KCode identity design (2026-11-14)
+
+KCode is the `KooshaPari/KCode` fork of the Jcode runtime: its own executable (`w6-install\bin\kcode.exe`, v0.93.398-k0.1.0-dev), store (`~/.kcode`) and `KCODE_*` environment, but the same ACP surface and `sessions/session_*.json` layout as stock `jcode.exe` v0.99.1 (`~/.jcode`). AC39 is a negative requirement, not a rename: the KCode reporter claims `jcode`, and kimaki must resolve the executable/store/socket and refuse rather than route by that label or select the stock binary. The current code fails structurally: hardcoded `'jcode'`, no provenance, `?? 'jcode'` defaults, and a discarded handshake `agentName`.
+
+The minimal surface is a `RuntimeProfile` plus observation provenance in `src/ops/contracts.ts`, de-hardcoding in `src/ops/runtime/jcode.ts`, `--profile`/`--binary` on ops commands, profile and env on the backend input, handshake verification, and a publication-label decision. Tests should cover positive profile preservation and four negative wrong-identity refusals across the observer, backend, ACP client and publication files. Blockers: Discord notice wording, profile-vs-family `backendKind` with binding relabel, the unmeasured KCode ACP handshake, a missing profile-to-executable registry, and whether the scope is ACP-only or also SDK/socket.
