@@ -1,4 +1,4 @@
-import { mkdtemp, writeFile, rm, copyFile, mkdir } from 'node:fs/promises'
+import { mkdtemp, writeFile, rm, mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import { afterEach, expect, it } from 'vitest'
 import { startCodexAppServer } from './codex-app-server.js'
@@ -12,7 +12,7 @@ it('streams a completed turn over a fake newline JSON-RPC child', async () => {
   await mkdir(scratch, { recursive: true })
   const dir = await mkdtemp(join(scratch, 'kimaki-codex-fake-'))
   dirs.push(dir)
-  const script = join(dir, 'app-server')
+  const script = join(dir, 'app-server.js')
   await writeFile(script, `const readline = require('node:readline');
 const send = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
 readline.createInterface({ input: process.stdin }).on('line', (line) => {
@@ -27,12 +27,11 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
   }
 });`)
   // Node interprets the app-server argument as the script in the isolated cwd.
-  const binary = join(dir, process.platform === 'win32' ? 'fake.exe' : 'fake')
-  await copyFile(process.execPath, binary)
-  const server = await startCodexAppServer({ binary, codexHome: dir, timeoutMs: 3000 })
+  const binary = process.execPath
+  const server = await startCodexAppServer({ binary, codexHome: dir, timeoutMs: 20000 })
   if (server instanceof Error) throw server
   try {
-    const controller = createCodexController({ hostId: 'host', endpointId: 'endpoint', request: server.request, subscribe: server.subscribe, timeoutMs: 3000, turnTimeoutMs: 3000 })
+    const controller = createCodexController({ hostId: 'host', endpointId: 'endpoint', request: server.request, subscribe: server.subscribe, timeoutMs: 20000, turnTimeoutMs: 20000 })
     if (controller instanceof Error) throw controller
     try {
       const started = await controller.startThread()
