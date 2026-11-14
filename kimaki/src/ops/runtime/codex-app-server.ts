@@ -1,4 +1,5 @@
 import childProcess from 'node:child_process'
+import fs from 'node:fs'
 import readline from 'node:readline'
 import { ConfigError } from '../../errors.js'
 
@@ -25,6 +26,11 @@ export async function startCodexAppServer({ binary, codexHome, timeoutMs = 30_00
   close: () => Promise<void>
 } | Error> {
   if (!binary.trim() || !codexHome.trim()) return new ConfigError({ reason: 'Explicit --binary and --codex-home are required' })
+  // spawn() reports a missing working directory as ENOENT on the binary, which
+  // reads as a wrong backend path. Name the real cause instead.
+  if (!fs.existsSync(codexHome) || !fs.statSync(codexHome).isDirectory()) {
+    return new ConfigError({ reason: `The --codex-home directory does not exist: ${codexHome}` })
+  }
   const child = childProcess.spawn(binary, ['app-server', '--listen', 'stdio://'], {
     cwd: codexHome,
     env: { SystemRoot: process.env.SystemRoot, PATH: process.env.PATH, CODEX_HOME: codexHome, HOME: codexHome, USERPROFILE: codexHome, APPDATA: codexHome, LOCALAPPDATA: codexHome, TEMP: codexHome, TMP: codexHome },

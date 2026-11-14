@@ -44,6 +44,16 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
   } finally { await server.close() }
 })
 
+it('names a missing codex home instead of reporting a spawn ENOENT', async () => {
+  const server = await startCodexAppServer({
+    binary: process.execPath,
+    codexHome: 'E:/koosh/Agents/scratch/codex-transport/definitely-missing-home',
+    timeoutMs: 5_000,
+  })
+  expect(server).toBeInstanceOf(Error)
+  expect((server as Error).message).toMatch(/codex-home directory does not exist/i)
+})
+
 it('answers an unhandled server request with a JSON-RPC error and still settles the turn', async () => {
   const scratch = 'E:/koosh/Agents/scratch/codex-transport'
   await mkdir(scratch, { recursive: true })
