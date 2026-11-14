@@ -22,11 +22,17 @@ beforeAll(async () => {
 afterAll(async () => { await discord?.stop() })
 
 let serial = 0
-async function fixture(fail = false, bufferLimit?: number, api?: string) {
+async function fixture(fail = false, bufferLimit?: number, api?: string, echo = false) {
   const backend: HubBackend = {
     async start() { return { sessionId: 'view-session', model: null } },
-    async prompt(_prompt, onChunk) {
+    async prompt(prompt, onChunk) {
       if (fail) return new Error('backend unavailable')
+      if (echo) {
+        // Distinguishable answers let a test prove which turn produced which post.
+        const text = `answer:${prompt}`
+        onChunk?.(text)
+        return { stopReason: 'end_turn', text, updateCount: 1 }
+      }
       onChunk?.('exact ')
       onChunk?.('answer')
       return { stopReason: 'end_turn', text: 'exact answer', updateCount: 2 }
@@ -111,6 +117,52 @@ test('restart skips posted turn and publishes next turn once', async () => {
     expect((await count()) - before).toBe(2)
     second.controller.abort()
     expect(await second.run).toBeUndefined()
+  } finally { await f.close() }
+})
+
+test('a cold inbox replays the existing backlog once, in order, then follows live turns', async () => {
+  const f = await fixture(false, undefined, undefined, true)
+  const before = await count()
+  try {
+    // Two turns finish before any view exists, so the hub already holds several
+    // events and the state file below knows nothing about them.
+    expect(await f.hub.submit('backlog one')).not.toBeInstanceOf(Error)
+    await waitFor(async () => f.hub.snapshot().seq === 4 && !f.hub.snapshot().busy)
+    expect(await f.hub.submit('backlog two')).not.toBeInstanceOf(Error)
+    await waitFor(async () => f.hub.snapshot().seq === 7 && !f.hub.snapshot().busy)
+    expect(fs.existsSync(f.statePath)).toBe(false)
+    const backlogSeq = f.hub.snapshot().seq
+
+    const seen: number[] = []
+    const view = f.start((seq) => { seen.push(seq) })
+    await waitFor(async () => seen.length === 2)
+    // Each finished turn is posted exactly once, in hub order.
+    const backlog = (await discord.channel(channelId).getMessages()).slice(before)
+    expect(backlog.map((message) => message.content)).toEqual(['answer:backlog one', 'answer:backlog two'])
+    expect(seen).toEqual([4, 7])
+    expect(JSON.parse(fs.readFileSync(f.statePath, 'utf8'))).toEqual({ sessionId: 'view-session', seq: backlogSeq })
+
+    // A live turn after the replay is posted once and moves the cursor to its end.
+    expect(await f.hub.submit('live turn')).not.toBeInstanceOf(Error)
+    await waitFor(async () => seen.length === 3)
+    const live = (await discord.channel(channelId).getMessages()).slice(before)
+    expect(live.map((message) => message.content)).toEqual(['answer:backlog one', 'answer:backlog two', 'answer:live turn'])
+    const liveSeq = f.hub.snapshot().seq
+    expect(seen).toEqual([4, 7, liveSeq])
+    expect(JSON.parse(fs.readFileSync(f.statePath, 'utf8'))).toEqual({ sessionId: 'view-session', seq: liveSeq })
+    view.controller.abort()
+    expect(await view.run).toBeUndefined()
+
+    // Restarting on the same state file resumes past the backlog instead of reposting it.
+    let restarted = 0
+    const again = f.start(() => { restarted += 1 })
+    await waitFor(async () => f.hub.snapshot().subscribers === 1)
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    expect(restarted).toBe(0)
+    expect((await count()) - before).toBe(3)
+    expect(JSON.parse(fs.readFileSync(f.statePath, 'utf8'))).toEqual({ sessionId: 'view-session', seq: liveSeq })
+    again.controller.abort()
+    expect(await again.run).toBeUndefined()
   } finally { await f.close() }
 })
 
