@@ -10,13 +10,14 @@ afterEach(async () => {
   for (const hub of hubs.splice(0)) await hub.close()
 })
 
-function fakeBackend(chunks: string[] = ['o', 'k']): HubBackend {
+function fakeBackend(chunks: string[] = ['o', 'k'], gate?: Promise<void>): HubBackend {
   return {
     async start(input) {
       return { sessionId: 'session-http', model: input?.model ?? null }
     },
     async prompt(_text, onChunk) {
       for (const chunk of chunks) onChunk?.(chunk)
+      if (gate) await gate
       return { stopReason: 'end_turn', text: chunks.join(''), updateCount: chunks.length }
     },
     async cancel() {
@@ -26,8 +27,8 @@ function fakeBackend(chunks: string[] = ['o', 'k']): HubBackend {
   }
 }
 
-async function boot({ token, chunks }: { token?: string; chunks?: string[] } = {}) {
-  const hub = createSessionHub({ backend: fakeBackend(chunks), model: 'beam-free' })
+async function boot({ token, chunks, gate }: { token?: string; chunks?: string[]; gate?: Promise<void> } = {}) {
+  const hub = createSessionHub({ backend: fakeBackend(chunks, gate), model: 'beam-free' })
   if (hub instanceof Error) throw hub
   hubs.push(hub)
   const server = await startHubServer({ hub, port: 0, token })
@@ -149,5 +150,62 @@ describe('startHubServer', () => {
     const { server, headers } = await boot()
     const missing = await fetch(`${server.url}/nope`, { headers })
     expect(missing.status).toBe(404)
+  })
+
+  it('tracks presence by client id and accepts an acknowledgement', async () => {
+    let release: () => void = () => {}
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const { server, headers } = await boot({ gate })
+    const finished = (events: HubEvent[]) => events.some((event) => event.type === 'prompt.finished')
+    const stream = readEvents(`${server.url}/events?cursor=0&client=cli`, headers, finished)
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    const withClient = (await (await fetch(`${server.url}/state`, { headers })).json()) as { clients: Array<{ clientId: string; acked: number }> }
+    expect(withClient.clients).toContainEqual({ clientId: 'cli', acked: 0 })
+
+    await fetch(`${server.url}/prompt`, {
+      method: 'POST',
+      headers: { ...headers, 'content-type': 'application/json' },
+      body: JSON.stringify({ text: 'hello' }),
+    })
+    // Acknowledge while the turn is still running and the stream is attached.
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    const acked = await fetch(`${server.url}/ack`, {
+      method: 'POST',
+      headers: { ...headers, 'content-type': 'application/json' },
+      body: JSON.stringify({ client: 'cli', seq: 3 }),
+    })
+    expect(acked.status).toBe(200)
+    expect(await acked.json()).toEqual({ acked: 3 })
+    const after = (await (await fetch(`${server.url}/state`, { headers })).json()) as { clients: Array<{ clientId: string; acked: number }> }
+    expect(after.clients).toContainEqual({ clientId: 'cli', acked: 3 })
+
+    release()
+    const result = await stream
+    expect(result.ready).toMatchObject({ client: 'cli' })
+    expect(result.events.map((event) => event.type).at(-1)).toBe('prompt.finished')
+    // Presence ends with the connection. Removal is asynchronous on the server,
+    // so poll briefly rather than assuming it happened the instant the stream closed.
+    await expect
+      .poll(
+        async () => ((await (await fetch(`${server.url}/state`, { headers })).json()) as { clients: unknown[] }).clients,
+        { timeout: 2000 },
+      )
+      .toEqual([])
+  })
+
+  it('refuses an ack for an unknown client, an ack ahead of the stream, and a malformed ack', async () => {
+    const { server, headers } = await boot()
+    const post = (body: unknown) =>
+      fetch(`${server.url}/ack`, {
+        method: 'POST',
+        headers: { ...headers, 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+    expect((await post({ client: 'ghost', seq: 0 })).status).toBe(404)
+    expect((await post({ client: 'cli', seq: 9 })).status).toBe(409)
+    expect((await post({ seq: 1 })).status).toBe(400)
+    expect((await post({ client: 'cli', seq: 'one' })).status).toBe(400)
   })
 })

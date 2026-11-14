@@ -296,4 +296,53 @@ describe('createSessionHub', () => {
       fs.rmSync(dir, { recursive: true, force: true })
     }
   })
+
+  it('lists attached clients with their acknowledged position', async () => {
+    const { backend } = fakeBackend()
+    const hub = createSessionHub({ backend })
+    if (hub instanceof Error) throw hub
+    const first = hub.subscribe({ clientId: 'cli', onEvent: () => {} })
+    const second = hub.subscribe({ clientId: 'discord', onEvent: () => {} })
+    if (first instanceof Error || second instanceof Error) throw new Error('subscribe failed')
+    expect(hub.snapshot().clients).toEqual([
+      { clientId: 'cli', acked: 0 },
+      { clientId: 'discord', acked: 0 },
+    ])
+    await hub.submit('hello')
+    await wait(10)
+    expect(hub.ack({ clientId: 'cli', seq: 4 })).toEqual({ acked: 4 })
+    expect(hub.snapshot().clients).toContainEqual({ clientId: 'cli', acked: 4 })
+    first.unsubscribe()
+    expect(hub.snapshot().clients.map((entry) => entry.clientId)).toEqual(['discord'])
+  })
+
+  it('keeps acknowledgements monotonic and refuses invalid ones', async () => {
+    const { backend } = fakeBackend()
+    const hub = createSessionHub({ backend })
+    if (hub instanceof Error) throw hub
+    const subscription = hub.subscribe({ clientId: 'cli', onEvent: () => {} })
+    if (subscription instanceof Error) throw subscription
+    await hub.submit('hello')
+    await wait(10)
+    expect(hub.ack({ clientId: 'cli', seq: 3 })).toEqual({ acked: 3 })
+    // A stale ack from a reconnecting client must not move the position back.
+    expect(hub.ack({ clientId: 'cli', seq: 1 })).toEqual({ acked: 3 })
+    expect(hub.ack({ clientId: 'cli', seq: 4 })).toEqual({ acked: 4 })
+    expect(hub.ack({ clientId: 'cli', seq: 5 })).toBeInstanceOf(Error)
+    expect(hub.ack({ clientId: 'ghost', seq: 1 })).toBeInstanceOf(Error)
+    expect(hub.ack({ clientId: '', seq: 1 })).toBeInstanceOf(Error)
+    expect(hub.ack({ clientId: 'cli', seq: -1 })).toBeInstanceOf(Error)
+  })
+
+  it('refuses a duplicate client identity while it is attached', async () => {
+    const { backend } = fakeBackend()
+    const hub = createSessionHub({ backend })
+    if (hub instanceof Error) throw hub
+    const first = hub.subscribe({ clientId: 'cli', onEvent: () => {} })
+    if (first instanceof Error) throw first
+    expect(hub.subscribe({ clientId: 'cli', onEvent: () => {} })).toBeInstanceOf(Error)
+    first.unsubscribe()
+    const again = hub.subscribe({ clientId: 'cli', onEvent: () => {} })
+    expect(again).not.toBeInstanceOf(Error)
+  })
 })

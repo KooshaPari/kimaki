@@ -44,10 +44,14 @@ export type HubSnapshot = {
   busy: boolean
   seq: number
   subscribers: number
+  /** Attached clients with the last sequence each has acknowledged. */
+  clients: Array<{ clientId: string; acked: number }>
   durable: boolean
 }
 
 export type HubSubscription = {
+  /** Server-assigned or caller-supplied identity of this attachment. */
+  clientId: string
   /** Next cursor to pass on reconnect. */
   cursor: number
   /** True when the requested cursor predates every source the hub can read. */
@@ -71,7 +75,9 @@ export type SessionHub = {
   start(): Promise<{ sessionId: string; model: string | null } | Error>
   submit(text: string): Promise<{ accepted: true; characters: number } | Error>
   cancel(): Promise<Error | undefined>
-  subscribe(input: { cursor?: number; onEvent: (event: HubEvent) => void }): HubSubscription | Error
+  subscribe(input: { cursor?: number; clientId?: string; onEvent: (event: HubEvent) => void }): HubSubscription | Error
+  /** Record the last sequence a client has processed. Monotonic, per client. */
+  ack(input: { clientId: string; seq: number }): { acked: number } | Error
   snapshot(): HubSnapshot
   close(): Promise<void>
 }
@@ -175,7 +181,7 @@ export function createSessionHub({
   let closed = false
   let sessionId: string | null = null
   let selectedModel: string | null = null
-  const subscribers = new Set<{ deliver: (event: HubEvent) => void }>()
+  const subscribers = new Map<string, { deliver: (event: HubEvent) => void; acked: number }>()
 
   // A restored log means the session may already exist; reuse its identity.
   for (const event of restored) {
@@ -202,12 +208,12 @@ export function createSessionHub({
     persist(event)
     buffer.push(event)
     while (buffer.length > bufferLimit) buffer.shift()
-    for (const subscriber of subscribers) {
+    for (const [clientId, subscriber] of subscribers) {
       try {
         subscriber.deliver(event)
       } catch {
         // A broken client must not stop the turn or the other clients.
-        subscribers.delete(subscriber)
+        subscribers.delete(clientId)
       }
     }
     return event
@@ -231,14 +237,17 @@ export function createSessionHub({
     busy,
     seq,
     subscribers: subscribers.size,
+    clients: [...subscribers].map(([clientId, entry]) => ({ clientId, acked: entry.acked })),
     durable: logFile !== undefined,
   })
 
-  const subscribe = ({ cursor, onEvent }: { cursor?: number; onEvent: (event: HubEvent) => void }): HubSubscription | Error => {
+  const subscribe = ({ cursor, clientId, onEvent }: { cursor?: number; clientId?: string; onEvent: (event: HubEvent) => void }): HubSubscription | Error => {
     if (typeof onEvent !== 'function') return new ConfigError({ reason: 'Hub subscription needs an onEvent callback' })
     const wanted = cursor ?? 0
     if (!Number.isSafeInteger(wanted) || wanted < 0) return new ConfigError({ reason: 'Hub cursor must be a non-negative integer' })
     if (wanted > seq) return new ConfigError({ reason: 'Hub cursor is ahead of the stream' })
+    const identity = clientId?.trim() ? clientId.trim() : globalThis.crypto.randomUUID()
+    if (subscribers.has(identity)) return new ConfigError({ reason: `Client ${identity} is already attached` })
     const oldest = buffer.length > 0 ? buffer[0]!.seq : seq + 1
     const needsDisk = wanted + 1 < oldest
     let source: HubSubscription['source'] = 'none'
@@ -267,16 +276,29 @@ export function createSessionHub({
       }
     }
 
-    const entry = { deliver: onEvent }
-    subscribers.add(entry)
+    const entry = { deliver: onEvent, acked: wanted }
+    subscribers.set(identity, entry)
     return {
+      clientId: identity,
       cursor: seq,
       clipped,
       source,
       unsubscribe: () => {
-        subscribers.delete(entry)
+        subscribers.delete(identity)
       },
     }
+  }
+
+  const ack = ({ clientId, seq: acked }: { clientId: string; seq: number }): { acked: number } | Error => {
+    if (closed) return new ConfigError({ reason: 'Hub is closed' })
+    if (typeof clientId !== 'string' || !clientId.trim()) return new ConfigError({ reason: 'Hub ack needs a client ID' })
+    if (!Number.isSafeInteger(acked) || acked < 0) return new ConfigError({ reason: 'Hub ack cursor must be a non-negative integer' })
+    if (acked > seq) return new ConfigError({ reason: 'Hub ack is ahead of the stream' })
+    const entry = subscribers.get(clientId)
+    if (entry === undefined) return new ConfigError({ reason: `Client ${clientId} is not attached` })
+    // Monotonic: a stale ack from a reconnecting client must not move it backwards.
+    if (acked > entry.acked) entry.acked = acked
+    return { acked: entry.acked }
   }
 
   const submit = async (text: string): Promise<{ accepted: true; characters: number } | Error> => {
@@ -325,5 +347,5 @@ export function createSessionHub({
     }
   }
 
-  return { capabilities: hubCapabilities, start, submit, cancel, subscribe, snapshot, close }
+  return { capabilities: hubCapabilities, start, submit, cancel, subscribe, ack, snapshot, close }
 }

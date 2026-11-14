@@ -1,10 +1,11 @@
 // Loopback HTTP surface for a session hub, so separate front ends can attach to
 // one live backend session at the same time.
 //
-// GET  /state            hub snapshot
+// GET  /state            hub snapshot, including attached clients and their acks
 // POST /prompt  {text}   submit one turn (single writer, refused while busy)
 // POST /cancel           cancel the running turn
-// GET  /events?cursor=N  server-sent events, replayed from the cursor then live
+// POST /ack {client, seq} record how far a client has processed the stream
+// GET  /events?cursor=N&client=<id>  server-sent events, replayed from the cursor then live
 //
 // This binds 127.0.0.1 only. When a token is supplied, every request must carry
 // it in the x-kimaki-hub header. No request reads a transcript from disk.
@@ -68,6 +69,22 @@ export async function startHubServer({
         if (result instanceof Error) return json(response, 409, { error: result.message })
         return json(response, 200, { cancelled: true })
       }
+      if (request.method === 'POST' && url.pathname === '/ack') {
+        const body = await readBody(request)
+        const record = typeof body === 'object' && body !== null ? (body as Record<string, unknown>) : undefined
+        const clientId = record?.['client']
+        const cursor = record?.['seq']
+        if (typeof clientId !== 'string' || typeof cursor !== 'number') {
+          return json(response, 400, { error: 'ack body needs client and seq' })
+        }
+        const result = hub.ack({ clientId, seq: cursor })
+        if (result instanceof Error) {
+          // Unknown client is a routing problem, not a bad request body.
+          const code = /not attached/.test(result.message) ? 404 : 409
+          return json(response, code, { error: result.message })
+        }
+        return json(response, 200, result)
+      }
       if (request.method === 'GET' && url.pathname === '/events') {
         const raw = url.searchParams.get('cursor')
         const cursor = raw === null ? 0 : Number(raw)
@@ -89,6 +106,7 @@ export async function startHubServer({
         let readySent = false
         const subscription = hub.subscribe({
           cursor,
+          clientId: url.searchParams.get('client') ?? undefined,
           onEvent: (event) => {
             if (readySent) writeFrame(event)
             else pending.push(event)
@@ -99,14 +117,20 @@ export async function startHubServer({
         }
         clients.add(response)
         readySent = true
-        response.write(`event: ready\ndata: ${JSON.stringify({ cursor, clipped: subscription.clipped, source: subscription.source })}\n\n`)
+        response.write(`event: ready\ndata: ${JSON.stringify({ client: subscription.clientId, cursor, clipped: subscription.clipped, source: subscription.source })}\n\n`)
         for (const event of pending) writeFrame(event)
         pending.length = 0
+        let cleaned = false
         const cleanup = (): void => {
+          if (cleaned) return
+          cleaned = true
           subscription.unsubscribe()
           clients.delete(response)
         }
+        // An aborted SSE stream closes the response, not necessarily the request.
+        // Both are wired so presence never outlives the connection.
         request.on('close', cleanup)
+        response.on('close', cleanup)
         return undefined
       }
       return json(response, 404, { error: 'not found' })
