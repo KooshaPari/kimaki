@@ -88,6 +88,30 @@ test('rejects empty identity and non-observe modes at the public boundary', asyn
   expect(await bindSurface({ db, ...input, mode: 'control' })).toBeInstanceOf(Error)
 })
 
+test('a superseded binding cannot carry control, and generations advance on rebind', async () => {
+  const { db } = await database()
+  const first = await bindSurface({ db, ...input })
+  if (first instanceof Error) throw first
+  expect(first.generation).toBe(1)
+  const detached = await detachBinding({ db, bindingId: first.id, tenantId: input.tenantId })
+  if (detached instanceof Error) throw detached
+  expect(detached.state).toBe('detached')
+  const second = await bindSurface({ db, ...input, idempotencyKey: 'request-2' })
+  if (second instanceof Error) throw second
+  expect(second.generation).toBe(2)
+  // A control write aimed at the superseded binding, reusing its request id and its
+  // generation, is refused: generations are not control credentials.
+  const staleControl = await bindSurface({ db, ...input, mode: 'control', idempotencyKey: 'request-1' })
+  expect(staleControl).toBeInstanceOf(Error)
+  expect((staleControl as Error).message).toMatch(/observe/i)
+  // The live binding offers no control surface either.
+  expect(await bindSurface({ db, ...input, mode: 'control', idempotencyKey: 'request-3' })).toBeInstanceOf(Error)
+  const rows = await listBindings({ db, tenantId: input.tenantId })
+  if (rows instanceof Error) throw rows
+  expect(rows).toHaveLength(2)
+  expect(rows.every((row) => row.mode === 'observe' && row.publication_policy === 'none')).toBe(true)
+})
+
 test('concurrent duplicate requests yield one binding', async () => {
   const { db } = await database()
   const results = await Promise.all(Array.from({ length: 4 }, () => bindSurface({ db, ...input })))

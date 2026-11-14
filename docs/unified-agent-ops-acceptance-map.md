@@ -12,12 +12,12 @@ Checksums from the bundle's own `SHA256SUMS.txt`: 7 of 7 documents match.
 
 | Status | Cases |
 | --- | --- |
-| Closed at the plan's standard | 7 |
-| Partial | 15 |
+| Closed at the plan's standard | 8 |
+| Partial | 14 |
 | Not started | 18 |
 | Total | 40 |
 
-AC03, AC04, AC06, AC13, AC14, AC23 and AC25 are closed. Every other case still lacks both a real native surface and a live service path in the same piece of evidence, which is the standard the plan sets.
+AC03, AC04, AC06, AC07, AC13, AC14, AC23 and AC25 are closed. Every other case still lacks both a real native surface and a live service path in the same piece of evidence, which is the standard the plan sets.
 
 ## Acceptance cases
 
@@ -29,7 +29,7 @@ AC03, AC04, AC06, AC13, AC14, AC23 and AC25 are closed. Every other case still l
 | AC04 | Observe disconnect/restart | closed | `ops discord view` holds a durable cursor: after a real ACP turn posted one channel message at sequence 5, the view was killed, restarted, and the next turn posted exactly one new message at sequence 9 with the first message still present and no duplicate. Recovery from a missing state file is reported ("starting at sequence 0"), and a clipped replay fails closed instead of reposting. Codex and the Jcode observer path are not covered by this evidence |
 | AC05 | Dynamic rebind | partial | metadata rebind with generation 2 fencing; no live client route change exercised |
 | AC06 | Multiple read views | closed | one real jcode ACP session was served by `ops jcode serve` while two CLI clients (`cli-a`, `cli-b`) prompted through `ops jcode attach` and a Discord channel rendered the turns through `ops discord view`. The channel received `bridge-ok` for the first turn and `bridge-two` for the second, each exactly once, with the CLI clients seeing the same turns. Uses discord-digital-twin as a real Discord-compatible server |
-| AC07 | Stale control | partial | binding generation fencing exists; no stale control write is attempted or rejected |
+| AC07 | Stale control | closed | a real libSQL binding was created at generation 1, detached, and rebound at generation 2. A control write reusing the superseded binding's request id and generation is refused, and a control write against the live binding is refused too, because generation is not a control credential and the boundary admits only `mode: observe`. Both rows remain `mode: observe`, `publication_policy: none`. Proven sensitive: disabling the mode gate makes this test and the existing boundary test fail |
 | AC08 | Unknown process | partial | herdr unknown identities are surfaced without invention; no PID-reuse case |
 | AC09 | PID reuse/runtime restart | not started | no PID-reuse or runtime-restart separation case |
 | AC10 | Wrong backend fallback | not started | no wrong-binary, wrong-profile or wrong-provider negative case |
@@ -99,6 +99,7 @@ fails, then restoring the file and re-running the suite green.
 | AC12 | the client renders an unknown `agent_message_retraction` as the text `<retracted>` | the test fails with `the sky is grenn<retracted>...`, so it detects fabrication |
 | AC13 | `if (ready.clipped)` disabled in `ops discord view` | the new clipped-replay test fails after 30013 ms: the view would mirror a partial turn instead of refusing |
 | AC25 | `rejectOnRateLimit` removed from the `ops follow` client only | the follow 429 test fails at its 300079 ms bound: the follow process never exits and never reports the failure |
+| AC07 | the `mode: observe` gate disabled in `bindSurface` | 2 tests fail: the stale-control test and the existing boundary test, so neither passes on a control write being silently accepted |
 
 Restored state: `hub.test.ts`, `acp/client.test.ts`, `ops-publish.e2e.test.ts` and
 `discord/watch.test.ts` are 49 of 49 green, and `git status` is clean.
