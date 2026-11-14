@@ -130,4 +130,31 @@ describe('Jcode passive observation', () => {
     expect(await live.observe({ key: { hostId: 'host', endpointId: 'other', backendKind: 'jcode', nativeSessionId: 'session_x' }, onEvent: () => {} })).toBeInstanceOf(Error)
     expect(await live.observe({ key: { hostId: 'host', endpointId: 'endpoint', backendKind: 'jcode', nativeSessionId: 'session_missing' }, onEvent: () => {} })).toBeInstanceOf(Error)
   })
+
+  it('reads persisted state without writing to the home or reviving a session', async () => {
+    const writes: string[] = []
+    const reads: string[] = []
+    const readOnly = createJcodeObserver({
+      jcodeHome: 'C:/jcode-read-only',
+      hostId: 'host',
+      endpointId: 'endpoint',
+      readDir: async (dir) => {
+        reads.push(`dir:${dir}`)
+        return ['session_a.json']
+      },
+      readFile: async (file) => {
+        reads.push(`file:${file}`)
+        return JSON.stringify({ id: 'session_a', title: 'Persisted', updated_at: '2026-01-01T00:00:00Z' })
+      },
+    })
+    if (readOnly instanceof Error) throw readOnly
+    const page = await readOnly.discover()
+    if (page instanceof Error) throw page
+    const snapshot = await readOnly.readSnapshot({ key: { hostId: 'host', endpointId: 'endpoint', backendKind: 'jcode', nativeSessionId: 'session_a' } })
+    expect(snapshot).not.toBeInstanceOf(Error)
+    // The whole surface is reads: no write, mkdir, unlink or spawn is reachable from it.
+    expect(reads.length).toBeGreaterThan(0)
+    expect(writes).toEqual([])
+    expect(Object.keys(readOnly).sort()).toEqual(['capabilities', 'discover', 'observe', 'readSnapshot'])
+  })
 })

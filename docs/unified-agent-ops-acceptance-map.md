@@ -12,12 +12,12 @@ Checksums from the bundle's own `SHA256SUMS.txt`: 7 of 7 documents match.
 
 | Status | Cases |
 | --- | --- |
-| Closed at the plan's standard | 1 |
+| Closed at the plan's standard | 2 |
 | Partial | 20 |
-| Not started | 19 |
+| Not started | 18 |
 | Total | 40 |
 
-Only AC14 is closed. Every other case still lacks both a real native surface and a live service path in the same piece of evidence, which is the standard the plan sets.
+Only AC14 and AC23 are closed. Every other case still lacks both a real native surface and a live service path in the same piece of evidence, which is the standard the plan sets.
 
 ## Acceptance cases
 
@@ -45,7 +45,7 @@ Only AC14 is closed. Every other case still lacks both a real native surface and
 | AC20 | Credential revocation | partial | consent revoked mid-flight blocks publication; credential revocation is not exercised |
 | AC21 | Prompt injection through chat/output | not started | no prompt-injection-through-output case |
 | AC22 | Worker success, sync-back failure | not started | no worker-success/sync-back-failure reconciliation case |
-| AC23 | Failed HERDR wait/read | partial | bounded waits return explicit errors instead of fabricated results |
+| AC23 | Failed HERDR wait/read | closed | real CLI run with a binary that cannot exist: exit 1, no JSON inventory on stdout, and a message naming the failed Herdr inventory command. Unit tests also cover a missing binary and unsafe timeouts before spawning |
 | AC24 | Synthetic engine backend | partial | identity comparison fails closed; no synthetic-engine oracle test |
 | AC25 | Output send failure/429 | partial | publication is at-most-once and failures are reported; no delivery state or backoff on 429 |
 | AC26 | Echo between bots/services | not started | no echo suppression case |
@@ -59,7 +59,7 @@ Only AC14 is closed. Every other case still lacks both a real native surface and
 | AC34 | Actual connector cutover | not started | no real connector cutover and no competing-consumer pause proof |
 | AC35 | Clean restart | partial | hub restart from a stopped state is verified; the full bot stack restart is not |
 | AC36 | Host/platform difference | partial | all evidence is Windows-only and no Linux success is claimed |
-| AC37 | Persisted session mistaken for live | partial | Jcode polling reads persisted state without reviving it; no explicit refusal case |
+| AC37 | Persisted session mistaken for live | partial | real CLI run over a temp Jcode home: the persisted session was discovered with its title, message bodies never appeared, the home's file hashes and mtimes were unchanged after discovery, a missing home failed instead of inventing sessions, and unit tests show the observer exposes only read operations. The concurrent revival race is not exercised |
 | AC38 | Rebind during activity | not started | no rebind-during-activity case |
 | AC39 | KCode reporter says jcode | not started | KCode identity is not implemented or tested |
 | AC40 | Collector outage | not started | no collector-outage or source-health case |

@@ -69,6 +69,17 @@ describe('discoverHerdr', () => {
     expect(exec).not.toHaveBeenCalled()
   })
 
+  test('reports a failed invocation instead of a fabricated empty inventory', async () => {
+    const failure = Object.assign(new Error('spawn herdr ENOENT'), { code: 'ENOENT' })
+    vi.spyOn(childProcess, 'execFile').mockImplementation((_file, _args, _options, callback) => {
+      if (typeof callback === 'function') callback(failure as never, '', '')
+      return {} as childProcess.ChildProcess
+    })
+    const result = await discoverHerdr({ binary: 'missing-herdr-binary' })
+    expect(result).toBeInstanceOf(ConfigError)
+    expect(result).not.toHaveProperty('agents')
+  })
+
   test.each([{ binary: '' }, { binary: 'bad\0binary' }, { session: '' }, { session: 'bad\0session' }])('validates options before spawning: %j', async (options) => {
     const exec = output(envelope([]))
     expect(await discoverHerdr(options)).toBeInstanceOf(ConfigError)
