@@ -636,4 +636,83 @@ describe('createSessionHub', () => {
       fs.rmSync(dir, { recursive: true, force: true })
     }
   })
+
+  // AC15: a managed launch can die after the process is spawned but before the
+  // session is acknowledged. That must surface as a failed start, not as a live
+  // session, and it must never be turned into a turn or a sequence advance.
+  describe('AC15 crash after launch before ACK', () => {
+    const crash = () => new Error('managed launch exited before session/new acknowledged')
+    const kinds = (events: HubEvent[]) => events.map((event) => event.type)
+
+    it('surfaces a throwing launch, stays inert, then starts cleanly on retry', async () => {
+      let attempts = 0
+      const { backend, calls } = fakeBackend({
+        overrides: {
+          async start(input) {
+            attempts += 1
+            // The first two managed launches die before the ACK; the retry after
+            // the operator intervenes acknowledges properly.
+            if (attempts <= 2) throw crash()
+            return { sessionId: 'session-1', model: input?.model ?? null }
+          },
+        },
+      })
+      const hub = createSessionHub({ backend, model: 'beam-free' })
+      if (hub instanceof Error) throw hub
+      const events: HubEvent[] = []
+      hub.subscribe({ onEvent: (event) => events.push(event) })
+
+      const started = await hub.start()
+      expect(started).toBeInstanceOf(Error)
+      expect(started instanceof Error ? started.message : '').toBe('managed launch exited before session/new acknowledged')
+      // The crash is reported and no session is invented from it.
+      expect(hub.snapshot()).toMatchObject({ sessionId: null, model: null, busy: false, seq: 0 })
+      expect(kinds(events)).not.toContain('session.started')
+
+      // A submit during the crash fails closed: same error, no turn, no advance.
+      const submitted = await hub.submit('hello')
+      expect(submitted).toBeInstanceOf(Error)
+      expect(submitted instanceof Error ? submitted.message : '').toBe(
+        'managed launch exited before session/new acknowledged',
+      )
+      expect(calls.prompts).toEqual([])
+      expect(kinds(events)).not.toContain('prompt.started')
+      expect(hub.snapshot()).toMatchObject({ sessionId: null, busy: false, seq: 0 })
+
+      // The retry is a fresh launch, not a replay of the failed one.
+      const retried = await hub.start()
+      expect(retried).toMatchObject({ sessionId: 'session-1', model: 'beam-free' })
+      expect(attempts).toBe(3)
+      expect(kinds(events)).toEqual(['session.started'])
+      expect(hub.snapshot()).toMatchObject({ sessionId: 'session-1', model: 'beam-free', seq: 1 })
+
+      // A turn after recovery is a real turn continuing from the recovered head.
+      expect(await hub.submit('hello')).toMatchObject({ accepted: true, characters: 5 })
+      await wait(10)
+      expect(hub.snapshot().seq).toBe(4)
+      expect(kinds(events)).toEqual(['session.started', 'prompt.started', 'prompt.chunk', 'prompt.finished'])
+    })
+
+    it('stays inert when every launch reports the crash as an error result', async () => {
+      const { backend, calls } = fakeBackend({
+        overrides: {
+          async start() {
+            return crash()
+          },
+        },
+      })
+      const hub = createSessionHub({ backend })
+      if (hub instanceof Error) throw hub
+      const events: HubEvent[] = []
+      hub.subscribe({ onEvent: (event) => events.push(event) })
+
+      expect(await hub.start()).toBeInstanceOf(Error)
+      expect(await hub.start()).toBeInstanceOf(Error)
+      expect(await hub.submit('hello')).toBeInstanceOf(Error)
+      // Repeated failures still leave no session, no turn and no events.
+      expect(hub.snapshot()).toMatchObject({ sessionId: null, model: null, busy: false, seq: 0 })
+      expect(events).toEqual([])
+      expect(calls.prompts).toEqual([])
+    })
+  })
 })

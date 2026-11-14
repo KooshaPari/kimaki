@@ -249,10 +249,23 @@ export function createSessionHub({
     return event
   }
 
+  // A managed launch can die after the process is spawned but before the session
+  // is acknowledged. That arrives as a throw rather than an Error result, so it is
+  // normalised here: a crash before the ACK is a failed start, never a session.
+  // The original error is preserved so callers see the launch failure itself.
+  const launch = async (): Promise<{ sessionId: string; model: string | null } | Error> => {
+    try {
+      return await backend.start(model === undefined ? undefined : { model })
+    } catch (cause) {
+      if (cause instanceof Error) return cause
+      return new ConfigError({ reason: 'Backend launch crashed before acknowledging the session', cause })
+    }
+  }
+
   const start = async (): Promise<{ sessionId: string; model: string | null } | Error> => {
     if (closed) return new ConfigError({ reason: 'Hub is closed' })
     if (started && sessionId) return { sessionId, model: selectedModel }
-    const result = await backend.start(model === undefined ? undefined : { model })
+    const result = await launch()
     if (result instanceof Error) return result
     started = true
     sessionId = result.sessionId
