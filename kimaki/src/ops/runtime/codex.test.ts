@@ -87,7 +87,7 @@ describe('Codex control surface', () => {
   })
 
   it('reads a thread as user and agent messages using the observed item shapes', async () => {
-    const { controller } = harness(() => ({
+    const { controller, calls } = harness(() => ({
       thread: {
         id: 'thread-9',
         turns: [
@@ -113,6 +113,9 @@ describe('Codex control surface', () => {
       ],
     })
     expect(JSON.stringify(read)).not.toContain('private reasoning')
+    // Reading must never resume: resume takes the native writer lock and would
+    // block the session this reader is observing.
+    expect(calls).toEqual([{ method: 'thread/read', params: { threadId: 'thread-9', includeTurns: true } }])
   })
 
   it('refuses a read that answers about another thread', async () => {

@@ -160,3 +160,11 @@ used, and the user's real `CODEX_HOME` was never pointed at or modified.
 Hypothesis disproved along the way: a thread is not visible to a new app-server process
 without `thread/resume`; `turn/start` answered `thread not found` until the resume call
 was added.
+
+Writer-lock measurements (two app-server processes, one thread):
+
+| Question | Observed |
+| --- | --- |
+| Does a resumed thread in process A block process B? | Yes. B's `thread/resume` fails with `thread <id> already has an active writer`, and its `turn/start` then fails with `thread not found`. Codex enforces one writer per thread natively, unlike Jcode |
+| Does `thread/read` block a writer? | No. A reader held the thread open, a second process resumed it, and `turn/start` succeeded with a real turn id. Reading is therefore a safe observe path, and `readThread` must never resume, which a unit test now pins |
+| Do cross-process notifications arrive? | No. While another process held the turn, the first process received nothing, so observation is poll-based rather than push |

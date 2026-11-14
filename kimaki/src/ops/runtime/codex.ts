@@ -370,7 +370,7 @@ export function createCodexObserver({ hostId, endpointId, request }: { hostId: s
     capabilities: {
       ...passiveCapabilities,
       snapshot: { kind: 'supported' as const },
-      observe: { kind: 'unsupported' as const, reason: 'A thread can be read on demand with thread/read, but no live notification stream is offered for turns another process runs, so this is not an observe surface' },
+      observe: { kind: 'unsupported' as const, reason: 'thread/read polls a live thread without blocking its writer, but no notification stream is offered and thread/resume takes the writer lock, so this is a poll-based read surface rather than an observe subscription' },
       replay: { kind: 'unsupported' as const, reason: 'Metadata reads do not provide a durable event cursor' },
       exclusiveControl: { kind: 'unsupported' as const, reason: 'No exclusive writer lease is established' },
     },
