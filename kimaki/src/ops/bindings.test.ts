@@ -7,6 +7,7 @@ import { openDb, type OpenedDb } from '../db.ts'
 import { removeTempDirs } from '../test/cleanup.ts'
 import {
   bindSurface, detachBinding, exportBindings, importBindings, listBindings,
+  createSyncBackLedger, listWorkerResultSyncBacks, recordWorkerResultSyncBack, reconcileSyncBack,
   type BindingBackup, type SurfaceBinding,
 } from './bindings.ts'
 
@@ -306,3 +307,168 @@ test('export validates scope identifiers and an unscoped export covers every ten
   expect(await exportBindings({ db, serviceKind: 'slack' })).toMatchObject({ version: 1, rows: [] })
 })
 
+// Sync-back reconciliation: AC22. A worker can succeed while the write-back to
+// the coordinating surface fails. Reporting such a result as synced, losing it,
+// or delivering it twice must break these tests.
+
+const target = 'discord:guild-1:thread-1'
+const result = { summary: 'refactor complete', files: ['a.ts', 'b.ts'], ok: true }
+
+test('a worker result whose write-back failed is pending-sync, not synced and not failed', async () => {
+  const ledger = createSyncBackLedger()
+  const record = recordWorkerResultSyncBack({
+    ledger, workerId: 'worker-1', target, payload: result,
+    cause: new Error('Discord send failed: 429 Too Many Requests'),
+  })
+  if (record instanceof Error) throw record
+  expect(record).toMatchObject({
+    worker_id: 'worker-1',
+    target,
+    state: 'pending-sync',
+    attempts: 1,
+    last_error: 'Discord send failed: 429 Too Many Requests',
+    ack_id: null,
+    acknowledged_at: null,
+  })
+  expect(record.payload_digest).toMatch(/^[0-9a-f]{64}$/)
+  // Digests are payload identity, not key order.
+  const reordered = recordWorkerResultSyncBack({ ledger, workerId: 'worker-1', target, payload: { ok: true, files: ['a.ts', 'b.ts'], summary: 'refactor complete' } })
+  expect(reordered).toEqual(record)
+  expect(listWorkerResultSyncBacks({ ledger })).toEqual([record])
+})
+
+test('a successful retry flips pending-sync to synced exactly once', async () => {
+  const ledger = createSyncBackLedger()
+  const record = recordWorkerResultSyncBack({ ledger, workerId: 'worker-1', target, payload: result, cause: 'surface unreachable' })
+  if (record instanceof Error) throw record
+  const deliveries: string[] = []
+  const deliver = (pending: { id: string }) => {
+    deliveries.push(pending.id)
+    return { ackId: 'ack-1' }
+  }
+  const first = await reconcileSyncBack({ ledger, recordId: record.id, deliver })
+  if (first instanceof Error) throw first
+  expect(first).toMatchObject({ status: 'synced', delivered: true })
+  expect(first.record).toMatchObject({ state: 'synced', ack_id: 'ack-1', last_error: null, attempts: 2 })
+  expect(first.record.acknowledged_at).toBeTypeOf('number')
+  expect(deliveries).toEqual([record.id])
+  // Replaying the same reconciliation delivers nothing and does not rewrite the record.
+  const second = await reconcileSyncBack({ ledger, recordId: record.id, deliver })
+  if (second instanceof Error) throw second
+  expect(second).toMatchObject({ status: 'duplicate', delivered: false, record: first.record })
+  expect(deliveries).toEqual([record.id])
+  expect(listWorkerResultSyncBacks({ ledger })).toEqual([first.record])
+})
+
+test('a duplicate retry of an already synced result delivers nothing', async () => {
+  const ledger = createSyncBackLedger()
+  const record = recordWorkerResultSyncBack({ ledger, workerId: 'worker-2', target, payload: result })
+  if (record instanceof Error) throw record
+  let calls = 0
+  const deliver = async () => {
+    calls += 1
+    return { ackId: `ack-${calls}` }
+  }
+  const synced = await reconcileSyncBack({ ledger, recordId: record.id, deliver })
+  if (synced instanceof Error) throw synced
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const replay = await reconcileSyncBack({ ledger, recordId: record.id, deliver })
+    if (replay instanceof Error) throw replay
+    expect(replay).toMatchObject({ status: 'duplicate', delivered: false, record: synced.record })
+  }
+  expect(calls).toBe(1)
+})
+
+test('a conflicting payload for the same worker is refused by name instead of overwriting', async () => {
+  const ledger = createSyncBackLedger()
+  const record = recordWorkerResultSyncBack({ ledger, workerId: 'worker-3', target, payload: result, cause: 'surface unreachable' })
+  if (record instanceof Error) throw record
+  const conflict = recordWorkerResultSyncBack({ ledger, workerId: 'worker-3', target, payload: { ...result, summary: 'different task' } })
+  expect(conflict).toBeInstanceOf(Error)
+  expect((conflict as Error).message).toContain('Worker worker-3')
+  expect((conflict as Error).message).toContain(record.payload_digest)
+  expect((conflict as Error).message).toMatch(/Refusing a different payload/)
+  // The original is untouched, including its failed attempt.
+  expect(listWorkerResultSyncBacks({ ledger })).toEqual([record])
+  expect(record.state).toBe('pending-sync')
+  // The same result aimed at another surface is also refused by name.
+  const retarget = recordWorkerResultSyncBack({ ledger, workerId: 'worker-3', target: 'discord:guild-2:thread-9', payload: result })
+  expect(retarget).toBeInstanceOf(Error)
+  expect((retarget as Error).message).toContain('discord:guild-1:thread-1')
+})
+
+test('two pending results reconciled out of order both land once, with monotonic attempts', async () => {
+  const ledger = createSyncBackLedger()
+  const earlier = recordWorkerResultSyncBack({ ledger, workerId: 'worker-4', target, payload: { step: 1 }, cause: 'surface unreachable' })
+  const later = recordWorkerResultSyncBack({ ledger, workerId: 'worker-5', target, payload: { step: 2 }, cause: 'surface unreachable' })
+  if (earlier instanceof Error) throw earlier
+  if (later instanceof Error) throw later
+  const delivered: string[] = []
+  const deliver = async (pending: { worker_id: string }) => {
+    delivered.push(pending.worker_id)
+    return { ackId: `ack-${pending.worker_id}` }
+  }
+  // The later result is reconciled first, then the earlier one, then both replay.
+  const secondFirst = await reconcileSyncBack({ ledger, recordId: later.id, deliver })
+  if (secondFirst instanceof Error) throw secondFirst
+  const firstSecond = await reconcileSyncBack({ ledger, recordId: earlier.id, deliver })
+  if (firstSecond instanceof Error) throw firstSecond
+  expect(delivered).toEqual(['worker-5', 'worker-4'])
+  expect(secondFirst.record).toMatchObject({ state: 'synced', attempts: 2 })
+  expect(firstSecond.record).toMatchObject({ state: 'synced', attempts: 2 })
+  for (const recordId of [later.id, earlier.id]) {
+    const replay = await reconcileSyncBack({ ledger, recordId, deliver })
+    if (replay instanceof Error) throw replay
+    expect(replay).toMatchObject({ status: 'duplicate', delivered: false })
+  }
+  expect(delivered).toEqual(['worker-5', 'worker-4'])
+  const records = listWorkerResultSyncBacks({ ledger })
+  expect(records.map((row) => [row.worker_id, row.state, row.attempts])).toEqual([
+    ['worker-4', 'synced', 2],
+    ['worker-5', 'synced', 2],
+  ])
+})
+
+test('a record never reads synced while its acknowledgement is missing', async () => {
+  const ledger = createSyncBackLedger()
+  const record = recordWorkerResultSyncBack({ ledger, workerId: 'worker-6', target, payload: result, cause: 'surface unreachable' })
+  if (record instanceof Error) throw record
+  // A delivery that returns without an acknowledgement is not a delivery.
+  const noAck = await reconcileSyncBack({ ledger, recordId: record.id, deliver: () => undefined })
+  if (noAck instanceof Error) throw noAck
+  expect(noAck).toMatchObject({ status: 'pending-sync', delivered: false })
+  expect(noAck.record).toMatchObject({ state: 'pending-sync', ack_id: null, acknowledged_at: null, attempts: 2 })
+  expect(noAck.record.last_error).toMatch(/no acknowledgement/)
+  // A thrown delivery keeps the record pending too, and attempts stay monotonic.
+  const threw = await reconcileSyncBack({ ledger, recordId: record.id, deliver: () => { throw new Error('still 503') } })
+  if (threw instanceof Error) throw threw
+  expect(threw.record).toMatchObject({ state: 'pending-sync', attempts: 3, last_error: 'still 503' })
+  expect(listWorkerResultSyncBacks({ ledger })).toMatchObject([{ state: 'pending-sync' }])
+  // Only a real acknowledgement flips it.
+  const acked = await reconcileSyncBack({ ledger, recordId: record.id, deliver: () => ({ ackId: 'ack-6' }) })
+  if (acked instanceof Error) throw acked
+  expect(acked.record).toMatchObject({ state: 'synced', attempts: 4, ack_id: 'ack-6' })
+})
+
+test('a second reconciliation in flight is refused instead of delivering twice', async () => {
+  const ledger = createSyncBackLedger()
+  const record = recordWorkerResultSyncBack({ ledger, workerId: 'worker-7', target, payload: result, cause: 'surface unreachable' })
+  if (record instanceof Error) throw record
+  let release: (() => void) | undefined
+  const gate = new Promise<void>((resolve) => { release = resolve })
+  let calls = 0
+  const slow = async () => {
+    calls += 1
+    await gate
+    return { ackId: 'ack-7' }
+  }
+  const running = reconcileSyncBack({ ledger, recordId: record.id, deliver: slow })
+  const competing = await reconcileSyncBack({ ledger, recordId: record.id, deliver: slow })
+  expect(competing).toBeInstanceOf(Error)
+  expect((competing as Error).message).toMatch(/already in flight/)
+  release?.()
+  const done = await running
+  if (done instanceof Error) throw done
+  expect(done).toMatchObject({ status: 'synced', delivered: true })
+  expect(calls).toBe(1)
+})
