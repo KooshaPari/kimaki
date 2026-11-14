@@ -244,4 +244,12 @@ Third pass additions:
 | --- | --- | --- |
 | AC13 durable replay through the CLI | `ops jcode serve --buffer 1 --log events.jsonl`, one real ACP turn (7 log events), hub stopped and restarted on the same log | `ops jcode attach --cursor 0` replayed all **7** events with `"ready":{"cursor":0,"clipped":false,"source":"log"}`. A one-event buffer is not a gap when the log covers the history |
 | AC25 unknown surface | `ops publish` against a stub that answers the channel lookup with `404 Unknown Channel` | exit non-zero, **zero** POSTs, no `sent` line; publish suite now 9 of 9 |
+
+Fourth pass:
+
+| Area | What was checked | Observed |
+| --- | --- | --- |
+| Torn log after a crash | a log whose last line is a partial write, then `createSessionHub` | restores the valid prefix (sequence 3), replays 1-3 with `clipped:false`, and the next turn continues at sequence 7 rather than reusing numbers |
+| Two surfaces on one session | two `ops discord view` processes on different channels of one hub | **defect found and fixed**: both views defaulted to client id `discord-view`, and the hub refuses a duplicate id (`Hub refused the stream with status 400`), so only one channel ever received the turn. The default is now `discord-view-<pid>`. After the fix both channels received exactly one message and both state files recorded the same session id at sequence 4 |
+| Wrong tenant | `ops discord view --tenant 000000000000000000` on a channel owned by another guild | refuses without posting; covered by a unit test that asserts an Error, no message and no state file. **Open issue**: the CLI process exits with Windows code `0xC0000409` and a libuv `UV_HANDLE_CLOSING` assertion instead of a clean 1 when it fails this early, so the refusal is correct but the exit path is not clean |
 | Rebind with a cursor ahead of the hub | state `{sessionId: <real>, seq: <seq + 500>}` | **defect found and fixed**: the view exited 0 with `{"kind":"closed"}` and `attach --cursor 500` also exited 0 with no events. The hub wrote SSE headers before subscribing, so its refusal arrived as a 200 whose JSON body the client read as an empty stream, and `attach` ignored the `Error` that `openHubStream` resolves. The server now subscribes before writing headers (400 with `Hub cursor is ahead of the stream`) and the CLI fails on a refused attach. Re-verified: raw fetch returns 400, and `attach --cursor 500` exits 1 |
