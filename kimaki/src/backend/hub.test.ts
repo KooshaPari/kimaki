@@ -518,6 +518,43 @@ describe('createSessionHub', () => {
       expect(coveredSubscription.clipped).toBe(false)
       expect(turnSeqs(covered)).toEqual([3, 4])
     })
+
+    it('delivers every live event to an attached subscriber even when the buffer overflows', async () => {
+      const { backend } = fakeBackend()
+      const hub = createSessionHub({ backend, bufferLimit: 1 })
+      if (hub instanceof Error) throw hub
+      const live: HubEvent[] = []
+      // Attach before the turn so these are live deliveries, not a replay.
+      const subscription = hub.subscribe({ onEvent: (event) => live.push(event) })
+      if (subscription instanceof Error) throw subscription
+      await hub.submit('hello')
+      await wait(10)
+      // The buffer holds one event, but a live subscriber saw the whole turn:
+      // overflow costs replay history, never live delivery.
+      expect(turnSeqs(live)).toEqual([1, 2, 3, 4])
+      expect(hub.snapshot().seq).toBe(4)
+    })
+
+    it('replays the whole history from the log when the buffer is smaller than it', async () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-hub-ac13-tiny-'))
+      const logFile = path.join(dir, 'events.jsonl')
+      try {
+        const hub = createSessionHub({ backend: fakeBackend().backend, logFile, bufferLimit: 1 })
+        if (hub instanceof Error) throw hub
+        await hub.submit('hello')
+        await wait(10)
+        const seen: HubEvent[] = []
+        const subscription = hub.subscribe({ cursor: 0, onEvent: (event) => seen.push(event) })
+        if (subscription instanceof Error) throw subscription
+        // A one-event buffer is not a gap when the log covers the history.
+        expect(subscription.clipped).toBe(false)
+        expect(subscription.source).toBe('log')
+        expect(turnSeqs(seen)).toEqual([1, 2, 3, 4])
+        await hub.close()
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true })
+      }
+    })
   })
 
   it('clamps a stale ack file entry to the restored sequence', async () => {

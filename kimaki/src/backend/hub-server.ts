@@ -95,14 +95,9 @@ export async function startHubServer({
         const writeFrame = (event: HubEvent): void => {
           response.write(`event: ${EVENT_NAME}\ndata: ${JSON.stringify(event)}\n\n`)
         }
-        response.writeHead(200, {
-          'content-type': 'text/event-stream',
-          'cache-control': 'no-cache',
-          connection: 'keep-alive',
-        })
-        // The hub replays synchronously inside subscribe, so hold replayed events
-        // until the ready frame is out. Otherwise a client cannot tell whether its
-        // replay was clipped until after it has already consumed it.
+        // Subscribe BEFORE any SSE header is written: a refused subscription (for
+        // example a cursor ahead of the stream) must reach the client as a real 400,
+        // not as a 200 whose body is JSON on an event-stream connection.
         const pending: HubEvent[] = []
         let readySent = false
         const subscription = hub.subscribe({
@@ -116,6 +111,13 @@ export async function startHubServer({
         if (subscription instanceof Error) {
           return json(response, 400, { error: subscription.message })
         }
+        response.writeHead(200, {
+          'content-type': 'text/event-stream',
+          'cache-control': 'no-cache',
+          connection: 'keep-alive',
+        })
+        // The hub replays synchronously inside subscribe, so replayed events were
+        // buffered above; flush them after the ready frame below.
         clients.add(response)
         readySent = true
         response.write(`event: ready\ndata: ${JSON.stringify({ client: subscription.clientId, cursor, clipped: subscription.clipped, source: subscription.source })}\n\n`)

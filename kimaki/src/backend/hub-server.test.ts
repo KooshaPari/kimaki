@@ -84,6 +84,12 @@ describe('startHubServer', () => {
     expect(await state.json()).toMatchObject({ sessionId: null, busy: false, seq: 0, subscribers: 0 })
     const bad = await fetch(`${server.url}/events?cursor=-5`, { headers })
     expect(bad.status).toBe(400)
+    // A cursor ahead of the stream is a refusal, not an empty 200: before this was
+    // fixed the server wrote SSE headers first and the client saw success with no
+    // events.
+    const ahead = await fetch(`${server.url}/events?cursor=500`, { headers })
+    expect(ahead.status).toBe(400)
+    expect(await ahead.json()).toMatchObject({ error: expect.stringMatching(/ahead/i) })
   })
 
   it('fans one prompt to two independent clients', async () => {
