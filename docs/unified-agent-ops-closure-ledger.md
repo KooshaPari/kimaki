@@ -43,6 +43,10 @@ No milestone is closed. Nothing below is a completion claim; each row names the 
 - Release: internally signed off as a CLI-driven ops layer. This is not approval for a production cutover or for in-bot wiring.
 - Storage: current placement retained. C: free space stays above the 500 GB policy threshold, and E: still needs a shared-volume plus Linux-native split before any reformat.
 
+## Acceptance against the delivered plan
+
+This ledger tracks M1 to M8. The delivered zipset used WP0 to WP9 and AC01 to AC40, and the two were never reconciled until 2026-11-14. `docs/unified-agent-ops-acceptance-map.md` now carries every acceptance case with its status and evidence, plus the work-package mapping and a checksum check of the delivered bundle. Read that file for coverage; treat this ledger as the narrative and decision record.
+
 ## Closure discipline
 
 Each milestone needs a named owner, concrete evidence links or reproducible commands, observed results, and a dated status. Unit tests, mocks and source inspection supplement but do not substitute for real public-interface acceptance. A blocked or unsupported capability stays open with its specific constraint. Do not silently mark a capability complete because a type, plan or placeholder exists. Closure of the whole initiative requires all applicable milestones and both Paperclip pilots, or a clearly documented and explicitly approved scope change.
