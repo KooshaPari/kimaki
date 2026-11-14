@@ -31,7 +31,7 @@ const thread = (value: unknown): value is NativeThread => record(value) && typeo
 // answered by this client, so `answerApproval` stays unsupported.
 export type CodexControlMethod = 'thread/start' | 'turn/start' | 'turn/interrupt'
 export type CodexControlRequest = (method: CodexControlMethod, params: Record<string, unknown>) => Promise<unknown>
-export type CodexNotification = { method: string; params: unknown }
+export type CodexNotification = { method: string; params?: unknown; id?: number }
 export type CodexNotificationListener = (notification: CodexNotification) => void
 export type CodexSubscribe = (listener: CodexNotificationListener) => (() => void) | Error
 

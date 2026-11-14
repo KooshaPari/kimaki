@@ -80,6 +80,16 @@ rl.on('line', (line) => {
     return
   }
   if (text.startsWith('silent')) return
+  if (text.startsWith('CORRECTION')) {
+    update(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'the sky is grenn' } })
+    // Hypothetical retraction frame. jcode 0.99.1 advertises no correction
+    // capability and never sends one, so this proves an unknown update kind is
+    // ignored rather than rendered as a fabricated correction.
+    update(sid, { sessionUpdate: 'agent_message_retraction', messageId: 'message_1' })
+    update(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '\nthe sky is green' } })
+    send({ jsonrpc: '2.0', id: message.id, result: { stopReason: 'end_turn' } })
+    return
+  }
   if (text.startsWith('AUTH_FAIL')) {
     update(sid, { sessionUpdate: 'available_commands_update', availableCommands: [] })
     send({
@@ -193,6 +203,22 @@ test('streams prompt chunks in order and assembles the turn', async () => {
   // tool_call + two chunks; the unknown permission notification is ignored.
   expect(result.updateCount).toBe(3)
   expect(result.usage).toEqual({ inputTokens: 30754, outputTokens: 28, totalTokens: 30782 })
+})
+
+test('cannot retract text already streamed: an unknown update kind is ignored, not invented', async () => {
+  const client = await startAgent()
+  ok(await client.initialize())
+  const { sessionId } = ok(await client.newSession({ cwd: process.cwd() }))
+  const chunks: string[] = []
+  const result = ok(await client.prompt({ sessionId, text: 'CORRECTION', onChunk: (text) => chunks.push(text) }))
+  // A real jcode 0.99.1 turn emits only available_commands_update,
+  // agent_message_chunk and usage_update, and its agentCapabilities declares no
+  // correction or retraction surface, so both the misspelling and the restatement
+  // reach the client as ordinary text. The client must not fabricate a correction.
+  expect(chunks).toEqual(['the sky is grenn', '\nthe sky is green'])
+  expect(result.text).toBe('the sky is grenn\nthe sky is green')
+  expect(result.updateCount).toBe(3)
+  expect(result.stopReason).toBe('end_turn')
 })
 
 test('omits usage when the agent sends none', async () => {

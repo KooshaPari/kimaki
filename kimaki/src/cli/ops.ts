@@ -9,6 +9,35 @@ function required(value: string | undefined, flag: string): string {
 }
 
 export function registerOpsCommands(cli: Goke) {
+  cli.command('ops codex turn', 'Run one explicit Codex app-server turn and stream text deltas')
+    .option('--binary <path>', 'Explicit Codex executable')
+    .option('--codex-home <dir>', 'Explicit isolated Codex state directory')
+    .option('--prompt <text>', 'Text for one turn')
+    .option('--cwd <dir>', 'Working directory for the new thread')
+    .option('--timeout-ms <n>', 'Request and turn timeout in milliseconds')
+    .action(async (options) => {
+      const binary = required(options.binary, 'binary')
+      const codexHome = required(options.codexHome, 'codex-home')
+      const prompt = required(options.prompt, 'prompt')
+      const timeoutMs = options.timeoutMs === undefined ? undefined : Number(options.timeoutMs)
+      if (timeoutMs !== undefined && (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1)) fail(new ConfigError({ reason: '--timeout-ms must be a positive integer' }))
+      const { startCodexAppServer } = await import('../ops/runtime/codex-app-server.ts')
+      const { createCodexController } = await import('../ops/runtime/codex.ts')
+      const server = await startCodexAppServer({ binary, codexHome, timeoutMs })
+      if (server instanceof Error) fail(server)
+      try {
+        const controller = createCodexController({ hostId: 'local', endpointId: 'explicit-app-server', request: server.request, subscribe: server.subscribe, timeoutMs, turnTimeoutMs: timeoutMs })
+        if (controller instanceof Error) fail(controller)
+        try {
+          const started = await controller.startThread(options.cwd === undefined ? {} : { cwd: options.cwd })
+          if (started instanceof Error) fail(started)
+          const result = await controller.sendTurn({ threadId: started.threadId, text: prompt, onDelta: ({ text }) => printJson({ kind: 'delta', text }) })
+          if (result instanceof Error) fail(result)
+          printJson({ kind: 'turn', status: result.status, threadId: result.threadId, turnId: result.turnId, text: result.text })
+        } finally { controller.close() }
+      } finally { await server.close() }
+    })
+
   cli.command('ops follow', 'Follow one explicitly authorized OpenCode or Jcode session and publish fixed metadata')
     .option('--source <kind>', 'Runtime source: opencode (default) or jcode')
     .option('--service-file <path>', 'Explicit running OpenCode service file')
