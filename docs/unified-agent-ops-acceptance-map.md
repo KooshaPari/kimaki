@@ -40,7 +40,7 @@ AC03, AC04, AC06, AC07, AC13, AC14, AC17, AC23 and AC25 are closed. Every other 
 | AC15 | Crash after launch before ACK | not started | no crash-after-launch-before-ack case |
 | AC16 | Competing managed launch paths | partial | the hub lease refuses a second writer; no Paperclip launcher fencing |
 | AC17 | Cancel request | closed | a real codex 0.169 app-server turn was interrupted mid-flight through `ops codex turn --cancel-after 2500` against a deliberately slow local model: the CLI printed `cancel-requested` and the turn settled with `"status": "interrupted"` and empty text, which is the native turn state. The hub also accepts a cancel and stays inert when idle |
-| AC18 | Approval race/replay | partial | `startCodexAppServer` can hold a server-initiated request instead of failing it with `-32601`; `createCodexController` surfaces the request, applies an opt-in policy, and answers it exactly once. A replay, an id that was never issued, an id the transport dropped, and a second racing answer are each refused by name; `close` releases anything still held. 30 controller tests and 4 transport tests pass, `tsc` is clean, commit `8450f029`. The transport tests use a fake app-server child, so the real-native half is still missing: no Codex 0.169 approval request has been driven through a real binary |
+| AC18 | Approval race/replay | partial | `startCodexAppServer` holds a server-initiated request instead of failing it with `-32601`; `createCodexController` surfaces the full payload (command, cwd, kind, grantRoot, approvalId, startedAtMs), applies an opt-in policy, and answers exactly once. A replay, an unknown id, an id the transport dropped, and a second racing answer are each refused by name. Invalid policy decisions fail closed to `decline`; `humanCommand` refuses `acceptForSession`; `item/permissions/requestApproval` is refused rather than held; the supported capability names the two methods it answers; approvals require `holdsServerRequests: true`; the transport reports delivery only for a live writable child and clears held ids on exit. 37 controller, 5 transport and 4 hub tests pass; `tsc` clean; commit `8ee74cef`. The transport tests use a fake app-server child, so the real-native half is still missing: no Codex 0.169 approval request has been driven through a real binary |
 | AC19 | Artifact changed after approval | not started | no artifact digest/revision mismatch case |
 | AC20 | Credential revocation | partial | consent revoked mid-flight blocks publication; credential revocation is not exercised |
 | AC21 | Prompt injection through chat/output | not started | no prompt-injection-through-output case |
@@ -76,7 +76,7 @@ AC03, AC04, AC06, AC07, AC13, AC14, AC17, AC23 and AC25 are closed. Every other 
 | WP5 | JCode/KCode adapters | partial | ACP backend, CLI, hub, durable stream, presence, ack and a Discord view of a live session verified; KCode identity absent and Jcode exposes no retraction or correction surface |
 | WP6 | Paperclip plugin and runtime adapter | partial | run metadata read and a local-command managed run; no entity projection or enrollment, model-backed run blocked |
 | WP7 | Discord comparison and route ownership | partial | consent-gated metadata publication, a live channel view of a hub session (`ops discord view`) with durable resume, and a native-session mirror (`ops jcode watch --tenant/--surface/--state`) that posted four real messages from a terminal session it did not start, with a durable index; no in-bot wiring, route ownership or cutover |
-| WP8 | Reliability and acceptance witnesses | partial | 61 backend tests plus 27 hub, 15 ACP client, 30 Codex control, 4 Codex transport, 4 Codex hub, 6 publication, 8 Discord view, 7 native mirror and 8 binding tests; three real witnesses (three clients on one jcode hub, native terminal mirrored into a channel, real Codex thread served and mirrored); test-suite gate baseline recorded in `docs/release-gate-2026-11-14.md` |
+| WP8 | Reliability and acceptance witnesses | partial | 61 backend tests plus 27 hub, 15 ACP client, 37 Codex control, 5 Codex transport, 4 Codex hub, 6 publication, 8 Discord view, 7 native mirror and 8 binding tests; three real witnesses (three clients on one jcode hub, native terminal mirrored into a channel, real Codex thread served and mirrored); test-suite gate baseline recorded in `docs/release-gate-2026-11-14.md` |
 | WP9 | Migration and retirement | not started | decision matrix and rollback rehearsal only; nothing drained or retired |
 
 ## What would move the most cases
@@ -212,6 +212,11 @@ Approval requests are a first-class opt-in. Without an approval channel the tran
 | Policy throws | decision becomes `decline`, never an accidental grant |
 | Close with held request | `close` releases it with `-32601`; later answers return false |
 | Unsupported server request | failed with `-32601` so the turn cannot hang |
+| Payload scope | command, cwd, kind, grantRoot, approvalId and startedAtMs are surfaced; a fileChange grantRoot is visible before any session-wide answer |
+| Method honesty | the supported capability names commandExecution and fileChange; item/permissions/requestApproval is refused with -32601 and never enters pending |
+| Transport tie | approvals require `holdsServerRequests: true`; the capability is supported only then |
+| Dead child | respond/respondError return false after exit or close; pendingServerRequests is empty |
+| Decision validation | an invalid policy value fails closed to decline; humanCommand refuses acceptForSession |
 
 Codex parity with the jcode fabric, measured end to end:
 
