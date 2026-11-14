@@ -37,22 +37,28 @@ export async function startCodexAppServer({ binary, codexHome, timeoutMs = 30_00
   const listeners = new Set<(message: Message) => void>()
   const awaiting = new Set<number>()
   let id = 0
+  // A child that has exited or failed can no longer receive an answer, so a write
+  // attempt is not evidence of delivery. Liveness is tracked explicitly because
+  // `child.stdin` can stay nominally writable for a short window after exit.
+  let alive = true
   const write = (message: unknown) => { child.stdin.write(`${JSON.stringify(message)}\n`) }
+  const deliverable = () => alive && !child.stdin.destroyed && !child.stdin.writableEnded && child.stdin.writable
   // Every server-initiated request that is still open, so a holder can list what
   // it owes an answer to and `close` can release anything left behind.
   const open = new Map<number, { method: string; params?: unknown }>()
-  const respond = (requestId: number, result: unknown) => {
-    if (!awaiting.delete(requestId)) return false
+  // The id is spent either way: an answer that cannot be delivered must not leave
+  // the request listed as open, or a holder would keep offering an undeliverable answer.
+  const answer = (requestId: number, message: () => unknown) => {
+    const held = awaiting.delete(requestId)
     open.delete(requestId)
-    write({ id: requestId, result })
+    if (!held) return false
+    if (!deliverable()) return false
+    try { write(message()) } catch { return false }
     return true
   }
-  const respondError = (requestId: number, code: number, message: string) => {
-    if (!awaiting.delete(requestId)) return false
-    open.delete(requestId)
-    write({ id: requestId, error: { code, message } })
-    return true
-  }
+  const respond = (requestId: number, result: unknown) => answer(requestId, () => ({ id: requestId, result }))
+  const respondError = (requestId: number, code: number, message: string) =>
+    answer(requestId, () => ({ id: requestId, error: { code, message } }))
   lines.on('line', (line) => {
     let message: unknown
     try { message = JSON.parse(line) } catch { return }
@@ -78,8 +84,16 @@ export async function startCodexAppServer({ binary, codexHome, timeoutMs = 30_00
     })
   })
   const failAll = (error: Error) => { for (const entry of pending.values()) entry.reject(error); pending.clear() }
-  child.on('error', failAll)
-  child.on('exit', () => failAll(new Error('app-server exited')))
+  // A dead child answers nothing more: fail in-flight requests and drop every held
+  // server request so `pendingServerRequests` matches reality and late answers report false.
+  const abandon = (error: Error) => {
+    alive = false
+    awaiting.clear()
+    open.clear()
+    failAll(error)
+  }
+  child.on('error', (error) => abandon(error))
+  child.on('exit', () => abandon(new Error('app-server exited')))
   const deadline = setTimeout(() => { child.kill(); failAll(new Error('app-server timed out')) }, timeoutMs)
   const close = async () => {
     clearTimeout(deadline)
@@ -87,6 +101,11 @@ export async function startCodexAppServer({ binary, codexHome, timeoutMs = 30_00
     for (const requestId of [...open.keys()]) respondError(requestId, -32601, 'app-server closed before this request was answered')
     child.kill()
     await closed
+    // The exit handler clears these; repeat it so `close` alone guarantees emptiness
+    // even if the child had already gone before this call.
+    alive = false
+    awaiting.clear()
+    open.clear()
     lines.close()
     listeners.clear()
   }

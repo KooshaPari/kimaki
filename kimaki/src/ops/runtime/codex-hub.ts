@@ -6,8 +6,8 @@ import type { HubBackend } from '../../backend/hub.ts'
 import { ConfigError } from '../../errors.ts'
 
 export type CodexHubController = {
-  startThread(input: { cwd?: string }): Promise<{ threadId: string } | Error>
-  resumeThread(input: { threadId: string; cwd?: string }): Promise<{ threadId: string } | Error>
+  startThread(input: { cwd?: string; approvalPolicy?: 'untrusted' | 'on-request' | 'never' }): Promise<{ threadId: string } | Error>
+  resumeThread(input: { threadId: string; cwd?: string; approvalPolicy?: 'untrusted' | 'on-request' | 'never' }): Promise<{ threadId: string } | Error>
   sendTurn(input: {
     threadId: string
     text: string
@@ -16,20 +16,22 @@ export type CodexHubController = {
   cancel(input: { threadId: string }): Promise<unknown>
 }
 
-export function createCodexHubBackend({ controller, cwd, model = null, resumeThreadId }: {
+export function createCodexHubBackend({ controller, cwd, model = null, resumeThreadId, approvalPolicy }: {
   controller: CodexHubController
   cwd: string
   model?: string | null
   /** Resume an existing thread instead of starting a new one. */
   resumeThreadId?: string
+  /** Approval policy the thread is created or resumed with. */
+  approvalPolicy?: 'untrusted' | 'on-request' | 'never'
 }): HubBackend & { threadId(): string | null } {
   let threadId: string | null = null
   return {
     threadId: () => threadId,
     async start() {
       const started = resumeThreadId === undefined
-        ? await controller.startThread({ cwd })
-        : await controller.resumeThread({ threadId: resumeThreadId, cwd })
+        ? await controller.startThread({ cwd, ...(approvalPolicy === undefined ? {} : { approvalPolicy }) })
+        : await controller.resumeThread({ threadId: resumeThreadId, cwd, ...(approvalPolicy === undefined ? {} : { approvalPolicy }) })
       if (started instanceof Error) return started
       threadId = started.threadId
       return { sessionId: started.threadId, model }

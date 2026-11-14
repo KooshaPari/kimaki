@@ -557,6 +557,36 @@ describe('createSessionHub', () => {
     })
   })
 
+  it('restores the valid prefix of a log whose last line was torn by a crash', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-hub-torn-'))
+    const logFile = path.join(dir, 'events.jsonl')
+    try {
+      const valid = [
+        { seq: 1, type: 'prompt.started', characters: 5 },
+        { seq: 2, type: 'prompt.chunk', text: 'hel' },
+        { seq: 3, type: 'prompt.finished', stopReason: 'end_turn', characters: 5 },
+      ]
+      // The trailing fragment is what a crash mid-write leaves behind.
+      fs.writeFileSync(logFile, `${valid.map((event) => JSON.stringify(event)).join('\n')}\n{"seq":4,"type":"prompt.`)
+      const hub = createSessionHub({ backend: fakeBackend().backend, logFile })
+      if (hub instanceof Error) throw hub
+      // The torn line is skipped, so the restored stream ends at the last whole event.
+      expect(hub.snapshot().seq).toBe(3)
+      const replayed: HubEvent[] = []
+      const subscription = hub.subscribe({ cursor: 0, onEvent: (event) => replayed.push(event) })
+      if (subscription instanceof Error) throw subscription
+      expect(subscription.clipped).toBe(false)
+      expect(replayed.map((event) => event.seq)).toEqual([1, 2, 3])
+      // A new turn continues after the recovered prefix rather than reusing its numbers.
+      await hub.submit('hello')
+      await wait(10)
+      expect(hub.snapshot().seq).toBe(7)
+      await hub.close()
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
   it('clamps a stale ack file entry to the restored sequence', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-hub-acks-clamp-'))
     const logFile = path.join(dir, 'events.jsonl')

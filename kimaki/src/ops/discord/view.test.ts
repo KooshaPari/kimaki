@@ -196,6 +196,27 @@ test('refuses a cursor it cannot attribute to a session', async () => {
   } finally { await f.close() }
 })
 
+test('refuses a channel that does not belong to the requested tenant', async () => {
+  const f = await fixture()
+  const before = await count()
+  try {
+    const rest = new REST({ api: discord.restUrl, version: '10' }).setToken(discord.botToken)
+    const controller = new AbortController()
+    const result = await openDiscordView({
+      rest,
+      tenantId: '000000000000000000',
+      channelId,
+      clientId: 'wrong-tenant',
+      statePath: f.statePath,
+      baseUrl: f.server.url,
+      signal: controller.signal,
+    })
+    expect(result).toBeInstanceOf(Error)
+    expect(await count()).toBe(before)
+    expect(fs.existsSync(f.statePath)).toBe(false)
+  } finally { await f.close() }
+})
+
 test('refuses an unreadable state file instead of starting from zero', async () => {
   const f = await fixture()
   const before = await count()

@@ -52,6 +52,7 @@ export function registerOpsCommands(cli: Goke) {
           subscribe: server.subscribe,
           timeoutMs,
           turnTimeoutMs: timeoutMs,
+          holdsServerRequests: approval !== undefined,
           ...(approval === undefined ? {} : {
             serverRequests: { result: server.respond, error: server.respondError },
             approvals: {
@@ -707,6 +708,7 @@ export function registerOpsCommands(cli: Goke) {
     .option('--log <path>', 'Append-only JSONL event log; enables resume across restarts and takes a writer lease')
     .option('--timeout-ms <n>', 'Request and turn timeout in milliseconds')
     .option('--approval <decision>', 'Answer approval requests on the served thread: accept, acceptForSession, decline or cancel')
+    .option('--approval-policy <policy>', 'Codex approval policy for the served thread: untrusted, on-request or never')
     .action(async (options) => {
       const binary = required(options.binary, 'binary')
       const codexHome = required(options.codexHome, 'codex-home')
@@ -716,6 +718,10 @@ export function registerOpsCommands(cli: Goke) {
       const timeoutMs = options.timeoutMs === undefined ? undefined : Number(options.timeoutMs)
       if (timeoutMs !== undefined && (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1)) fail(new ConfigError({ reason: '--timeout-ms must be a positive integer' }))
       const approval = approvalDecision(options.approval)
+      const approvalPolicy = options.approvalPolicy === undefined
+        ? undefined
+        : (['untrusted', 'on-request', 'never'] as const).find((policy) => policy === options.approvalPolicy)
+      if (options.approvalPolicy !== undefined && approvalPolicy === undefined) fail(new ConfigError({ reason: '--approval-policy must be untrusted, on-request or never' }))
       const { startCodexAppServer } = await import('../ops/runtime/codex-app-server.ts')
       const { createCodexController } = await import('../ops/runtime/codex.ts')
       const { createCodexHubBackend } = await import('../ops/runtime/codex-hub.ts')
@@ -730,6 +736,7 @@ export function registerOpsCommands(cli: Goke) {
         subscribe: server.subscribe,
         timeoutMs,
         turnTimeoutMs: timeoutMs,
+        holdsServerRequests: approval !== undefined,
         ...(approval === undefined ? {} : {
           serverRequests: { result: server.respond, error: server.respondError },
           approvals: {
@@ -755,6 +762,7 @@ export function registerOpsCommands(cli: Goke) {
         controller,
         cwd,
         ...(options.thread === undefined ? {} : { resumeThreadId: options.thread }),
+        ...(approvalPolicy === undefined ? {} : { approvalPolicy }),
       })
       const hub = createSessionHub({ backend, logFile: options.log })
       if (hub instanceof Error) {
@@ -907,7 +915,9 @@ export function registerOpsCommands(cli: Goke) {
         rest,
         tenantId: tenant,
         channelId: surface,
-        clientId: options.client ?? 'discord-view',
+        // The hub refuses a duplicate client id, so two views on one session must
+        // not share a default. A per-process id keeps separate surfaces independent.
+        clientId: options.client ?? `discord-view-${process.pid}`,
         cursor,
         statePath,
         baseUrl: url,

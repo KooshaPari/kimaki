@@ -136,6 +136,7 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
       subscribe: server.subscribe,
       timeoutMs: 20000,
       turnTimeoutMs: 20000,
+      holdsServerRequests: true,
       serverRequests: { result: server.respond, error: server.respondError },
       approvals: { policy: () => 'accept', onRequest: (request) => { requests.push({ requestId: request.requestId, command: request.command }) } },
     })
@@ -186,4 +187,46 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
   expect(server.pendingServerRequests()).toEqual([])
   expect(server.respondError(42, -32601, 'late answer')).toBe(false)
   expect(server.respond(42, { decision: 'accept' })).toBe(false)
+})
+
+it('drops held server requests and reports undelivered answers when the child exits on its own', async () => {
+  const scratch = 'E:/koosh/Agents/scratch/codex-transport'
+  await mkdir(scratch, { recursive: true })
+  const dir = await mkdtemp(join(scratch, 'kimaki-codex-hold-exit-'))
+  dirs.push(dir)
+  const script = join(dir, 'app-server.js')
+  // The fake raises an approval the client owns and then dies of its own accord: no
+  // `close` call from the parent. An answer written afterwards would go nowhere, so
+  // it must be reported as undelivered rather than as success.
+  await writeFile(script, `const readline = require('node:readline');
+const send = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
+readline.createInterface({ input: process.stdin }).on('line', (line) => {
+  const message = JSON.parse(line);
+  if (message.method === 'initialize') send({ id: message.id, result: { capabilities: {} } });
+  if (message.method === 'thread/start') {
+    send({ id: 42, method: 'item/fileChange/requestApproval', params: { threadId: 'thread-1', itemId: 'item-1' } });
+  }
+  if (message.method === 'shell/exitNow') setTimeout(() => process.exit(0), 0);
+});`)
+  const server = await startCodexAppServer({ binary: process.execPath, codexHome: dir, timeoutMs: 20000, holdServerRequests: true })
+  if (server instanceof Error) throw server
+  try {
+    // Both requests hang by design; settle them into plain promises so the exit is
+    // observable without an unhandled rejection.
+    const ignore = (promise: Promise<unknown>) => promise.then(() => undefined, () => undefined)
+    const started = ignore(server.request('thread/start', {}))
+    for (let attempt = 0; attempt < 200 && server.pendingServerRequests().length === 0; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    expect(server.pendingServerRequests()).toEqual([{ id: 42, method: 'item/fileChange/requestApproval', params: { threadId: 'thread-1', itemId: 'item-1' } }])
+    // Trigger the child's own exit, then wait for the transport to notice it.
+    const exited = ignore(server.request('shell/exitNow', {}))
+    await Promise.all([started, exited])
+    expect(server.pendingServerRequests()).toEqual([])
+    expect(server.respond(42, { decision: 'accept' })).toBe(false)
+    expect(server.respondError(42, -32601, 'late answer')).toBe(false)
+  } finally { await server.close() }
+  expect(server.pendingServerRequests()).toEqual([])
+  expect(server.respond(42, { decision: 'accept' })).toBe(false)
+  expect(server.respondError(42, -32601, 'late answer')).toBe(false)
 })

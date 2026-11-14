@@ -299,6 +299,9 @@ function approvalHarness(policy?: CodexApprovalPolicy, withApprovals = true) {
     },
     timeoutMs: 50,
     turnTimeoutMs: 50,
+    // The stand-in transport below holds a server request until exactly one answer
+    // is written, which is exactly what the option declares.
+    holdsServerRequests: true,
     serverRequests: {
       result: (id, result) => {
         if (!open.delete(id)) return false
@@ -335,7 +338,27 @@ describe('Codex approval surface', () => {
     expect(controller.capabilities.control.answerApproval.kind).toBe('unsupported')
     expect(controller.answerApproval({ requestId: 1, decision: 'accept' })).toBeInstanceOf(Error)
     const configured = approvalHarness(() => 'accept')
-    expect(configured.controller.capabilities.control.answerApproval.kind).toBe('supported')
+    expect(configured.controller.capabilities.control.answerApproval).toMatchObject({
+      kind: 'supported',
+      methods: ['item/commandExecution/requestApproval', 'item/fileChange/requestApproval'],
+    })
+  })
+
+  it('refuses an approval surface without a transport that holds server requests', () => {
+    const base = {
+      hostId: 'host',
+      endpointId: 'endpoint',
+      request: async () => ({}),
+      subscribe: () => () => {},
+      serverRequests: { result: () => true, error: () => true },
+      approvals: { policy: () => 'accept' as const },
+    }
+    const missing = createCodexController(base)
+    expect(missing).toBeInstanceOf(Error)
+    expect((missing as Error).message).toMatch(/holds server requests/)
+    const refused = createCodexController({ ...base, holdsServerRequests: false })
+    expect(refused).toBeInstanceOf(Error)
+    expect((refused as Error).message).toMatch(/holds server requests/)
   })
 
   it('refuses an approval surface without a result and error channel', () => {
@@ -409,6 +432,101 @@ describe('Codex approval surface', () => {
     const { failures, request } = approvalHarness()
     request(12, 'item/tool/requestUserInput', { threadId: 'thread-1' })
     expect(failures).toEqual([{ id: 12, code: -32601, message: 'Server-initiated request item/tool/requestUserInput unsupported' }])
+  })
+
+  it('surfaces command approval scope to the policy', () => {
+    const seen: CodexApprovalRequest[] = []
+    const { ask } = approvalHarness((request) => { seen.push(request); return 'accept' })
+    ask(21, { cwd: 'E:/work', kind: 'command', approvalId: 'apr-1', startedAtMs: 1_700_000_000_000 })
+    expect(seen).toEqual([{
+      requestId: 21,
+      method: 'item/commandExecution/requestApproval',
+      threadId: 'thread-1',
+      turnId: 'turn-1',
+      itemId: 'item-1',
+      command: 'rm -rf /tmp/x',
+      reason: null,
+      grantRoot: null,
+      cwd: 'E:/work',
+      kind: 'command',
+      approvalId: 'apr-1',
+      startedAtMs: 1_700_000_000_000,
+    }])
+  })
+
+  it('surfaces a file-change grant root to the policy', () => {
+    const seen: CodexApprovalRequest[] = []
+    const { request } = approvalHarness((approval) => { seen.push(approval); return 'accept' })
+    request(22, 'item/fileChange/requestApproval', {
+      threadId: 'thread-1',
+      turnId: 'turn-1',
+      itemId: 'item-2',
+      grantRoot: 'E:/work/repo',
+      reason: 'write outside workspace',
+    })
+    expect(seen).toEqual([{
+      requestId: 22,
+      method: 'item/fileChange/requestApproval',
+      threadId: 'thread-1',
+      turnId: 'turn-1',
+      itemId: 'item-2',
+      command: null,
+      reason: 'write outside workspace',
+      grantRoot: 'E:/work/repo',
+      cwd: null,
+      kind: null,
+      approvalId: null,
+      startedAtMs: null,
+    }])
+  })
+
+  it('drops blank scope fields and non-finite timestamps', () => {
+    const { requests, ask, request } = approvalHarness(() => 'accept')
+    ask(23, { cwd: '   ', approvalId: ' ', startedAtMs: Number.POSITIVE_INFINITY })
+    // A command approval with no kind reported is a plain command, not unknown.
+    expect(requests[0]).toMatchObject({ cwd: null, approvalId: null, startedAtMs: null, kind: 'command' })
+    request(24, 'item/fileChange/requestApproval', { threadId: 'thread-1', kind: '  ', grantRoot: '   ', cwd: '' })
+    expect(requests[1]).toMatchObject({ method: 'item/fileChange/requestApproval', kind: null, grantRoot: null, cwd: null })
+  })
+
+  it('refuses item/permissions/requestApproval and never holds it', () => {
+    const { controller, failures, request } = approvalHarness(() => 'accept')
+    request(15, 'item/permissions/requestApproval', { threadId: 'thread-1' })
+    expect(failures).toEqual([
+      { id: 15, code: -32601, message: 'Server-initiated request item/permissions/requestApproval unsupported' },
+    ])
+    expect(controller.pendingApprovals()).toEqual([])
+  })
+
+  it('fails closed when a policy returns a decision outside the protocol set', () => {
+    const invalid = (() => 'grant') as unknown as CodexApprovalPolicy
+    const { results, ask } = approvalHarness(invalid)
+    ask(31)
+    expect(results).toEqual([{ id: 31, result: { decision: 'decline' } }])
+  })
+
+  it('refuses acceptForSession for a humanCommand and fails closed to decline', () => {
+    // A policy that reaches for the session answer gets a refusal, not a grant.
+    const policy = approvalHarness(() => 'acceptForSession')
+    policy.ask(41, { kind: 'humanCommand' })
+    expect(policy.results).toEqual([{ id: 41, result: { decision: 'decline' } }])
+
+    // An explicit answer is refused by name and leaves the request open, so a
+    // valid answer can still be given afterwards.
+    const explicit = approvalHarness()
+    explicit.ask(42, { kind: 'humanCommand' })
+    const refused = explicit.controller.answerApproval({ requestId: 42, decision: 'acceptForSession' })
+    expect(refused).toBeInstanceOf(Error)
+    expect((refused as Error).message).toMatch(/humanCommand/)
+    expect(explicit.results).toEqual([])
+    expect(explicit.controller.pendingApprovals()).toHaveLength(1)
+    expect(explicit.controller.answerApproval({ requestId: 42, decision: 'accept' })).toEqual({ requestId: 42, decision: 'accept' })
+    expect(explicit.results).toEqual([{ id: 42, result: { decision: 'accept' } }])
+
+    // Other command kinds still admit the session answer.
+    const plain = approvalHarness(() => 'acceptForSession')
+    plain.ask(43)
+    expect(plain.results).toEqual([{ id: 43, result: { decision: 'acceptForSession' } }])
   })
 
   it('declines when a policy throws instead of granting by accident', () => {

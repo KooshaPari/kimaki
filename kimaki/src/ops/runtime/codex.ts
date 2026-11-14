@@ -49,7 +49,14 @@ export type CodexNotification = { method: string; params?: unknown; id?: number 
 export type CodexNotificationListener = (notification: CodexNotification) => void
 export type CodexSubscribe = (listener: CodexNotificationListener) => (() => void) | Error
 
-export type CodexCapability = { kind: 'supported' } | { kind: 'unsupported'; reason: string }
+// A supported capability may name the protocol methods it actually answers, so a
+// caller can distinguish "this client answers approvals" from "this client
+// answers the two approval methods the runtime documents".
+export type CodexCapability = { kind: 'supported'; methods?: string[] } | { kind: 'unsupported'; reason: string }
+// The only server requests this controller can answer when an approval channel is
+// configured. `item/permissions/requestApproval` is deliberately absent: it has no
+// defined answer here, so it is refused instead of being held open.
+export const codexApprovalMethods = ['item/commandExecution/requestApproval', 'item/fileChange/requestApproval'] as const
 export type CodexControlCapabilities = {
   version: 1
   discovery: { kind: 'supported' }
@@ -85,6 +92,15 @@ export type CodexTurnResult = { threadId: string; turnId: string; status: 'compl
 // `{ decision }`, where command decisions also admit `acceptForSession` and
 // both variants admit `cancel`.
 export type CodexApprovalDecision = 'accept' | 'acceptForSession' | 'decline' | 'cancel'
+const approvalDecisions: readonly string[] = ['accept', 'acceptForSession', 'decline', 'cancel']
+// A policy is caller code, so its answer is data on the wire and must be checked
+// at the boundary instead of trusted from its declared type.
+const isApprovalDecision = (value: unknown): value is CodexApprovalDecision =>
+  typeof value === 'string' && approvalDecisions.includes(value)
+// `humanCommand` has no session-wide grant to extend, so `acceptForSession` is
+// not an answer the runtime accepts for it.
+const isDecisionValidFor = (request: CodexApprovalRequest, decision: CodexApprovalDecision): boolean =>
+  !(request.kind === 'humanCommand' && decision === 'acceptForSession')
 export type CodexApprovalRequest = {
   requestId: number
   method: 'item/commandExecution/requestApproval' | 'item/fileChange/requestApproval'
@@ -94,6 +110,19 @@ export type CodexApprovalRequest = {
   /** The command under review, when the runtime names one. */
   command: string | null
   reason: string | null
+  /**
+   * File-change approvals name the root a session-wide grant would cover. Without
+   * it an `acceptForSession` answer would silently widen to an unseen path.
+   */
+  grantRoot: string | null
+  /** Working directory the runtime reports for the action under review. */
+  cwd: string | null
+  /** Runtime-reported classification of the change being approved. */
+  kind: string | null
+  /** Stable runtime id for this approval, when one is supplied. */
+  approvalId: string | null
+  /** When the runtime started the approval clock, in epoch milliseconds. */
+  startedAtMs: number | null
 }
 export type CodexApprovalPolicy = (request: CodexApprovalRequest) => CodexApprovalDecision | null
 type TurnSettlement = CodexTurnResult | Error
@@ -146,6 +175,7 @@ export function createCodexController({
   turnTimeoutMs = 600_000,
   serverRequests,
   approvals,
+  holdsServerRequests,
 }: {
   hostId: string
   endpointId: string
@@ -153,6 +183,12 @@ export function createCodexController({
   subscribe: CodexSubscribe
   timeoutMs?: number
   turnTimeoutMs?: number
+  /**
+   * Declares that the transport was started with `holdServerRequests`, so a
+   * server-initiated request stays open until this client answers it. An approval
+   * surface is meaningless without it: the transport would answer first.
+   */
+  holdsServerRequests?: boolean
   /**
    * Delivers the two possible JSON-RPC answers to a server-initiated request.
    * Required for any approval surface: the transport must be started with
@@ -175,6 +211,9 @@ export function createCodexController({
   if (approvals !== undefined && (typeof serverRequests?.result !== 'function' || typeof serverRequests?.error !== 'function')) {
     return new ConfigError({ reason: 'An approval surface needs a result and an error channel for server-initiated requests' })
   }
+  if (approvals !== undefined && holdsServerRequests !== true) {
+    return new ConfigError({ reason: 'An approval surface requires a transport that holds server requests' })
+  }
   const source = Object.freeze({ hostId, endpointId, backendKind: 'codex' as const })
   const keyFor = (nativeSessionId: string): SessionKey => ({ ...source, nativeSessionId })
   const pending = new Map<string, PendingTurn>()
@@ -190,26 +229,48 @@ export function createCodexController({
     if (typeof notification.id !== 'number') return null
     const params = notification.params
     if (!record(params) || typeof params.threadId !== 'string') return null
+    // Only the two documented methods are held. `item/permissions/requestApproval`
+    // has no answer shape here, so it must fall through to the refusal path rather
+    // than entering the pending set.
     if (notification.method !== 'item/commandExecution/requestApproval' && notification.method !== 'item/fileChange/requestApproval') return null
+    const text = (value: unknown): string | null => (typeof value === 'string' && value.trim().length > 0 ? value : null)
+    // The schema admits `command | writeStdin | humanCommand` and older servers
+    // omit it entirely, which means a plain command.
+    const kind = text(params.kind) ?? (notification.method === 'item/commandExecution/requestApproval' ? 'command' : null)
     return {
       requestId: notification.id,
       method: notification.method,
       threadId: params.threadId,
-      turnId: typeof params.turnId === 'string' && params.turnId ? params.turnId : null,
-      itemId: typeof params.itemId === 'string' && params.itemId ? params.itemId : null,
-      command: typeof params.command === 'string' && params.command ? params.command : null,
-      reason: typeof params.reason === 'string' && params.reason ? params.reason : null,
+      turnId: text(params.turnId),
+      itemId: text(params.itemId),
+      command: text(params.command),
+      reason: text(params.reason),
+      grantRoot: text(params.grantRoot),
+      cwd: text(params.cwd),
+      kind,
+      approvalId: text(params.approvalId),
+      startedAtMs: typeof params.startedAtMs === 'number' && Number.isFinite(params.startedAtMs) ? params.startedAtMs : null,
     }
   }
 
   // One place answers, so "first answer wins" is a property of the code and not
   // of whichever caller happens to run first.
   const settleApproval = (requestId: number, decision: CodexApprovalDecision): Error | { requestId: number; decision: CodexApprovalDecision } => {
+    // Defence in depth: `answerApproval` already validates, but this is the only
+    // function that writes an answer, so it never forwards an unchecked value.
+    if (!isApprovalDecision(decision)) {
+      return new CodexApprovalError({ requestId: String(requestId), reason: `the decision ${String(decision)} is not one of ${approvalDecisions.join(', ')}` })
+    }
     const request = openApprovals.get(requestId)
     if (!request) {
       return settledApprovals.has(requestId)
         ? new CodexApprovalError({ requestId: String(requestId), reason: 'it was already answered, so a repeated answer cannot change the decision' })
         : new CodexApprovalError({ requestId: String(requestId), reason: 'no approval request with this id is open' })
+    }
+    // A human command has no session-wide grant to extend, so the runtime's
+    // session answer is not a valid decision for it.
+    if (!isDecisionValidFor(request, decision)) {
+      return new CodexApprovalError({ requestId: String(requestId), reason: `the decision ${decision} is not valid for a ${request.kind} approval` })
     }
     if (!serverRequests!.result(requestId, { decision })) {
       openApprovals.delete(requestId)
@@ -245,6 +306,9 @@ export function createCodexController({
       } catch {
         decision = 'decline'
       }
+      // A policy can return anything at runtime. `null` means "leave it open";
+      // every other unrecognised value fails closed instead of reaching the wire.
+      if (decision !== null && (!isApprovalDecision(decision) || !isDecisionValidFor(approval, decision))) decision = 'decline'
       if (decision !== null) settleApproval(approval.requestId, decision)
       return
     }
@@ -324,7 +388,10 @@ export function createCodexController({
     ? codexControlCapabilities
     : {
         ...codexControlCapabilities,
-        control: { ...codexControlCapabilities.control, answerApproval: { kind: 'supported' } },
+        control: {
+          ...codexControlCapabilities.control,
+          answerApproval: { kind: 'supported', methods: [...codexApprovalMethods] },
+        },
       }
 
   return {
@@ -494,7 +561,7 @@ export function createCodexController({
         return new ConfigError({ reason: 'This controller was started without an approval channel' })
       }
       if (!Number.isSafeInteger(requestId) || requestId <= 0) return new ConfigError({ reason: 'Approval request id must be a positive integer' })
-      if (!['accept', 'acceptForSession', 'decline', 'cancel'].includes(decision)) return new ConfigError({ reason: `Unknown approval decision ${String(decision)}` })
+      if (!isApprovalDecision(decision)) return new ConfigError({ reason: `Unknown approval decision ${String(decision)}` })
       return settleApproval(requestId, decision)
     },
     close,
