@@ -58,7 +58,7 @@ export const codexControlCapabilities = {
     interrupt: { kind: 'supported' },
     answerApproval: {
       kind: 'unsupported',
-      reason: 'Server-initiated approval requests are not answered; a turn that needs approval stalls until interrupted',
+      reason: 'Server-initiated approval requests are answered with a JSON-RPC error, so an approval-gated action fails instead of being granted',
     },
   },
 } as const satisfies CodexControlCapabilities

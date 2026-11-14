@@ -199,3 +199,10 @@ so replaying an earlier finished turn satisfied the wait and the client reported
 previous turn's result, exiting before its own turn ran. A prompting attach now starts
 at the hub's current sequence; verified by a turn that returned `"cursor": 10` for its
 own completion instead of a stale `4`.
+
+Approval requests, measured instead of assumed: the transport answers a
+server-initiated request such as `item/commandExecution/requestApproval` with JSON-RPC
+error `-32601` on a microtask and the turn still settles. The capability reason said
+such a turn "stalls until interrupted", which was wrong and is corrected: an
+approval-gated action fails rather than being granted. A test drives that path with a
+fake app-server that asks for approval mid-turn and echoes the answer back.
