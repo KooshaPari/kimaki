@@ -73,4 +73,47 @@ describe('Codex hub backend', () => {
     const result = await backend.prompt('hi')
     expect(result).toBeInstanceOf(Error)
   })
+
+  it('routes control only for a verified real engine', async () => {
+    const { controller, calls } = fake()
+    const backend = createCodexHubBackend({
+      controller,
+      cwd: 'C:/work',
+      engine: { identity: 'codex', version: '0.9.1' },
+    })
+    expect(await backend.start()).toEqual({ sessionId: 'thread-1', model: null })
+    expect(calls).toEqual(['startThread:C:/work'])
+  })
+
+  it('refuses a synthetic engine before any control frame and names the marker', async () => {
+    const { controller, calls } = fake()
+    const backend = createCodexHubBackend({
+      controller,
+      cwd: 'C:/work',
+      engine: { identity: 'codex', version: '0.9.1', synthetic: true },
+    })
+    const started = await backend.start()
+    expect(started).toBeInstanceOf(Error)
+    expect((started as Error).message).toMatch(/synthetic marker 'synthetic'/)
+    const prompted = await backend.prompt('hi')
+    expect((prompted as Error).message).toMatch(/synthetic marker 'synthetic'/)
+    const cancelled = await backend.cancel()
+    expect((cancelled as Error).message).toMatch(/synthetic marker 'synthetic'/)
+    expect(backend.threadId()).toBeNull()
+    // No startThread, sendTurn or cancel reached the app-server.
+    expect(calls).toEqual([])
+  })
+
+  it('refuses a real engine identity that omits the version rather than defaulting it', async () => {
+    const { controller, calls } = fake()
+    const backend = createCodexHubBackend({
+      controller,
+      cwd: 'C:/work',
+      engine: { identity: 'codex' },
+    })
+    const started = await backend.start()
+    expect(started).toBeInstanceOf(Error)
+    expect((started as Error).message).toMatch(/no runtime version/)
+    expect(calls).toEqual([])
+  })
 })

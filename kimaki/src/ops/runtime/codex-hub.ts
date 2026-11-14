@@ -4,6 +4,7 @@
 // rule matches the runtime rather than papering over it.
 import type { HubBackend } from '../../backend/hub.ts'
 import { ConfigError } from '../../errors.ts'
+import { assertControlEngine, type EngineIdentityClaim } from './engine-identity.js'
 
 export type CodexHubController = {
   startThread(input: { cwd?: string; approvalPolicy?: 'untrusted' | 'on-request' | 'never' }): Promise<{ threadId: string } | Error>
@@ -16,19 +17,33 @@ export type CodexHubController = {
   cancel(input: { threadId: string }): Promise<unknown>
 }
 
-export function createCodexHubBackend({ controller, cwd, model = null, resumeThreadId, approvalPolicy }: {
+export function createCodexHubBackend({ controller, cwd, model = null, resumeThreadId, approvalPolicy, engine }: {
   controller: CodexHubController
   cwd: string
   model?: string | null
-  /** Resume an existing thread instead of starting a new one. */
+  // Resume an existing thread instead of starting a new one.
   resumeThreadId?: string
-  /** Approval policy the thread is created or resumed with. */
+  // Approval policy the thread is created or resumed with.
   approvalPolicy?: 'untrusted' | 'on-request' | 'never'
+  // Engine identity claim from the app-server handshake. When supplied, control
+  // is routed only for a verified real engine; a synthetic claim is refused
+  // before any control frame is sent to the controller.
+  engine?: EngineIdentityClaim
 }): HubBackend & { threadId(): string | null } {
   let threadId: string | null = null
+  // The hub is a control surface (start/prompt/cancel), so it cannot express
+  // observation-only. A synthetic engine is therefore refused entirely here;
+  // callers that want to watch a synthetic engine use createObservationOnlyEngine.
+  const engineGate = (): ConfigError | null => {
+    if (engine === undefined) return null
+    const verdict = assertControlEngine(engine)
+    return verdict instanceof Error ? verdict : null
+  }
   return {
     threadId: () => threadId,
     async start() {
+      const refused = engineGate()
+      if (refused !== null) return refused
       const started = resumeThreadId === undefined
         ? await controller.startThread({ cwd, ...(approvalPolicy === undefined ? {} : { approvalPolicy }) })
         : await controller.resumeThread({ threadId: resumeThreadId, cwd, ...(approvalPolicy === undefined ? {} : { approvalPolicy }) })
@@ -37,6 +52,8 @@ export function createCodexHubBackend({ controller, cwd, model = null, resumeThr
       return { sessionId: started.threadId, model }
     },
     async prompt(text: string, onChunk?: (text: string) => void) {
+      const refused = engineGate()
+      if (refused !== null) return refused
       if (threadId === null) return new ConfigError({ reason: 'The Codex backend has not started a thread' })
       let updates = 0
       const result = await controller.sendTurn({
@@ -51,6 +68,8 @@ export function createCodexHubBackend({ controller, cwd, model = null, resumeThr
       return { stopReason: result.status, text: result.text, updateCount: updates }
     },
     async cancel() {
+      const refused = engineGate()
+      if (refused !== null) return refused
       if (threadId === null) return undefined
       const cancelled = await controller.cancel({ threadId })
       return cancelled instanceof Error ? cancelled : undefined
