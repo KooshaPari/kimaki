@@ -39,6 +39,26 @@ function fakeBackend({ blocking = false, overrides = {} }: { blocking?: boolean;
 }
 
 describe('createSessionHub', () => {
+  it('drops a subscriber that throws without losing the turn for the others', async () => {
+    const { backend } = fakeBackend()
+    const hub = createSessionHub({ backend })
+    if (hub instanceof Error) throw hub
+    let brokenCalls = 0
+    const broken = hub.subscribe({ clientId: 'broken', onEvent: () => { brokenCalls += 1; throw new Error('consumer bug') } })
+    if (broken instanceof Error) throw broken
+    const healthy: HubEvent[] = []
+    const good = hub.subscribe({ clientId: 'healthy', onEvent: (event) => healthy.push(event) })
+    if (good instanceof Error) throw good
+
+    const result = await hub.submit('hello')
+    expect(result).not.toBeInstanceOf(Error)
+    // The healthy subscriber still saw the whole turn.
+    expect(healthy.map((event) => event.seq)).toEqual([1, 2, 3, 4])
+    // The thrower was detached on its first failure rather than retried per event.
+    expect(brokenCalls).toBe(1)
+    expect(hub.snapshot().subscribers).toBe(1)
+  })
+
   it('fans one turn out to several subscribers in order', async () => {
     const { backend } = fakeBackend()
     const hub = createSessionHub({ backend, model: 'beam-free' })
