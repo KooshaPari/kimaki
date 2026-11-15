@@ -210,14 +210,20 @@ export function createEffectsRunner({ discord, markViewed, footerDefaults }: { d
     thread.typing = null
   }
 
-  // `mentions: false` for user text (prompt echoes): it must never ping.
-  async function post({ threadId, options, notify, mentions = true }: { threadId: string; options: PostOptions; notify: boolean; mentions?: boolean }) {
+  // Nothing kimaki publishes parses mentions. Prompt echoes and model output
+  // both arrive as untrusted text: a raw `<@id>` or `@everyone` can be copied
+  // from an injected prompt or a quoted message, and the wire text cannot tell
+  // an intended mention from a copied one. The old `parse: ['users']` existed so
+  // the agent could deliberately mention a user by ID (system-prompt guidance),
+  // but that intent must be carried structurally (an explicit effect field),
+  // which is out of scope here. Until then, agent output is inert.
+  async function post({ threadId, options, notify }: { threadId: string; options: PostOptions; notify: boolean }) {
     if (lifecycle.closed) return null
     const channel = await sendableChannel(threadId)
     if (!channel || lifecycle.closed) return null
     const flags = (options.flags ?? 0) | embedFlags(options.content) | (notify ? 0 : MessageFlags.SuppressNotifications)
     // Replies never ping their author: the footer is what notifies.
-    const sent = await channel.send({ ...options, flags, allowedMentions: { parse: mentions ? ['users'] : [], repliedUser: false } }).catch((e: Error) => e)
+    const sent = await channel.send({ ...options, flags, allowedMentions: { parse: [], repliedUser: false } }).catch((e: Error) => e)
     if (!(sent instanceof Error)) return sent.id
     logger.error(`send failed in ${threadId}`, sent)
     return null
@@ -305,7 +311,6 @@ export function createEffectsRunner({ discord, markViewed, footerDefaults }: { d
             ...(replyTo && { reply: { messageReference: replyTo, failIfNotExists: false } }),
           },
           notify: effect.notify,
-          mentions: !effect.echo,
         })
         if (id) ids.push(id)
       }
@@ -327,15 +332,15 @@ export function createEffectsRunner({ discord, markViewed, footerDefaults }: { d
     const generation = thread.generation
     const live = () => thread.generation === generation
     // A merged message notifies when any of its lines does. Echoes and
-    // bot lines never merge, so an echo never pings and a bot line can.
+    // bot lines never merge, so a prompt echo stays a separate message.
     // Lines with Discord media only merge with each other: their message
     // shows embeds, so other links merged in would unfurl too.
-    let lines: { text: string; notify: boolean; mentions: boolean; media: boolean } | null = null
+    let lines: { text: string; notify: boolean; echo: boolean; media: boolean } | null = null
     const flush = async () => {
       const pending = lines
       lines = null
       if (pending === null || !live()) return
-      await post({ threadId, options: { content: pending.text }, notify: pending.notify, mentions: pending.mentions })
+      await post({ threadId, options: { content: pending.text }, notify: pending.notify })
       await refreshTyping(threadId)
     }
     for (const [index, effect] of batch.entries()) {
@@ -349,25 +354,24 @@ export function createEffectsRunner({ discord, markViewed, footerDefaults }: { d
       const text = effect.type === 'send' ? effect.text : await footerText({ effect, footerDefaults })
       const notify = effect.notify === true
       const echo = effect.type === 'send' && effect.echo === true
-      const mentions = !echo
       // A line over the limit (a long prompt echo) is split like model markdown.
       if (text.length > DISCORD_TEXT_LIMIT) {
         await flush()
         for (const payload of echo ? echoPayloads(text) : markdownPayloads(text)) {
           if (!live()) return drop(batch.slice(index + 1))
-          await post({ threadId, options: payload, notify, mentions })
+          await post({ threadId, options: payload, notify })
         }
         await refreshTyping(threadId)
         continue
       }
       const media = DISCORD_MEDIA_URL.test(text)
       const joined: string | null = lines === null ? null : `${lines.text}\n${text}`
-      if (lines !== null && joined !== null && lines.mentions === mentions && lines.media === media && joined.length <= DISCORD_TEXT_LIMIT) {
-        lines = { text: joined, notify: lines.notify || notify, mentions, media }
+      if (lines !== null && joined !== null && lines.echo === echo && lines.media === media && joined.length <= DISCORD_TEXT_LIMIT) {
+        lines = { text: joined, notify: lines.notify || notify, echo, media }
         continue
       }
       await flush()
-      lines = { text, notify, mentions, media }
+      lines = { text, notify, echo, media }
     }
     await flush()
   }
