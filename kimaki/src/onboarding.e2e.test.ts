@@ -16,6 +16,7 @@ import { shellQuote } from './lock-server.ts'
 import { runOnboarding } from './onboarding.ts'
 import {
   TEST_USER_ID,
+  isFooter,
   scriptedTurn,
   startOpencodeTestServer,
   startTestBot,
@@ -23,7 +24,6 @@ import {
   tempDataDir,
   textParts,
   waitFor,
-  waitForFooter,
   warmUp,
   type OpencodeTestServer,
   type TestTwin,
@@ -83,7 +83,7 @@ beforeAll(async () => {
   })
   await warmUp({ server })
   bot = await startTestBot({ dataDir, twin, server })
-}, 120_000)
+}, 300_000)
 
 afterAll(async () => {
   await bot?.stop()
@@ -97,6 +97,30 @@ afterAll(async () => {
 // bounded: when the directory is really stuck the error still fails the file.
 async function removeDataDir(directory: string) {
   await fs.promises.rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
+}
+
+// `waitForFooter` clamps every wait to 8-10s, which fits a quiet Linux runner but not
+// a turn that shells out to the real `kimaki` CLI: that child starts node plus the tsx
+// loader, seconds on this host before it does any work. The budget is sized for the
+// host; the assertion after the wait is unchanged.
+async function waitForFooterCount({
+  threadId,
+  count,
+  timeoutMs = 90_000,
+}: {
+  threadId: string
+  count: number
+  timeoutMs?: number
+}) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const footers = (await twin.discord.thread(threadId).getMessages()).filter(
+      (message) => message.author.id === twin.discord.botUserId && isFooter(message),
+    )
+    if (footers.length >= count) return footers[count - 1]
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+  throw new Error(`Timed out waiting for footer #${count} in thread ${threadId} after ${timeoutMs}ms`)
 }
 
 async function guildChannels() {
@@ -113,10 +137,10 @@ test('onboarding thread adds a project channel through the kimaki CLI, which ans
   const guild = bot.discord.guilds.cache.get(discord.guildId)!
   const onboarded = await runOnboarding({ bot, dataDir, guild, gateway: true, installerId: TEST_USER_ID, machine: 'test-machine' })
   if (!onboarded || onboarded instanceof Error) throw new Error(`onboarding failed: ${onboarded?.message}`, { cause: onboarded })
-  await waitForFooter({ discord, threadId: onboarded.threadId })
+  await waitForFooterCount({ threadId: onboarded.threadId, count: 1 })
 
   await discord.thread(onboarded.threadId).user(TEST_USER_ID).sendMessage({ content: 'yes, add-other-project' })
-  await waitForFooter({ discord, threadId: onboarded.threadId, count: 2 })
+  await waitForFooterCount({ threadId: onboarded.threadId, count: 2 })
 
   expect(await discord.channel(onboarded.channelId).text()).toMatchInlineSnapshot(`
     "--- from: assistant (TestBot)
@@ -162,7 +186,7 @@ test('onboarding thread adds a project channel through the kimaki CLI, which ans
   const added = rows.find((row) => row.directory === otherProject)!
   await discord.channel(added.channel_id).user(TEST_USER_ID).sendMessage({ content: 'hello new channel' })
   const thread = await discord.channel(added.channel_id).waitForThread({ timeout: 8_000 })
-  await waitForFooter({ discord, threadId: thread.id })
+  await waitForFooterCount({ threadId: thread.id, count: 1 })
 
   // Second start: nothing is created again.
   expect(await runOnboarding({ bot, dataDir, guild, gateway: true, machine: 'test-machine' })).toBe(null)
@@ -176,9 +200,9 @@ test('onboarding thread adds a project channel through the kimaki CLI, which ans
   const retried = await runOnboarding({ bot, dataDir, guild, gateway: true, installerId: TEST_USER_ID, machine: 'test-machine' })
   if (retried instanceof Error || !retried) throw new Error(`expected a retried onboarding, got ${retried}`)
   expect(retried.channelId).toBe(defaultChannel.channel_id)
-  await waitForFooter({ discord, threadId: retried.threadId })
+  await waitForFooterCount({ threadId: retried.threadId, count: 1 })
   expect((await guildChannels()).length).toBe(6)
-}, 30_000)
+}, 300_000)
 
 test('an upgraded setup with project mappings skips onboarding without selecting a server', async () => {
   const before = await guildChannels()

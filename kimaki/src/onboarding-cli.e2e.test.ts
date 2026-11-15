@@ -4,7 +4,7 @@
 // OAuth callback, authorizes the new client in the twin, which plays
 // gateway-proxy (REST scope rules enforced).
 
-import { execFile, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
+import { execFile, execFileSync, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import fs from 'node:fs'
 import http from 'node:http'
 import { createRequire } from 'node:module'
@@ -16,13 +16,12 @@ import { afterAll, beforeAll, expect, test } from 'vitest'
 import { createApi } from './project.ts'
 import {
   freePort,
+  isFooter,
   startOpencodeTestServer,
   startTwin,
   tempDataDir,
   TEST_USER_ID,
   textParts,
-  waitFor,
-  waitForFooter,
   warmUp,
   type OpencodeTestServer,
   type TestTwin,
@@ -38,6 +37,12 @@ let child: ChildProcessWithoutNullStreams | null = null
 
 beforeAll(async () => {
   dataDir = tempDataDir()
+  // Onboarding initialises <dataDir>/projects/kimaki with a plain `git init`, so its
+  // branch follows this host's init.defaultBranch. Pin it, so the footer's branch is
+  // the fixture's, not the host's (onboarding.e2e.test.ts does the same).
+  const defaultProject = path.join(dataDir, 'projects', 'kimaki')
+  fs.mkdirSync(defaultProject, { recursive: true })
+  execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: defaultProject })
   ;[server, twin] = await Promise.all([
     startOpencodeTestServer({
       matchers: [
@@ -80,7 +85,7 @@ afterAll(async () => {
   await new Promise<void>((resolve) => website?.close(() => resolve()))
   await twin?.stop()
   await server?.stop()
-  fs.rmSync(dataDir, { recursive: true, force: true })
+  await fs.promises.rm(dataDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
 })
 
 function sseEvents(stdout: string): Array<Record<string, unknown>> {
@@ -88,6 +93,51 @@ function sseEvents(stdout: string): Array<Record<string, unknown>> {
     .split('\n\n')
     .filter((chunk) => chunk.startsWith('data: '))
     .map((chunk) => JSON.parse(chunk.slice('data: '.length)) as Record<string, unknown>)
+}
+
+// `waitFor` clamps every wait to 8-10s. That is enough when the CLI is already
+// running, but this file starts the CLI itself: node plus the tsx loader costs
+// seconds on Windows, and the documented `ready` event comes after the bot
+// starts, onboarding runs and the voice channel is created. The budget is sized
+// for the host, and the message reads stderr at the moment it throws, so an
+// empty stderr is never evidence of anything.
+async function waitForHost({
+  label,
+  timeoutMs = 120_000,
+  check,
+  diagnose,
+}: {
+  label: string
+  timeoutMs?: number
+  check: () => boolean
+  diagnose: () => string
+}) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (check()) return
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+  throw new Error(`Timed out waiting for ${label} after ${timeoutMs}ms (${diagnose()})`)
+}
+
+async function waitForFooterCount({
+  threadId,
+  count,
+  timeoutMs = 120_000,
+}: {
+  threadId: string
+  count: number
+  timeoutMs?: number
+}) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const footers = (await twin.discord.thread(threadId).getMessages()).filter(
+      (message) => message.author.id === twin.discord.botUserId && isFooter(message),
+    )
+    if (footers.length >= count) return footers[count - 1]
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+  throw new Error(`Timed out waiting for footer #${count} in thread ${threadId} after ${timeoutMs}ms`)
 }
 
 test('kimaki --gateway without a TTY installs, onboards and reports ready on stdout', async () => {
@@ -111,10 +161,10 @@ test('kimaki --gateway without a TTY installs, onboards and reports ready on std
   const output = { stdout: '', stderr: '' }
   child.stdout.on('data', (chunk: Buffer) => (output.stdout += chunk.toString()))
   child.stderr.on('data', (chunk: Buffer) => (output.stderr += chunk.toString()))
-  await waitFor({
-    label: `ready event (stderr: ${output.stderr.slice(-500)})`,
-    timeout: 10_000,
-    check: async () => sseEvents(output.stdout).some((event) => event['type'] === 'ready'),
+  await waitForHost({
+    label: 'ready event',
+    check: () => sseEvents(output.stdout).some((event) => event['type'] === 'ready'),
+    diagnose: () => `stdout: ${output.stdout.slice(-800)} stderr: ${output.stderr.slice(-800)} exit: ${child?.exitCode}`,
   })
 
   const token = (sseEvents(output.stdout)[0]?.['url'] as string).match(/clientId=([^&]+)&clientSecret=([^&]+)/)
@@ -163,7 +213,7 @@ test('kimaki --gateway without a TTY installs, onboards and reports ready on std
 
   const kimakiChannel = channels.find((channel) => channel.name === 'kimaki')!
   // Coordinator mode is on by default: onboarding answers in the channel.
-  await waitForFooter({ discord: twin.discord, threadId: kimakiChannel.id })
+  await waitForFooterCount({ threadId: kimakiChannel.id, count: 1 })
   expect(await twin.discord.channel(kimakiChannel.id).text()).toMatchInlineSnapshot(`
     "--- from: assistant (TestBot)
     **Kimaki** lets you code from Discord. Each project channel is linked to a folder on your computer. Write in the channel: one long session answers there and starts threads for the work.
@@ -180,13 +230,14 @@ test('kimaki --gateway without a TTY installs, onboards and reports ready on std
   })
   const before = JSON.parse((await cli(['status', '--json'])).stdout) as { pid: number }
   await cli(['restart'])
-  await waitFor({
-    label: `second ready event (stderr: ${output.stderr.slice(-500)})`,
-    check: async () => sseEvents(output.stdout).filter((event) => event['type'] === 'ready').length === 2,
+  await waitForHost({
+    label: 'second ready event',
+    check: () => sseEvents(output.stdout).filter((event) => event['type'] === 'ready').length === 2,
+    diagnose: () => `stdout: ${output.stdout.slice(-800)} stderr: ${output.stderr.slice(-800)} exit: ${child?.exitCode}`,
   })
   const after = JSON.parse((await cli(['status', '--json'])).stdout) as { pid: number }
   expect({ newPid: after.pid !== before.pid, supervisorAlive: child.exitCode === null }).toEqual({ newPid: true, supervisorAlive: true })
-}, 40_000)
+}, 240_000)
 
 test('--install-url --gateway prints the install URL with the callback and exits', async () => {
   const otherDataDir = tempDataDir()
@@ -214,4 +265,4 @@ test('--install-url --gateway prints the install URL with the callback and exits
       "url": "https://kimaki.test/discord-install?clientId=<clientId>&clientSecret=<secret>&kimakiCallbackUrl=https%3A%2F%2Fexample.com%2Fdone",
     }
   `)
-})
+}, 120_000)
