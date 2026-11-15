@@ -106,15 +106,22 @@ async function waitForHost({
   timeoutMs = 120_000,
   check,
   diagnose,
+  stopped,
 }: {
   label: string
   timeoutMs?: number
   check: () => boolean
   diagnose: () => string
+  // Non-null when the process that would emit the event is gone: no budget can help.
+  stopped?: () => string | null
 }) {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     if (check()) return
+    // A process that already exited cannot emit another event. Failing here names the
+    // cause; spending the budget on a wait that cannot succeed only hides it.
+    const reason = stopped?.()
+    if (reason) throw new Error(`${label} can no longer arrive (${reason}; ${diagnose()})`)
     await new Promise((resolve) => setTimeout(resolve, 100))
   }
   throw new Error(`Timed out waiting for ${label} after ${timeoutMs}ms (${diagnose()})`)
@@ -161,10 +168,12 @@ test('kimaki --gateway without a TTY installs, onboards and reports ready on std
   const output = { stdout: '', stderr: '' }
   child.stdout.on('data', (chunk: Buffer) => (output.stdout += chunk.toString()))
   child.stderr.on('data', (chunk: Buffer) => (output.stderr += chunk.toString()))
+  const stopped = () => (child?.exitCode === null || child?.exitCode === undefined ? null : `the CLI process exited ${child.exitCode}`)
   await waitForHost({
     label: 'ready event',
     check: () => sseEvents(output.stdout).some((event) => event['type'] === 'ready'),
     diagnose: () => `stdout: ${output.stdout.slice(-800)} stderr: ${output.stderr.slice(-800)} exit: ${child?.exitCode}`,
+    stopped,
   })
 
   const token = (sseEvents(output.stdout)[0]?.['url'] as string).match(/clientId=([^&]+)&clientSecret=([^&]+)/)
@@ -234,6 +243,7 @@ test('kimaki --gateway without a TTY installs, onboards and reports ready on std
     label: 'second ready event',
     check: () => sseEvents(output.stdout).filter((event) => event['type'] === 'ready').length === 2,
     diagnose: () => `stdout: ${output.stdout.slice(-800)} stderr: ${output.stderr.slice(-800)} exit: ${child?.exitCode}`,
+    stopped,
   })
   const after = JSON.parse((await cli(['status', '--json'])).stdout) as { pid: number }
   expect({ newPid: after.pid !== before.pid, supervisorAlive: child.exitCode === null }).toEqual({ newPid: true, supervisorAlive: true })
