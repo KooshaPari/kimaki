@@ -300,8 +300,10 @@ export function createEventSink({
   let delivered = 0
   let dropped = 0
   let health = reachableHealth()
-  // One pass at a time: concurrent passes would send the same event twice.
-  let inflight: Promise<void> | null = null
+  // Passes are chained, never concurrent: each flush queues behind the last,
+  // so a burst of emits cannot send the same retained event twice, and every
+  // emit still gets a pass that sees it.
+  let tail: Promise<void> = Promise.resolve()
 
   const recordFailure = (failure: SourceFailure) => {
     const at = now()
@@ -349,12 +351,9 @@ export function createEventSink({
   }
 
   const flush = () => {
-    if (!inflight) {
-      inflight = pass().finally(() => {
-        inflight = null
-      })
-    }
-    return inflight
+    const next = tail.then(() => pass()).catch(() => {})
+    tail = next
+    return next
   }
 
   return {

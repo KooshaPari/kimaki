@@ -162,3 +162,26 @@ test('AC40 (e) a partial success does not re-deliver the accepted events', async
   expect(sink.health().reachable).toBe(true)
   expectInvariant(sink)
 })
+
+test('AC40 (f) a burst of emits is attempted, delivered once, and never overlapped', async () => {
+  const collector = fakeCollector()
+  let active = 0
+  let maxActive = 0
+  const deliver: CollectorTransport['deliver'] = async (events) => {
+    active += 1
+    maxActive = Math.max(maxActive, active)
+    await Promise.resolve()
+    const outcomes = await collector.deliver(events)
+    active -= 1
+    return outcomes
+  }
+  const sink = createEventSink({ deliver })
+  const sending = [1, 2, 3, 4].map((seq) => sink.emit(event(seq)))
+  expectInvariant(sink)
+  await Promise.all(sending)
+  // Emits queue behind each other's pass; two passes never run at once.
+  expect(maxActive).toBe(1)
+  expect(seqs(collector.accepted)).toEqual([1, 2, 3, 4])
+  expect(sink.counters()).toEqual({ attempted: 4, delivered: 4, retained: 0, dropped: 0 })
+  expectInvariant(sink)
+})
