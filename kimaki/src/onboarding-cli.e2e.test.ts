@@ -207,6 +207,14 @@ test('kimaki --gateway without a TTY installs, onboards and reports ready on std
     ]
   `)
 
+  // The contract: one `ready` carrying the app and guild ids, and a supervisor that
+  // keeps running to serve onboarding and `kimaki restart`. A one-shot run would have
+  // exited here; the CLI must not, and a failure would have set an exit code.
+  expect({
+    exitCode: child.exitCode,
+    ready: sseEvents(output.stdout).filter((event) => event['type'] === 'ready').length,
+  }).toEqual({ exitCode: null, ready: 1 })
+
   const channels = await createApi({ token: twin.discord.botToken, restUrl: twin.discord.restUrl }).guilds.getChannels(twin.discord.guildId)
   const names = new Map(channels.map((channel) => [channel.id, channel.name]))
   expect(channels.map((channel) => `${channel.name}${channel.parent_id ? ` (in ${names.get(channel.parent_id)})` : ''}`)).toMatchInlineSnapshot(`
@@ -246,7 +254,13 @@ test('kimaki --gateway without a TTY installs, onboards and reports ready on std
     stopped,
   })
   const after = JSON.parse((await cli(['status', '--json'])).stdout) as { pid: number }
-  expect({ newPid: after.pid !== before.pid, supervisorAlive: child.exitCode === null }).toEqual({ newPid: true, supervisorAlive: true })
+  // `kimaki restart` must respawn the bot, not kill the supervisor: exit code null
+  // here is the product signal that the restart exited 75 and the supervisor looped.
+  expect({
+    newPid: after.pid !== before.pid,
+    exitCode: child.exitCode,
+    ready: sseEvents(output.stdout).filter((event) => event['type'] === 'ready').length,
+  }).toEqual({ newPid: true, exitCode: null, ready: 2 })
 }, 240_000)
 
 test('--install-url --gateway prints the install URL with the callback and exits', async () => {

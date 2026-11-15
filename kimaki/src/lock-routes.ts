@@ -331,9 +331,14 @@ export const lockRoutes = {
       if (!bot.supervised) {
         return new ConfigError({ reason: 'This bot was not started by the `kimaki` command, so nothing would start it again. Stop it and start it yourself.' })
       }
-      // After the response: the SIGTERM handler stops the bot and exits with this code.
+      // After the response: the bot stops and exits with this code, so the `kimaki`
+      // supervisor spawns a new one. Stop in-process rather than SIGTERM ourselves:
+      // Windows has no catchable SIGTERM, where process.kill terminates the process
+      // with exit code 1, and the supervisor reads that as a crash and exits too.
       process.exitCode = RESTART_EXIT_CODE
-      setTimeout(() => process.kill(process.pid, 'SIGTERM'), 100)
+      // No listener: `restart` arrived before the bot wired shutdown. Exiting here
+      // keeps the exit code the supervisor acts on instead of hanging at 75 forever.
+      setTimeout(() => (process.listenerCount('SIGTERM') > 0 ? process.emit('SIGTERM', 'SIGTERM') : process.exit()), 100)
       return { restarting: true, pid: process.pid }
     },
   }),
