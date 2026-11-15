@@ -66,8 +66,15 @@ afterAll(async () => {
   await bot?.stop()
   await twin?.stop()
   await server?.stop()
-  fs.rmSync(dataDir, { recursive: true, force: true })
+  await removeDataDir(dataDir)
 })
+
+// A child process or a SQLite handle can still be closing when teardown runs, so
+// the removal is retried (Windows reports the race as EPERM/EBUSY). The retries are
+// bounded: when the directory is really stuck the error still fails the file.
+async function removeDataDir(directory: string) {
+  await fs.promises.rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
+}
 
 async function newThread(channelId: string, content: string) {
   const { discord } = twin
@@ -433,6 +440,16 @@ test('/<agent>-agent variant: sets the thinking level with the agent, per sessio
     options: [{ name: 'variant', type: 3, value: 'fast' }],
   })
   await discord.channel(channelId).waitForInteractionAck({ interactionId: ack.id })
+  // The reply is visible before the channel preference is saved: a session started
+  // now could still pick up the defaults, so wait for the rows the session reads.
+  await waitFor({
+    label: 'channel agent and thinking level saved',
+    check: async () => {
+      const agent = await bot.db.query.channel_agents.findFirst({ where: { channel_id: channelId } })
+      const model = await bot.db.query.channel_models.findFirst({ where: { channel_id: channelId } })
+      return agent?.agent_name === 'build' && model?.variant === 'fast'
+    },
+  })
   const fresh = await newThread(channelId, 'Uses the channel variant')
   expect(await sessionModel(fresh.id)).toMatchInlineSnapshot(`
     {

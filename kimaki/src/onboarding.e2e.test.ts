@@ -6,7 +6,6 @@
 
 import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
-import { createRequire } from 'node:module'
 import path from 'node:path'
 import { API } from '@discordjs/core/http-only'
 import { ChannelType } from 'discord.js'
@@ -34,17 +33,33 @@ let server: OpencodeTestServer
 let twin: TestTwin
 let bot: BotHandle
 let dataDir: string
-let kimaki: string
 let otherProject: string
+let defaultProject: string
+
+// The Kimaki plugin puts the `kimaki` shim on the shell tool's PATH. A quoted value
+// in the tool's command string arrives literal on Windows (cmd.exe keeps the quotes
+// in argv), so the command is a one-line script written next to the session: the
+// script, not the command string, carries the quoted directory.
+function projectAddScript(directory: string): string {
+  const windows = process.platform === 'win32'
+  const file = path.join(defaultProject, `add-other-project.${windows ? 'cmd' : 'sh'}`)
+  const command = `kimaki project add ${windows ? `"${directory}"` : shellQuote(directory)}`
+  fs.writeFileSync(file, windows ? `@echo off\r\n${command}\r\n` : `#!/bin/sh\n${command}\n`)
+  return windows ? 'add-other-project.cmd' : 'sh add-other-project.sh'
+}
 
 beforeAll(async () => {
   dataDir = tempDataDir()
   twin = await startTwin({ gateway: true })
-  const require = createRequire(import.meta.url)
-  kimaki = [process.execPath, require.resolve('tsx/cli'), path.join(import.meta.dirname, 'cli.ts')].map(shellQuote).join(' ')
   otherProject = path.join(dataDir, 'other-project')
   fs.mkdirSync(otherProject)
-  execFileSync('git', ['init', '-q'], { cwd: otherProject })
+  execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: otherProject })
+  // Onboarding initialises the default project directory with a plain `git init`, so
+  // its branch follows this host's init.defaultBranch. Pin it here (like the test
+  // harness does) to keep the footer's branch out of the host's configuration.
+  defaultProject = path.join(dataDir, 'projects', 'kimaki')
+  fs.mkdirSync(defaultProject, { recursive: true })
+  execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: defaultProject })
   server = await startOpencodeTestServer({
     matchers: [
       {
@@ -59,7 +74,7 @@ beforeAll(async () => {
           {
             id: 'call-project-add',
             tool: 'shell',
-            input: { command: `${kimaki} project add ${otherProject}`, description: 'add project channel' },
+            input: { command: projectAddScript(otherProject), description: 'add project channel' },
           },
         ],
         finalText: 'Added the channel for other-project.',
@@ -74,8 +89,15 @@ afterAll(async () => {
   await bot?.stop()
   await twin?.stop()
   await server?.stop()
-  fs.rmSync(dataDir, { recursive: true, force: true })
+  await removeDataDir(dataDir)
 })
+
+// A child process or a SQLite handle can still be closing when teardown runs, so
+// the removal is retried (Windows reports the race as EPERM/EBUSY). The retries are
+// bounded: when the directory is really stuck the error still fails the file.
+async function removeDataDir(directory: string) {
+  await fs.promises.rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
+}
 
 async function guildChannels() {
   const channels = await new API(bot.discord.rest).guilds.getChannels(twin.discord.guildId)
@@ -128,7 +150,8 @@ test('onboarding thread adds a project channel through the kimaki CLI, which ans
   `)
 
   const rows = await bot.db.query.channel_directories.findMany({ orderBy: { created_at: 'asc' } })
-  expect(rows.map((row) => path.relative(dataDir, row.directory))).toMatchInlineSnapshot(`
+  // The layout is what matters, not the path separator of the host.
+  expect(rows.map((row) => path.relative(dataDir, row.directory).split(path.sep).join('/'))).toMatchInlineSnapshot(`
     [
       "projects/kimaki",
       "other-project",
