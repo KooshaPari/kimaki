@@ -461,8 +461,14 @@ test('/<agent>-agent variant: sets the thinking level with the agent, per sessio
       },
     }
   `)
-  const messages = await discord.channel(channelId).getMessages()
-  expect(messages.at(-2)?.content).toMatchInlineSnapshot(`
+  // The command defers its reply and the thread's starter message can land
+  // after it, so find the reply by content instead of by position.
+  const reply = await waitFor({
+    label: 'channel agent reply',
+    check: async () =>
+      (await discord.channel(channelId).getMessages()).filter((message) => message.content.includes('Thinking level:')).at(-1) ?? null,
+  })
+  expect(reply.content).toMatchInlineSnapshot(`
     "Switched to **build** agent for this channel
     Model: \`deterministic-provider/deterministic-v2 (fast)\`
     All new sessions will use this agent.
