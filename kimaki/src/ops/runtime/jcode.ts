@@ -8,9 +8,30 @@ import { passiveCapabilities, sessionKeyId } from '../registry.js'
 
 type NativeSession = { id: string; title: string | null; updatedAt: string | null; messageCount: number }
 
+// Whether a read produced a trustworthy record. `consistent` means two
+// independent reads agreed byte for byte and the bytes parsed to the requested
+// session id. `transient` means the record was mid-write (torn, replaced or
+// otherwise unparseable at that instant) and nothing about the session is
+// claimed from it: a caller must not read a skipped transient as "no session".
+export type JcodeObservationHealth = 'consistent' | 'transient'
+
+// Bounded backoff between the two reads that confirm a record. A native turn
+// appends to the same file, so the confirming read is what separates a settled
+// record from one that is still being written.
+const CONFIRM_DELAYS_MS = [1, 2, 4] as const
+
+const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
+
 export type JcodeObservedEvent =
   | { schemaVersion: 1; key: SessionKey; seq: number; type: 'session.renamed'; title: string | null }
   | { schemaVersion: 1; key: SessionKey; seq: number; type: 'session.appended'; messageCount: number }
+
+// The result of one consistency-checked read. Only `consistent` carries an
+// identity or a title.
+type ConsistentRead =
+  | { health: 'consistent'; session: NativeSession }
+  | { health: 'transient'; reason: string }
+  | { health: 'missing' }
 
 const record = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value)
 
@@ -92,9 +113,41 @@ export function createJcodeObserver({ jcodeHome, store, profile: requestedProfil
   }
 
   const keyFor = (nativeSessionId: string): SessionKey => ({ hostId, endpointId, backendKind: 'jcode' as const, nativeSessionId })
-  const poll = async (nativeSessionId: string): Promise<NativeSession | undefined> => {
-    const raw = await readFile(fileFor(nativeSessionId)).catch(() => undefined)
-    return raw === undefined ? undefined : parse(raw)
+
+  // Read a record only when it is provably settled. A single read can land in
+  // the middle of an append or a replacement, so a candidate is accepted only
+  // when a second read after a bounded backoff returns identical bytes, those
+  // bytes parse completely, and the parsed id is the requested session. Any
+  // other outcome is `transient` (or `missing` if the file never appeared), so a
+  // torn record can never surface as a session, a key or a truncated title.
+  const readConsistent = async (nativeSessionId: string): Promise<ConsistentRead> => {
+    let last: 'missing' | 'unstable' | 'unparsable' | 'mismatch' = 'missing'
+    for (const backoff of CONFIRM_DELAYS_MS) {
+      const first = await readFile(fileFor(nativeSessionId)).catch(() => undefined)
+      if (first === undefined) continue
+      await wait(backoff)
+      const second = await readFile(fileFor(nativeSessionId)).catch(() => undefined)
+      if (second === undefined) {
+        last = 'missing'
+        continue
+      }
+      if (second !== first) {
+        last = 'unstable'
+        continue
+      }
+      const session = parse(first)
+      if (!session) {
+        last = 'unparsable'
+        continue
+      }
+      if (session.id !== nativeSessionId) {
+        last = 'mismatch'
+        continue
+      }
+      return { health: 'consistent', session }
+    }
+    if (last === 'missing') return { health: 'missing' }
+    return { health: 'transient', reason: last }
   }
 
   return {
@@ -105,6 +158,12 @@ export function createJcodeObserver({ jcodeHome, store, profile: requestedProfil
       discovery: { kind: 'supported' as const },
       snapshot: { kind: 'supported' as const },
       observe: { kind: 'supported' as const },
+      // Reads are consistency-checked: a torn record is reported transient and
+      // skipped rather than being published as a session.
+      consistency: {
+        kind: 'supported' as const,
+        description: 'A record is reported only when two reads separated by a bounded backoff agree and parse to the requested session id; a torn read is transient and never becomes a session or a title',
+      },
       replay: { kind: 'unsupported' as const, reason: 'Jcode persists session state, not an event log, so missed changes cannot be replayed' },
       exclusiveControl: { kind: 'unsupported' as const, reason: 'No exclusive writer lease is established' },
     },
@@ -114,11 +173,11 @@ export function createJcodeObserver({ jcodeHome, store, profile: requestedProfil
         .filter((name) => name.startsWith('session_') && name.endsWith('.json'))
         .map((name) => name.slice(0, -'.json'.length))
       const parsed: NativeSession[] = []
+      let skippedTransient = 0
       for (const id of ids) {
-        const raw = await readFile(fileFor(id)).catch(() => undefined)
-        if (raw === undefined) continue
-        const session = parse(raw)
-        if (session) parsed.push(session)
+        const read = await readConsistent(id)
+        if (read.health === 'consistent') parsed.push(read.session)
+        else if (read.health === 'transient') skippedTransient += 1
       }
       // Newest first, with a stable tiebreak so pagination is deterministic.
       parsed.sort((a, b) => (b.updatedAt ?? '').localeCompare(a.updatedAt ?? '') || a.id.localeCompare(b.id))
@@ -132,6 +191,12 @@ export function createJcodeObserver({ jcodeHome, store, profile: requestedProfil
         source,
         sessions: page.map((session) => ({ key: keyFor(session.id), title: session.title })),
         cursor: next < parsed.length ? String(next) : null,
+        // Which health produced this page, and how many records were skipped as
+        // transient rather than absent.
+        observation: {
+          health: (skippedTransient === 0 ? 'consistent' : 'transient') as JcodeObservationHealth,
+          skippedTransient,
+        },
       }
     },
     async readSnapshot({ key }: { key: SessionKey }) {
@@ -141,19 +206,24 @@ export function createJcodeObserver({ jcodeHome, store, profile: requestedProfil
         return new ConfigError({ reason: 'Session identity does not match this Jcode endpoint' })
       }
       const nativeSessionId = key.nativeSessionId
-      const raw = await readFile(fileFor(nativeSessionId)).catch(() => undefined)
-      if (raw === undefined) return new ConfigError({ reason: 'Jcode session record is missing or unreadable' })
-      const session = parse(raw)
-      if (!session) return new ConfigError({ reason: 'Malformed or mismatched Jcode session record' })
-      if (session.id !== nativeSessionId) return new ConfigError({ reason: 'Record identity does not match the requested session' })
-      return { key: Object.freeze(keyFor(nativeSessionId)), source, session: { id: session.id, title: session.title } }
+      const read = await readConsistent(nativeSessionId)
+      if (read.health === 'missing') return new ConfigError({ reason: 'Jcode session record is missing or unreadable' })
+      if (read.health === 'transient') {
+        // Distinct from missing: the record exists but was being written when it
+        // was read, so no identity or title is claimed.
+        return new ConfigError({
+          reason: `Jcode session record read was transient (${read.reason}); the record was mid-write, so no session identity or title is claimed`,
+        })
+      }
+      return { key: Object.freeze(keyFor(nativeSessionId)), source, session: { id: read.session.id, title: read.session.title } }
     },
     // Polling observation over the persisted record. Only counts and titles are
     // emitted. Nothing from messages, tool calls or paths is ever surfaced.
-    async observe({ key, signal, onEvent }: {
+    async observe({ key, signal, onEvent, onHealth }: {
       key: SessionKey
       signal?: AbortSignal
       onEvent: (event: JcodeObservedEvent) => Promise<void> | void
+      onHealth?: (health: JcodeObservationHealth) => void
     }) {
       const validKey = sessionKeyId(key)
       if (validKey instanceof Error) return validKey
@@ -163,10 +233,18 @@ export function createJcodeObserver({ jcodeHome, store, profile: requestedProfil
       if (signal?.aborted) return new ConfigError({ reason: 'Observation already aborted' })
       const nativeSessionId = key.nativeSessionId
       const scopedKey = Object.freeze(keyFor(nativeSessionId))
-      const first = await poll(nativeSessionId)
-      if (!first) return new ConfigError({ reason: 'Jcode session record is missing or unreadable' })
-      let title = first.title
-      let messageCount = first.messageCount
+      const first = await readConsistent(nativeSessionId)
+      if (first.health === 'missing') return new ConfigError({ reason: 'Jcode session record is missing or unreadable' })
+      let health: JcodeObservationHealth = first.health === 'consistent' ? 'consistent' : 'transient'
+      const emitHealth = (next: JcodeObservationHealth) => {
+        if (next === health) return
+        health = next
+        onHealth?.(next)
+      }
+      const initial = first.health === 'consistent' ? first.session : undefined
+      let title = initial?.title ?? null
+      let messageCount = initial?.messageCount ?? 0
+      let seen = initial !== undefined
       let seq = 0
       let stopped = false
       const stop = () => { stopped = true }
@@ -174,17 +252,29 @@ export function createJcodeObserver({ jcodeHome, store, profile: requestedProfil
       signal?.addEventListener('abort', onAbort, { once: true })
       const run = async (): Promise<ConfigError | null> => {
         while (!stopped) {
-          await new Promise((resolve) => setTimeout(resolve, intervalMs))
+          await wait(intervalMs)
           if (stopped) break
-          const current = await poll(nativeSessionId)
-          if (!current) continue
-          if (current.title !== title) {
-            title = current.title
+          const current = await readConsistent(nativeSessionId)
+          // A torn or vanished record is skipped as transient; it never rewrites
+          // the identity the observer already reported.
+          if (current.health !== 'consistent') {
+            emitHealth('transient')
+            continue
+          }
+          emitHealth('consistent')
+          if (!seen) {
+            seen = true
+            title = current.session.title
+            messageCount = current.session.messageCount
+            continue
+          }
+          if (current.session.title !== title) {
+            title = current.session.title
             seq += 1
             await onEvent({ schemaVersion: 1, key: scopedKey, seq, type: 'session.renamed', title })
           }
-          if (current.messageCount > messageCount) {
-            messageCount = current.messageCount
+          if (current.session.messageCount > messageCount) {
+            messageCount = current.session.messageCount
             seq += 1
             await onEvent({ schemaVersion: 1, key: scopedKey, seq, type: 'session.appended', messageCount })
           }
@@ -193,6 +283,8 @@ export function createJcodeObserver({ jcodeHome, store, profile: requestedProfil
       }
       return {
         detach: stop,
+        // Which health produced the most recent poll.
+        health: () => health,
         done: run().catch((cause) => new ConfigError({ reason: 'Jcode observation failed', cause })),
       }
     },

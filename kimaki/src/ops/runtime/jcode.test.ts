@@ -1,5 +1,9 @@
-import { describe, expect, it } from 'vitest'
-import { createJcodeObserver } from './jcode.js'
+import { createHash } from 'node:crypto'
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { afterEach, describe, expect, it } from 'vitest'
+import { createJcodeObserver, type JcodeObservedEvent } from './jcode.js'
 
 // A synthetic Jcode home. The records deliberately carry transcript and tool
 // content so the tests can prove none of it reaches the output.
@@ -300,6 +304,178 @@ describe('Runtime profile identity', () => {
     })
     expect(refused).toBeInstanceOf(Error)
     expect((refused as Error).message).toContain('Runtime profile kcode needs an explicit store (expected ~/.kcode)')
+  })
+})
+
+// AC37: a persisted session must not be mistaken for live, and a live turn's
+// writes must not be mistaken for the session itself. These tests use a real
+// directory that the test rewrites while the observer polls it, so a torn read
+// is a real torn read rather than a mock.
+describe('Jcode concurrent write consistency', () => {
+  const homes: string[] = []
+
+  afterEach(async () => {
+    await Promise.all(homes.splice(0).map((dir) => rm(dir, { recursive: true, force: true })))
+  })
+
+  const liveKey = { hostId: 'host', endpointId: 'endpoint', backendKind: 'jcode' as const, nativeSessionId: 'session_live' }
+
+  const recordBytes = (title: string, messages = 1) => JSON.stringify({
+    id: 'session_live',
+    title,
+    created_at: '2026-01-01T00:00:00Z',
+    updated_at: '2026-01-01T00:00:00Z',
+    working_dir: 'C:/private/project',
+    messages: Array.from({ length: messages }, () => ({ role: 'user', content: 'SECRET TRANSCRIPT TEXT' })),
+    tool_calls: [{ name: 'bash', input: 'rm -rf /' }],
+  })
+
+  const makeHome = async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'jcode-concurrent-'))
+    homes.push(dir)
+    await mkdir(join(dir, 'sessions'), { recursive: true })
+    return dir
+  }
+
+  const sessionPath = (dir: string) => join(dir, 'sessions', 'session_live.json')
+
+  const realObserver = (dir: string, intervalMs = 5) => {
+    const result = createJcodeObserver({
+      jcodeHome: dir,
+      hostId: 'host',
+      endpointId: 'endpoint',
+      intervalMs,
+      readFile: (path) => readFile(path, 'utf8'),
+      readDir: (path) => readdir(path),
+    })
+    if (result instanceof Error) throw result
+    return result
+  }
+
+  // Bytes and mtime of the observed record. Reading does not change either, so
+  // an unchanged fingerprint proves the observer never wrote to the store.
+  const fingerprint = async (dir: string) => {
+    const file = sessionPath(dir)
+    const bytes = await readFile(file)
+    const info = await stat(file)
+    return { sha256: createHash('sha256').update(bytes).digest('hex'), mtimeMs: info.mtimeMs, size: info.size }
+  }
+
+  it('observes a complete real write as a consistent session', async () => {
+    const dir = await makeHome()
+    await writeFile(sessionPath(dir), recordBytes('Complete title', 2))
+    const obs = realObserver(dir)
+
+    const page = await obs.discover()
+    if (page instanceof Error) throw page
+    expect(page.observation).toEqual({ health: 'consistent', skippedTransient: 0 })
+    expect(page.sessions).toEqual([{ key: liveKey, title: 'Complete title' }])
+
+    const snapshot = await obs.readSnapshot({ key: liveKey })
+    if (snapshot instanceof Error) throw snapshot
+    expect(snapshot.session).toEqual({ id: 'session_live', title: 'Complete title' })
+    expect(JSON.stringify(page)).not.toContain('SECRET')
+  })
+
+  it('never turns a half-written record into a session or a truncated title', async () => {
+    const dir = await makeHome()
+    await writeFile(sessionPath(dir), recordBytes('Complete title'))
+    const obs = realObserver(dir)
+
+    // A native turn is mid-append: the file currently ends inside the title.
+    await writeFile(sessionPath(dir), '{"id":"session_live","title":"Torn ti')
+    const midWrite = await fingerprint(dir)
+
+    const torn = await obs.readSnapshot({ key: liveKey })
+    expect(torn).toBeInstanceOf(Error)
+    const message = (torn as Error).message
+    expect(message).toContain('transient')
+    // The torn bytes never become a title.
+    expect(message).not.toContain('Torn ti')
+
+    // Discovery skips the transient record instead of inventing a session.
+    const tornPage = await obs.discover()
+    if (tornPage instanceof Error) throw tornPage
+    expect(tornPage.sessions).toEqual([])
+    expect(tornPage.observation).toEqual({ health: 'transient', skippedTransient: 1 })
+
+    // Reading, even of a torn record, is read-only.
+    expect(await fingerprint(dir)).toEqual(midWrite)
+
+    // The writer completes the append.
+    await writeFile(sessionPath(dir), recordBytes('Final title'))
+    const settled = await obs.readSnapshot({ key: liveKey })
+    if (settled instanceof Error) throw settled
+    expect(settled.session).toEqual({ id: 'session_live', title: 'Final title' })
+  })
+
+  it('observes an atomic replacement exactly once', async () => {
+    const dir = await makeHome()
+    await writeFile(sessionPath(dir), recordBytes('Alpha', 1))
+    const obs = realObserver(dir)
+    const events: JcodeObservedEvent[] = []
+    const observation = await obs.observe({ key: liveKey, onEvent: (event) => { events.push(event) } })
+    if (observation instanceof Error) throw observation
+
+    // The turn replaces the whole record atomically: new title, one more message.
+    const temp = join(dir, 'sessions', 'session_live.json.tmp')
+    await writeFile(temp, recordBytes('Beta', 2))
+    await rename(temp, sessionPath(dir))
+
+    await expect.poll(() => events.length, { timeout: 3_000 }).toBe(2)
+    // Give several more poll intervals: a re-read of the settled record must not
+    // emit the replacement a second time.
+    await new Promise((resolve) => setTimeout(resolve, 60))
+    observation.detach()
+    expect(await observation.done).toBeNull()
+
+    expect(events.filter((event) => event.type === 'session.renamed')).toEqual([
+      { schemaVersion: 1, key: liveKey, seq: 1, type: 'session.renamed', title: 'Beta' },
+    ])
+    expect(events.filter((event) => event.type === 'session.appended')).toEqual([
+      { schemaVersion: 1, key: liveKey, seq: 2, type: 'session.appended', messageCount: 2 },
+    ])
+    expect(events.length).toBe(2)
+  })
+
+  it('reports transient while a native turn writes, then consistent with the final title', async () => {
+    const dir = await makeHome()
+    await writeFile(sessionPath(dir), recordBytes('Stable title', 1))
+    const obs = realObserver(dir)
+    const events: JcodeObservedEvent[] = []
+    const healthChanges: string[] = []
+    const observation = await obs.observe({
+      key: liveKey,
+      onEvent: (event) => { events.push(event) },
+      onHealth: (health) => { healthChanges.push(health) },
+    })
+    if (observation instanceof Error) throw observation
+
+    // The turn holds the record half-written long enough for several polls.
+    await writeFile(sessionPath(dir), '{"id":"session_live","title":"Half-writ')
+    await expect.poll(() => healthChanges.includes('transient'), { timeout: 3_000 }).toBe(true)
+    // A torn read produced no event at all, so no truncated title escaped.
+    expect(events).toEqual([])
+    expect(observation.health()).toBe('transient')
+
+    // The turn finishes the write, then stops.
+    await writeFile(sessionPath(dir), recordBytes('Settled title', 1))
+    await expect.poll(() => events.some((event) => event.type === 'session.renamed' && event.title === 'Settled title'), { timeout: 3_000 }).toBe(true)
+    await expect.poll(() => observation.health(), { timeout: 3_000 }).toBe('consistent')
+    const settledBytes = await fingerprint(dir)
+
+    observation.detach()
+    expect(await observation.done).toBeNull()
+
+    // After the writer stops, the next read is consistent and names the final title.
+    const snapshot = await obs.readSnapshot({ key: liveKey })
+    if (snapshot instanceof Error) throw snapshot
+    expect(snapshot.session).toEqual({ id: 'session_live', title: 'Settled title' })
+    expect(healthChanges[healthChanges.length - 1]).toBe('consistent')
+    expect(JSON.stringify(events)).not.toContain('Half-writ')
+    expect(events.filter((event) => event.type === 'session.renamed').length).toBe(1)
+    // The observer did not write to the store during the run.
+    expect(await fingerprint(dir)).toEqual(settledBytes)
   })
 })
 
