@@ -43,7 +43,9 @@ const run = (args: string[]) => new Promise<{ code: number; stdout: string }>((r
     resolve({ code, stdout })
   }
   // A case that never finishes must fail loudly rather than stall the whole pass.
-  const bound = setTimeout(() => { child.kill(); finish(124) }, 180_000)
+  // The bound is deliberately generous: codex start-up on a loaded host has taken
+  // longer than three minutes, which is slow, not a hang.
+  const bound = setTimeout(() => { child.kill(); finish(124) }, 300_000)
   child.stdout.on('data', (chunk) => { stdout += chunk })
   child.stderr.on('data', (chunk) => { stdout += chunk })
   child.on('error', (cause) => { stdout += `spawn failed: ${cause.message}\n`; finish(-1) })
@@ -159,6 +161,17 @@ const cases: Case[] = [
     writeFile: { path: path.join(work, 'probe-write.txt'), content: 'written' },
     method: 'item/commandExecution/requestApproval',
   },
+  {
+    // This runtime offers request_user_input only in plan mode, so the client's
+    // refusal of that server request cannot be reached from a default thread. The
+    // case pins that limit instead of claiming the path is exercised.
+    name: 'request_user_input is unavailable outside plan mode',
+    prompt: '__ASK__ ask me a question',
+    args: ['--approval', 'accept', '--approval-policy', 'untrusted'],
+    approvals: 0,
+    status: 'completed',
+    modelOutputs: (out) => out.length === 1 && out[0].includes('unavailable in Default mode'),
+  },
 ]
 
 const failures: string[] = []
@@ -167,7 +180,9 @@ say(`acceptance: ${cases.length} cases, codex ${binary}, bun ${bunBinary}, witne
 for (const testCase of cases) {
   if (testCase.writeFile) { try { fs.rmSync(testCase.writeFile.path) } catch { /* absent */ } }
   say(`...   ${testCase.name}`)
+  const startedAt = Date.now()
   const { code, stdout } = await run(['--prompt', testCase.prompt, ...testCase.args])
+  const seconds = ((Date.now() - startedAt) / 1000).toFixed(1)
   if (code !== 0) say(`      child said: ${stdout.trim().split('\n').slice(-2).join(' / ').slice(0, 300)}`)
   const objects = parse(stdout)
   const approvals = objects.filter((entry) => entry.kind === 'approval-request')
@@ -186,7 +201,7 @@ for (const testCase of cases) {
     const content = (() => { try { return fs.readFileSync(testCase.writeFile.path, 'utf8').trim() } catch { return '' } })()
     note(`file content`, content === testCase.writeFile.content)
   }
-  say(`${checks.some((entry) => entry.includes('FAIL')) ? 'FAIL' : 'PASS'}  ${testCase.name}  ::  ${checks.join(' | ')}`)
+  say(`${checks.some((entry) => entry.includes('FAIL')) ? 'FAIL' : 'PASS'}  ${testCase.name}  (${seconds}s)  ::  ${checks.join(' | ')}`)
 }
 
 say(`\n${cases.length - failures.length}/${cases.length} cases passed`)

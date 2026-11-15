@@ -9,6 +9,7 @@
 //   __PAR__     ask for two commands in a single model output
 //   __PATCH__   name an apply_patch tool the runtime never offered
 //   __WRITE__   write a file through the shell
+//   __ASK__     call request_user_input, which this runtime offers only in plan mode
 import http from 'node:http'
 import fs from 'node:fs'
 
@@ -43,6 +44,22 @@ const patchItem = () => ({
   arguments: JSON.stringify({ input: '*** Begin Patch\n*** Add File: probe.txt\n+hello\n*** End Patch' }),
 })
 
+const askItem = () => ({
+  id: 'fc_stub_ask',
+  type: 'function_call',
+  status: 'completed',
+  name: 'request_user_input',
+  call_id: 'call_stub_ask',
+  arguments: JSON.stringify({
+    questions: [{
+      header: 'Pick',
+      id: 'pick',
+      question: 'Which one?',
+      options: [{ label: 'A (Recommended)', description: 'first' }, { label: 'B', description: 'second' }],
+    }],
+  }),
+})
+
 const respond = (response, body) => {
   let parsed = null
   try { parsed = JSON.parse(body) } catch { parsed = null }
@@ -59,7 +76,9 @@ const respond = (response, body) => {
     : 'echo second-command'
 
   let output
-  if (body.includes('__WRITE__') && first) {
+  if (body.includes('__ASK__') && first) {
+    output = [messageItem('asking the user a question'), askItem()]
+  } else if (body.includes('__WRITE__') && first) {
     output = [messageItem('writing a file through the shell'), call('fc_stub', 'call_stub_1', "Set-Content -LiteralPath 'probe-write.txt' -Value written")]
   } else if (body.includes('__PATCH__') && first) {
     output = [messageItem('trying a patch tool the runtime did not offer'), patchItem()]

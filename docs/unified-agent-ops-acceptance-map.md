@@ -279,7 +279,8 @@ when the CLI's exit code, request count, turn status and what the model was told
 anything else prints `FAIL` and the pass exits non-zero. No account credential is used and the
 temporary home is removed on exit. `CODEX_BINARY` and `BUN_BINARY` override the two executables.
 
-Last full run on this host against codex-cli 0.169: **12/12 cases passed**, in 5m35s:
+Last full run on this host against codex-cli 0.169: **13/13 cases passed**, with per-case elapsed time printed
+because the host was heavily loaded during the run (cases took 50-70s each instead of 5-15s):
 
 | Case | What it proves |
 | --- | --- |
@@ -295,6 +296,13 @@ Last full run on this host against codex-cli 0.169: **12/12 cases passed**, in 5
 | escalation declined is refused | `rejected by user` |
 | an unadvertised patch tool is rejected by the runtime | `unsupported call: apply_patch`, no approval raised |
 | a shell write arrives as a command approval | method `item/commandExecution/requestApproval`, file written |
+| request_user_input is unavailable outside plan mode | the runtime answers the model `request_user_input is unavailable in Default mode` and raises no approval, so the client's refusal of that server request stays unit-tested |
+
+One earlier run of this pass reported 12/13: the `decline` case was killed at the old 180s per-case bound
+even though its turn had printed as completed. Five isolated repeats of that same command then exited in
+2.6-4.5s each, so the stall was the bound meeting a loaded host, not the CLI failing to exit. The bound is
+now 300s and every case prints its elapsed time, which is how this run's 50-70s per case is visible above
+rather than hidden.
 
 Building the harness caught two defects in the harness itself, not in the approval code, and both
 are worth knowing because each looked like a product failure first: a stale `bun.exe` earlier on
