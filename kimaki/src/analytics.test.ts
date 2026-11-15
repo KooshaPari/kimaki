@@ -448,3 +448,6 @@ test('AC28 (d) per-session rows stay separate across a reattach', () => {
   expect(replay.state[root]?.steps.size).toBe(1)
   expect(replay.state[child]?.steps.size).toBe(1)
 })
+
+// AC40 (collector outage, source health, retention) lives in
+// analytics-outage.test.ts to keep each test file under 500 lines.

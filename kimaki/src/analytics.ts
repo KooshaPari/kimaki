@@ -20,6 +20,10 @@
 //
 // Off with --no-analytics or KIMAKI_STRADA_ENABLED=0, and under vitest unless
 // a test passes its own endpoint.
+//
+// Delivery is not fire-and-forget. A collector outage is a source-health
+// state: events that could not be delivered stay in a bounded in-order buffer
+// and are retried; counters keep `attempted = delivered + retained + dropped`.
 
 import crypto from 'node:crypto'
 import fs from 'node:fs'
@@ -222,6 +226,152 @@ export type Analytics = {
   // An OpenCode event of a Kimaki thread (event loop).
   observe: (event: V2Event, isRoot: boolean) => void
   flush: () => Promise<void>
+  // Collector reachability and the retention buffer, for `kimaki status` and
+  // tests. Always reachable/zero for disabledAnalytics.
+  health: () => SourceHealth
+  counters: () => SourceCounters
+}
+
+// --- source health and the outage buffer ---
+// Retention is bounded so an outage cannot grow without limit. 256 events is
+// hours of normal traffic (a busy turn emits about three) and stays near a
+// quarter of a megabyte. Past the cap the oldest event is dropped and counted:
+// a silent unbounded buffer would be a leak.
+export const RETAIN_CAP = 256
+
+export type SourceFailure =
+  | { kind: 'network'; message: string }
+  // The collector answered, but not 2xx: up and refusing, unlike 'network'.
+  | { kind: 'status'; status: number; message: string }
+
+export type SourceHealth = {
+  reachable: boolean // false from a failed pass until one succeeds
+  lastError: string | null
+  lastErrorKind: SourceFailure['kind'] | null
+  lastErrorStatus: number | null // HTTP status, null for a network failure
+  failedSends: number // passes that carried at least one failure
+  firstFailureAt: number | null // start of the current outage
+  lastSuccessAt: number | null
+}
+
+export type SourceCounters = {
+  // Distinct events the sink accepted; retrying a retained event is not a new
+  // attempt, which is what keeps the invariant adding up.
+  attempted: number
+  delivered: number
+  retained: number
+  dropped: number
+}
+
+export type CollectorTransport = {
+  // One pass over `events`, in order: undefined = accepted, else why not.
+  deliver: (events: readonly AnalyticsEvent[]) => Promise<readonly (SourceFailure | undefined)[]>
+}
+
+export type EventSink = {
+  emit: (event: AnalyticsEvent) => Promise<void>
+  flush: () => Promise<void>
+  health: () => SourceHealth
+  counters: () => SourceCounters
+  // The retained events, oldest first.
+  peek: () => readonly AnalyticsEvent[]
+}
+
+export function reachableHealth(): SourceHealth {
+  return { reachable: true, lastError: null, lastErrorKind: null, lastErrorStatus: null, failedSends: 0, firstFailureAt: null, lastSuccessAt: null }
+}
+
+export function emptyCounters(): SourceCounters {
+  return { attempted: 0, delivered: 0, retained: 0, dropped: 0 }
+}
+
+export function createEventSink({
+  deliver,
+  cap = RETAIN_CAP,
+  now = Date.now,
+}: {
+  deliver: CollectorTransport['deliver']
+  cap?: number
+  now?: () => number
+}): EventSink {
+  const limit = Math.max(1, cap)
+  let buffer: AnalyticsEvent[] = []
+  let attempted = 0
+  let delivered = 0
+  let dropped = 0
+  let health = reachableHealth()
+  // One pass at a time: concurrent passes would send the same event twice.
+  let inflight: Promise<void> | null = null
+
+  const recordFailure = (failure: SourceFailure) => {
+    const at = now()
+    health = {
+      reachable: false,
+      lastError: failure.message,
+      lastErrorKind: failure.kind,
+      lastErrorStatus: failure.kind === 'status' ? failure.status : null,
+      failedSends: health.failedSends + 1,
+      firstFailureAt: health.firstFailureAt ?? at,
+      lastSuccessAt: health.lastSuccessAt,
+    }
+  }
+
+  const pass = async () => {
+    if (buffer.length === 0) return
+    const batch = buffer
+    let outcomes: readonly (SourceFailure | undefined)[]
+    try {
+      outcomes = await deliver(batch)
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message : String(cause)
+      outcomes = batch.map(() => ({ kind: 'network' as const, message }))
+    }
+    const keep: AnalyticsEvent[] = []
+    let failure: SourceFailure | undefined // the last failure of the pass
+    for (let i = 0; i < batch.length; i += 1) {
+      const event = batch[i]
+      if (event === undefined) continue
+      // A short answer is a failure: silence must not look like acceptance.
+      const outcome = i < outcomes.length ? outcomes[i] : ({ kind: 'network', message: 'collector answered for no such event' } as const)
+      if (outcome) {
+        failure = outcome
+        keep.push(event)
+      } else {
+        delivered += 1
+      }
+    }
+    buffer = keep
+    if (failure) {
+      recordFailure(failure)
+      return
+    }
+    health = { ...health, reachable: true, lastError: null, lastErrorKind: null, lastErrorStatus: null, firstFailureAt: null, lastSuccessAt: now() }
+  }
+
+  const flush = () => {
+    if (!inflight) {
+      inflight = pass().finally(() => {
+        inflight = null
+      })
+    }
+    return inflight
+  }
+
+  return {
+    emit: async (event) => {
+      attempted += 1
+      if (buffer.length >= limit) {
+        buffer.shift()
+        dropped += 1
+      }
+      buffer.push(event)
+      await flush()
+    },
+    flush,
+    health: () => health,
+    counters: () => ({ attempted, delivered, retained: buffer.length, dropped }),
+    peek: () => buffer.slice(),
+  }
 }
 
 export const disabledAnalytics: Analytics = {
@@ -229,6 +379,8 @@ export const disabledAnalytics: Analytics = {
   track: () => {},
   observe: () => {},
   flush: async () => {},
+  health: reachableHealth,
+  counters: emptyCounters,
 }
 
 function readInstallId(dataDir: string): ConfigError | string {
@@ -251,6 +403,34 @@ function readInstallId(dataDir: string): ConfigError | string {
 function kimakiVersion(): string {
   const pkg = createRequire(import.meta.url)('../package.json') as { version: string }
   return pkg.version
+}
+
+// The SDK reports a refused batch as `Strada ingest <path> responded <status>`
+// and a transport problem as `... request failed`. That message is the only
+// status surface the SDK exposes, so the parsing lives here and nowhere else.
+function toSourceFailure(error: Error): SourceFailure {
+  const refused = /responded (\d{3})\b/.exec(error.message)
+  if (refused?.[1]) return { kind: 'status', status: Number(refused[1]), message: error.message }
+  return { kind: 'network', message: error.message }
+}
+
+// Deliver a pass through the SDK. track() only buffers; flush() is what talks
+// to the collector. The SDK does not say which record a failed batch rejected,
+// so a failed flush fails every event that track() did not already reject, and
+// a retry re-sends the whole retained pass (the SDK has no partial-batch view).
+function stradaDeliver(): CollectorTransport['deliver'] {
+  return async (events) => {
+    const outcomes = events.map((event): SourceFailure | undefined => {
+      const failed = track(event.name, event.properties)
+      return failed instanceof Error ? toSourceFailure(failed) : undefined
+    })
+    const flushed = await flush()
+    if (flushed instanceof Error) {
+      const failure = toSourceFailure(flushed)
+      return outcomes.map((outcome) => outcome ?? failure)
+    }
+    return outcomes
+  }
 }
 
 export function createAnalytics({
@@ -291,10 +471,11 @@ export function createAnalytics({
     return disabledAnalytics
   }
   const common = { install_id: installId, schema_version: SCHEMA_VERSION, bot_mode: botMode, platform: process.platform, arch: process.arch }
+  const sink = createEventSink({ deliver: stradaDeliver() })
   const send = (name: AnalyticsEventName, properties: AnalyticsProps = {}) => {
-    // Identity fields always win over caller props.
-    const failed = track(name, { ...properties, ...common })
-    if (failed instanceof Error) logger.warn(`track ${name}`, failed)
+    // Identity fields always win over caller props. emit() never rejects: a
+    // failure is recorded as source health instead of thrown at the caller.
+    void sink.emit({ name, properties: { ...properties, ...common } })
   }
   const usage: { state: UsageState } = { state: {} }
   return {
@@ -306,8 +487,13 @@ export function createAnalytics({
       for (const tracked of folded.events) send(tracked.name, tracked.properties)
     },
     flush: async () => {
-      const failed = await flush()
-      if (failed instanceof Error) logger.warn(`flush`, failed)
+      await sink.flush()
+      const health = sink.health()
+      // A flush that could not reach the collector is now a health state, but
+      // it is still worth one log line when it happens.
+      if (!health.reachable) logger.warn(`analytics collector unreachable`, health.lastError ?? 'unknown')
     },
+    health: sink.health,
+    counters: sink.counters,
   }
 }
