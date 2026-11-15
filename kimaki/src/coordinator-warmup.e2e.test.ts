@@ -42,13 +42,17 @@ function bigText(text: string) {
   ] as const
 }
 
-// The shell tool hands its command to cmd.exe as one argv element on Windows, where the
-// POSIX single quotes and `$OPENCODE_SESSION_ID` of an inline command do not apply. A
-// script file passes the real command line to the shell: it groups the quoted values and
-// expands the session variable itself, %VAR% in cmd.exe and $VAR in sh. Same pattern as
-// coordinator.e2e.test.ts.
+// The shell tool hands its command to the platform shell as one argv element on
+// Windows, where the POSIX single quotes and `$OPENCODE_SESSION_ID` of an inline
+// command do not apply. A script file passes the real command line to the shell:
+// it groups the quoted values and expands the session variable itself, %VAR% in
+// cmd.exe and $VAR in sh. Same pattern as coordinator.e2e.test.ts.
+//
+// The script is run from the project directory, so it needs an explicit
+// relative path: PowerShell does not resolve a bare `warmup-quickjob.cmd` from
+// the current directory, and the launch would exit 1 without starting a worker.
 function dispatchScript(base: string) {
-  return process.platform === 'win32' ? `${base}.cmd` : `sh ${base}.sh`
+  return process.platform === 'win32' ? `.\\${base}.cmd` : `sh ${base}.sh`
 }
 
 function scriptBase(worker: string) {

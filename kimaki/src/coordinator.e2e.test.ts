@@ -37,7 +37,10 @@ const dataDir = tempDataDir()
 // values and expands the session variable itself, %VAR% in cmd.exe and $VAR in
 // sh. One mechanism, both platforms.
 function dispatchScript(base: string) {
-  return process.platform === 'win32' ? `${base}.cmd` : `sh ${base}.sh`
+  // An explicit relative path: PowerShell does not resolve a bare
+  // `dispatch-worker.cmd` from the current directory, so the launch would exit 1
+  // without ever starting the worker.
+  return process.platform === 'win32' ? `.\\${base}.cmd` : `sh ${base}.sh`
 }
 
 // Written once the server exists, in the directory the shell tool runs in.
@@ -153,11 +156,43 @@ function usageless(note: string): string {
   return note.replace(/ context="[^"]+"/, ' context="N tokens"').replace(/ duration="[^"]+"/, ' duration="Ns"')
 }
 
+// The coordinator's own shell tool call, with its output, from the session read
+// surface. This is what tells a launch that never ran (the shell could not find
+// the script: exit 1, "not recognized") from a worker that was really started
+// (the `kimaki send` JSON with the new thread). Without it a broken launch only
+// shows up as a footer timeout, far from the cause.
+async function shellRun(sessionId: string, description: string): Promise<string | null> {
+  const client = await server.client()
+  const read = await readSessionMarkdown({ client, sessionId, full: true, verbose: true })
+  if (read instanceof Error) return null
+  // Only a finished call: a running one has no output yet.
+  const done = (block: string) => block.startsWith('tool shell [completed]') || block.startsWith('tool shell [error]')
+  return read.split('\n\n').find((block) => done(block) && block.includes(description)) ?? null
+}
+
+// `waitForFooter` clamps its deadline to 10s. The footer of a wake that crosses a
+// worker run and a busy shell call can be slower than that on a loaded host, so
+// this waits with a real budget. It does not change what is asserted.
+async function footersEventually(threadId: string, count: number, timeoutMs = 25_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const footers = (await twin.discord.thread(threadId).getMessages()).filter(isFooter)
+    if (footers.length >= count) return
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+  throw new Error(`Timed out waiting for footer #${count} in thread ${threadId}`)
+}
+
 afterAll(async () => {
   await bot?.stop()
   await twin?.stop()
   await server?.stop()
-  fs.rmSync(dataDir, { recursive: true, force: true })
+  // A child may still hold the temp dir for a moment on Windows.
+  try {
+    fs.rmSync(dataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 })
+  } catch {
+    // Best effort: the OS cleans its temp dir.
+  }
 })
 
 test('channel messages go to one session that replies in the channel', async () => {
@@ -200,7 +235,19 @@ test('channel messages go to one session that replies in the channel', async () 
 test('a worker started with --parent-session gets a thread and wakes the coordinator when done', async () => {
   const { discord, channelId } = twin
   const footers = (await discord.channel(channelId).getMessages()).filter(isFooter)
+  const root = bot.store.getState().roots[channelId]!
   await discord.channel(channelId).user(TEST_USER_ID).sendMessage({ content: 'Fix it delegate-marker' })
+  // The launch ran: the shell found the script and `kimaki send` answered with the
+  // new thread. A bare script name in PowerShell never runs (exit 1, "not
+  // recognized"), so this is checked first and names the cause instead of a later
+  // footer timeout.
+  const launch = await waitFor({
+    label: 'worker launch output',
+    check: () => shellRun(root, 'Start the worker thread'),
+  })
+  expect(launch).toContain('tool shell [completed]')
+  expect(launch).not.toContain('not recognized')
+  expect(launch).toContain('threadId')
   const thread = await discord.channel(channelId).waitForThread({ timeout: 8_000 })
   await waitForFooter({ discord, threadId: thread.id })
   await waitFor({
@@ -391,7 +438,9 @@ test('a worker that outlives a bounded --wait wakes the coordinator with a note'
   const { discord, channelId } = twin
   const footers = (await discord.channel(channelId).getMessages()).filter(isFooter)
   await discord.channel(channelId).user(TEST_USER_ID).sendMessage({ content: 'Do it boundedwait-marker' })
-  await waitForFooter({ discord, threadId: channelId, count: footers.length + 1 })
+  // The dispatch turn stays busy in its own shell call while the 0.1s wait runs
+  // out; the wake footer that follows crosses that run.
+  await footersEventually(channelId, footers.length + 1)
   const text = await discord.channel(channelId).text()
   expect(text.slice(text.lastIndexOf('Do it boundedwait-marker'))).toMatchInlineSnapshot(`
     "Do it boundedwait-marker
@@ -551,7 +600,12 @@ test('the coordinator survives a bot restart; /reset-coordinator starts a fresh 
 
   const { id: interactionId } = await discord.channel(channelId).user(TEST_USER_ID).runSlashCommand({ name: 'reset-coordinator' })
   await discord.channel(channelId).waitForInteractionAck({ interactionId, timeout: 4_000 })
-  expect(bot.store.getState().roots[channelId]).toBeUndefined()
+  // The ack is the deferReply; abort and endCoordinator run after it, so wait for
+  // the binding to be gone instead of sampling it in the same tick as the ack.
+  await waitFor({
+    label: 'coordinator reset',
+    check: async () => (bot.store.getState().roots[channelId] === undefined ? true : null),
+  })
   const footers = (await discord.channel(channelId).getMessages()).filter(isFooter).length
   await discord.channel(channelId).user(TEST_USER_ID).sendMessage({ content: 'Fresh start hello-marker' })
   await waitForFooter({ discord, threadId: channelId, count: footers + 1 })
