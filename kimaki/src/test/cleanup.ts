@@ -7,12 +7,13 @@ import fs from 'node:fs'
 import { rm } from 'node:fs/promises'
 
 // Each round spends up to 10 retries with a 100ms linear backoff (Node's fs.rm
-// waits 100, 200, ... 1000ms between tries, so a round is ~5.5s). Four rounds
-// with a growing pause covers roughly 25s, long enough to outlast a closing
-// SQLite handle or a child process that is a few seconds behind, and still a
-// hard bound: once the rounds are spent the error is thrown, so a genuinely
-// stuck directory fails the suite instead of being hidden.
-const REMOVAL_ROUNDS = 4
+// waits 100, 200, ... 1000ms between tries, so a round is ~5.5s). Two rounds with
+// a pause between them cover roughly 12s, enough to outlast a closing SQLite
+// handle or a child process that is a few seconds behind, and still a hard bound
+// that fits inside the 60s default hook timeout: once the rounds are spent the
+// error is thrown, so a genuinely stuck directory fails the suite instead of
+// being hidden.
+const REMOVAL_ROUNDS = 2
 const REMOVAL_RETRY_DELAY_MS = 100
 const REMOVAL_MAX_RETRIES = 10
 const REMOVAL_ROUND_PAUSE_MS = 500
