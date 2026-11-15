@@ -26,6 +26,12 @@ export type BindingBackup = {
   rows: SurfaceBinding[]
 }
 
+// A sealed backup carries the content digest a restore checks before writing.
+// The digest covers exactly the restore payload: version, creation timestamp and
+// rows. Any other top-level property is ignored, so a hostile extra field cannot
+// change what the digest attests.
+export type SealedBindingBackup = BindingBackup & { digest: string }
+
 export type ImportBindingsResult = {
   imported: number
   skipped: number
@@ -330,6 +336,53 @@ export function payloadDigest(payload: unknown): string | ConfigError {
   const canonical = canonicalPayload(payload)
   if (canonical === undefined) return new ConfigError({ reason: 'The worker result payload must be JSON-serializable before it can be recorded for sync-back' })
   return crypto.createHash('sha256').update(canonical).digest('hex')
+}
+
+// A backup digest attests the restore payload only: schema version, creation
+// timestamp and rows. It is stable across key order and ignores any other
+// top-level property, so an added field cannot change what the digest covers.
+export function bindingBackupDigest(
+  backup: Pick<BindingBackup, 'version' | 'exportedAt' | 'rows'>,
+): string | ConfigError {
+  const canonical = canonicalPayload({ version: backup.version, exportedAt: backup.exportedAt, rows: backup.rows })
+  if (canonical === undefined) {
+    return new ConfigError({ reason: 'The backup payload must be JSON-serializable before a digest can be computed or verified' })
+  }
+  return crypto.createHash('sha256').update(canonical).digest('hex')
+}
+
+export function sealBindingBackup(backup: BindingBackup): SealedBindingBackup | ConfigError {
+  const digest = bindingBackupDigest(backup)
+  if (digest instanceof Error) return digest
+  return { version: backup.version, exportedAt: backup.exportedAt, rows: backup.rows, digest }
+}
+
+// Order matters: the schema version is refused by name before the digest is
+// examined, so a backup from another version fails for the real reason. A
+// missing or mismatched digest is refused before any row is validated or written.
+export function verifySealing(sealed: unknown): BindingBackup | ConfigError {
+  if (typeof sealed !== 'object' || sealed === null || Array.isArray(sealed)) {
+    return new ConfigError({ reason: 'Backup must be a versioned binding backup object' })
+  }
+  const envelope = sealed as Record<string, unknown>
+  if (envelope['version'] !== 1) {
+    return new ConfigError({ reason: `Unsupported binding backup version ${String(envelope['version'])}. Only version 1 can be restored` })
+  }
+  const digest = envelope['digest']
+  if (typeof digest !== 'string' || !/^[0-9a-f]{64}$/.test(digest)) {
+    return new ConfigError({ reason: 'Backup carries no content digest. Re-export it before restoring so the payload can be verified' })
+  }
+  const payload = {
+    version: envelope['version'],
+    exportedAt: envelope['exportedAt'],
+    rows: envelope['rows'],
+  } as Pick<BindingBackup, 'version' | 'exportedAt' | 'rows'>
+  const expected = bindingBackupDigest(payload)
+  if (expected instanceof Error) return expected
+  if (expected !== digest) {
+    return new ConfigError({ reason: `Backup digest ${digest} does not match its content ${expected}. The payload is truncated or altered; refusing to restore it` })
+  }
+  return payload as BindingBackup
 }
 
 function errorText(cause: unknown): string {
