@@ -7,6 +7,8 @@ import fs from 'node:fs'
 import http from 'node:http'
 import { afterAll, beforeAll, expect, test } from 'vitest'
 
+import { removeDataDir } from './test/cleanup.ts'
+
 import { createAnalytics } from './analytics.ts'
 import type { BotHandle } from './main.ts'
 import {
@@ -69,7 +71,7 @@ afterAll(async () => {
   await twin?.stop()
   await server?.stop()
   await new Promise<void>((resolve) => receiver?.close(() => resolve()))
-  fs.rmSync(dataDir, { recursive: true, force: true })
+  await removeDataDir(dataDir)
 })
 
 test('a Discord turn sends the funnel events with anonymous identity props', async () => {

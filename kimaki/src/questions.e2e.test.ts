@@ -2,7 +2,7 @@
 // select, by the "Other" modal, several questions in one form, a new message
 // cancels a pending question, and a restarted bot shows it again.
 
-import fs from 'node:fs'
+import { removeDataDir } from './test/cleanup.ts'
 import { ComponentType, type APIMessage } from 'discord.js'
 import type { DeterministicMatcher } from 'opencode-deterministic-provider'
 import { afterAll, beforeAll, expect, test } from 'vitest'
@@ -84,7 +84,7 @@ afterAll(async () => {
   await bot?.stop()
   await twin?.stop()
   await server?.stop()
-  fs.rmSync(dataDir, { recursive: true, force: true })
+  await removeDataDir(dataDir)
 })
 
 type Select = { message: APIMessage; customId: string; values: string[] }
