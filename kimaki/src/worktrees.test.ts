@@ -28,6 +28,12 @@ async function checked(directory: string, args: string[]) {
   return result
 }
 
+// Git applies core.autocrlf on checkout, so a committed LF file arrives as CRLF on Windows.
+// Compare the content Git actually stores; the product never rewrites file bytes itself.
+function readText(file: string) {
+  return fs.readFileSync(file, 'utf8').replace(/\r\n/g, '\n')
+}
+
 test('custom worktrees use the exact clone and committed HEAD; cwd resolves subfolders and symlinks safely', async () => {
   const { root, directory } = await repo()
   fs.writeFileSync(path.join(directory, 'file.txt'), 'uncommitted\n')
@@ -38,7 +44,7 @@ test('custom worktrees use the exact clone and committed HEAD; cwd resolves subf
   fs.symlinkSync(created.directory, alias)
   const resolved = await resolveWorkingDirectory({ projectDirectory: directory, candidate: path.join(alias, 'src') })
   expect(resolved).toBe(path.join(created.directory, 'src'))
-  expect(fs.readFileSync(path.join(created.directory, 'file.txt'), 'utf8')).toBe('original\n')
+  expect(readText(path.join(created.directory, 'file.txt'))).toBe('original\n')
   expect(created.branch).toBe('opencode/kimaki-feature')
   expect(await createWorktree({ projectDirectory: directory, dataDir: root, name: '../escape' })).toBeInstanceOf(Error)
   expect(await createWorktree({ projectDirectory: directory, dataDir: root, name: 'feature' })).toBeInstanceOf(Error)
@@ -73,7 +79,7 @@ test.each(['rebase', 'squash'] as const)('%s merges locally and deletion rejects
   await checked(directory, ['commit', '-qm', 'target advanced'])
   const merged = await mergeWorktree({ projectDirectory: directory, directory: created.directory, strategy })
   if (merged instanceof Error) throw merged
-  expect(fs.readFileSync(path.join(directory, 'feature.txt'), 'utf8')).toBe('feature\n')
+  expect(readText(path.join(directory, 'feature.txt'))).toBe('feature\n')
   expect(await checked(directory, ['rev-list', '--count', 'main'])).toBe(strategy === 'rebase' ? '4' : '3')
   expect(await checked(created.directory, ['branch', '--show-current'])).toBe('')
   expect(await deleteWorktree({ projectDirectory: directory, directory: created.directory })).toBeUndefined()
@@ -94,6 +100,6 @@ test('merge conflicts leave the worktree paused and a retry does not hide the re
   const retry = await mergeWorktree({ projectDirectory: directory, directory: created.directory })
   if (!(retry instanceof Error)) throw new Error('Expected a paused rebase')
   expect(retry.message).toMatchInlineSnapshot(`"A rebase is already paused. Resolve conflicts and run git rebase --continue, or git rebase --abort, before merging."`)
-  expect(fs.readFileSync(path.join(directory, 'file.txt'), 'utf8')).toBe('target\n')
-  expect(fs.readFileSync(path.join(created.directory, 'file.txt'), 'utf8')).toContain('<<<<<<<')
+  expect(readText(path.join(directory, 'file.txt'))).toBe('target\n')
+  expect(readText(path.join(created.directory, 'file.txt'))).toContain('<<<<<<<')
 })
