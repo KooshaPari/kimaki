@@ -5,6 +5,7 @@ import path from 'node:path'
 import { execFile } from 'node:child_process'
 import os from 'node:os'
 import { createRequire } from 'node:module'
+import { pathToFileURL } from 'node:url'
 import { eq } from 'drizzle-orm'
 import { promisify } from 'node:util'
 import { afterAll, beforeAll, expect, test } from 'vitest'
@@ -48,7 +49,7 @@ function cli(args: string[]) {
   // Options must precede `--`: everything after it is passthrough.
   const separator = args.indexOf('--')
   const withDataDir = separator === -1 ? [...args, '--data-dir', dataDir] : [...args.slice(0, separator), '--data-dir', dataDir, ...args.slice(separator)]
-  return exec(process.execPath, ['--import', createRequire(import.meta.url).resolve('tsx'), path.resolve('src/cli.ts'), ...withDataDir], {
+  return exec(process.execPath, ['--import', pathToFileURL(createRequire(import.meta.url).resolve('tsx')).href, path.resolve('src/cli.ts'), ...withDataDir], {
     cwd: server.projectDirectory,
     env: { ...process.env, KIMAKI_LOCK_PORT: String(bot.lock.port), KIMAKI_OPENCODE_SERVICE_FILE: server.serviceFile, KIMAKI_DISCORD_REST_URL: twin.discord.restUrl },
   })

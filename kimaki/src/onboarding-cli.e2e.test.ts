@@ -9,6 +9,7 @@ import fs from 'node:fs'
 import http from 'node:http'
 import { createRequire } from 'node:module'
 import path from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
 import { afterAll, beforeAll, expect, test } from 'vitest'
 
@@ -95,7 +96,7 @@ test('kimaki --gateway without a TTY installs, onboards and reports ready on std
   const lockPort = await freePort()
   child = spawn(
     process.execPath,
-    ['--import', require.resolve('tsx'), path.resolve('src/cli.ts'), '--data-dir', dataDir, '--gateway', '--machine-name', 'test-machine'],
+    ['--import', pathToFileURL(require.resolve('tsx')).href, path.resolve('src/cli.ts'), '--data-dir', dataDir, '--gateway', '--machine-name', 'test-machine'],
     {
       env: {
         ...process.env,
@@ -174,7 +175,7 @@ test('kimaki --gateway without a TTY installs, onboards and reports ready on std
   `)
 
   // `kimaki restart`: the supervisor starts a new bot process, which reports ready again.
-  const cli = (args: string[]) => execFileAsync(process.execPath, ['--import', require.resolve('tsx'), path.resolve('src/cli.ts'), ...args, '--data-dir', dataDir], {
+  const cli = (args: string[]) => execFileAsync(process.execPath, ['--import', pathToFileURL(require.resolve('tsx')).href, path.resolve('src/cli.ts'), ...args, '--data-dir', dataDir], {
     env: { ...process.env, KIMAKI_LOCK_PORT: String(lockPort) },
   })
   const before = JSON.parse((await cli(['status', '--json'])).stdout) as { pid: number }
@@ -194,7 +195,7 @@ test('--install-url --gateway prints the install URL with the callback and exits
     const process_ = spawn(
       process.execPath,
       [
-        '--import', require.resolve('tsx'), path.resolve('src/cli.ts'),
+        '--import', pathToFileURL(require.resolve('tsx')).href, path.resolve('src/cli.ts'),
         '--data-dir', otherDataDir, '--install-url', '--gateway', '--gateway-callback-url', 'https://example.com/done',
       ],
       { env: { ...process.env, KIMAKI_WEBSITE_URL: 'https://kimaki.test' } },
