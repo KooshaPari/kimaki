@@ -143,4 +143,10 @@ test('a second bot on the same lock port stops the running one and takes over', 
     ok
     -# *main ⋅ Ns ⋅ deterministic-v2*"
   `)
-})
+  // Real work, and its duration scales with machine load: a `node --import tsx`
+  // child compiles src/main.ts and its whole graph, then two bots, the twin and
+  // the takeover run. Measured on this host: 12.4s and 15.5s alone, 17.4s in a
+  // full suite run, and >30s (the suite default) when the other forks were
+  // slower still. 120s is ~7x the under-load figure, and a genuine hang still
+  // fires: every inner wait is bounded (waitFor 8-10s, lock eviction 25s).
+}, 120_000)
