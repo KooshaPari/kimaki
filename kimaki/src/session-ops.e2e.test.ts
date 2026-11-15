@@ -7,6 +7,7 @@ import type { DeterministicMatcher } from 'opencode-deterministic-provider'
 import { afterAll, beforeAll, expect, test } from 'vitest'
 
 import type { BotHandle } from './main.ts'
+import { removeDataDir } from './test/cleanup.ts'
 import {
   TEST_USER_ID,
   scriptedTurn,
@@ -72,7 +73,7 @@ afterAll(async () => {
   await bot?.stop()
   await twin?.stop()
   await server?.stop()
-  fs.rmSync(dataDir, { recursive: true, force: true })
+  await removeDataDir(dataDir)
 })
 
 async function newThread(content: string) {

@@ -2,10 +2,10 @@
 // them right after READY. Those messages must start or continue sessions like
 // live ones, even though they arrive before OpenCode is connected.
 
-import fs from 'node:fs'
 import { afterAll, beforeAll, expect, test } from 'vitest'
 
 import type { BotHandle } from './main.ts'
+import { removeDataDir } from './test/cleanup.ts'
 import {
   TEST_USER_ID,
   seedProjectChannel,
@@ -40,7 +40,7 @@ afterAll(async () => {
   await bot?.stop()
   await twin?.stop()
   await server?.stop()
-  fs.rmSync(dataDir, { recursive: true, force: true })
+  await removeDataDir(dataDir)
 })
 
 test('messages sent while the bot is offline are handled after it reconnects', async () => {

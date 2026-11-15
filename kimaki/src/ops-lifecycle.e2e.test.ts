@@ -3,7 +3,7 @@ import path from 'node:path'
 import { promisify } from 'node:util'
 import { afterAll, beforeAll, expect, test } from 'vitest'
 import { openDb } from './db.ts'
-import { removeTempDirs } from './test/cleanup.ts'
+import { removeDataDir } from './test/cleanup.ts'
 import { startOpencodeTestServer, startTwin, tempDataDir, type OpencodeTestServer, type TestTwin } from './test/harness.ts'
 
 const exec = promisify(execFile)
@@ -35,7 +35,7 @@ beforeAll(async () => {
 afterAll(async () => {
   await Promise.all([server?.stop(), twin?.stop()])
   global.gc?.()
-  await removeTempDirs([dataDir])
+  await removeDataDir(dataDir)
 }, 180_000)
 
 test('public ops lifecycle observes an external session without controlling it', async () => {

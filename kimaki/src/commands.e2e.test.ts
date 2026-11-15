@@ -2,12 +2,12 @@
 // OpenCode catalog: /<agent>-agent, /<cmd>-cmd, /<skill>-skill, and
 // /queue-command. MCP prompts get no slash command; they run as messages.
 
-import fs from 'node:fs'
 import path from 'node:path'
 import type { DeterministicMatcher } from 'opencode-deterministic-provider'
 import { afterAll, beforeAll, expect, test } from 'vitest'
 
 import type { BotHandle } from './main.ts'
+import { removeDataDir } from './test/cleanup.ts'
 import {
   TEST_USER_ID,
   seedProjectChannel,
@@ -65,7 +65,7 @@ afterAll(async () => {
   await bot?.stop()
   await twin?.stop()
   await server?.stop()
-  fs.rmSync(dataDir, { recursive: true, force: true })
+  await removeDataDir(dataDir)
 })
 
 test('the bot registers exactly the static and catalog commands in the guild', async () => {

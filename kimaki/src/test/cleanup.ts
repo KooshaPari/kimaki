@@ -1,8 +1,47 @@
 // libSQL's native statements can retain Windows file handles briefly after
-// close. Cleanup must not fail an otherwise passing test, so retry and, if the
-// OS still holds the directory, leave it to temp cleanup.
+// close, and the bot/opencode children may still be exiting when `afterAll`
+// runs. Removing a per-test data dir therefore has to tolerate a short window
+// where the directory is still held open (typically `kimaki.db-shm`, which stays
+// locked until every connection to the database is gone).
 import fs from 'node:fs'
+import { rm } from 'node:fs/promises'
 
+// Each round spends up to 10 retries with a 100ms linear backoff (Node's fs.rm
+// waits 100, 200, ... 1000ms between tries, so a round is ~5.5s). Four rounds
+// with a growing pause covers roughly 25s, long enough to outlast a closing
+// SQLite handle or a child process that is a few seconds behind, and still a
+// hard bound: once the rounds are spent the error is thrown, so a genuinely
+// stuck directory fails the suite instead of being hidden.
+const REMOVAL_ROUNDS = 4
+const REMOVAL_RETRY_DELAY_MS = 100
+const REMOVAL_MAX_RETRIES = 10
+const REMOVAL_ROUND_PAUSE_MS = 500
+const RETRYABLE_CODES = new Set(['EBUSY', 'EPERM', 'ENOTEMPTY'])
+
+// Removes a per-test data directory, retrying while the OS still holds it.
+// Unlike removeTempDirs this never swallows a failure: after the bound is spent
+// the error propagates, so teardown problems stay visible.
+export async function removeDataDir(dir: string): Promise<void> {
+  for (let round = 1; round <= REMOVAL_ROUNDS; round++) {
+    try {
+      await rm(dir, {
+        recursive: true,
+        force: true,
+        maxRetries: REMOVAL_MAX_RETRIES,
+        retryDelay: REMOVAL_RETRY_DELAY_MS,
+      })
+      return
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      if (code !== undefined && !RETRYABLE_CODES.has(code)) throw error
+      if (round === REMOVAL_ROUNDS) throw error
+      await new Promise((resolve) => setTimeout(resolve, REMOVAL_ROUND_PAUSE_MS * round))
+    }
+  }
+}
+
+// Cleanup must not fail an otherwise passing test, so retry and, if the OS
+// still holds the directory, leave it to temp cleanup.
 export async function removeTempDirs(dirs: string[], attempts = 10): Promise<void> {
   for (const dir of dirs.splice(0)) {
     for (let attempt = 0; attempt < attempts; attempt++) {

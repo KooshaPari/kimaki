@@ -13,6 +13,7 @@ import { afterAll, beforeAll, expect, test } from 'vitest'
 import type { BotHandle } from './main.ts'
 import { LEGACY_DB_FILE } from './migrations.ts'
 import { createApi } from './project.ts'
+import { removeDataDir } from './test/cleanup.ts'
 import {
   startOpencodeTestServer,
   startTestBot,
@@ -40,7 +41,7 @@ afterAll(async () => {
   await bot?.stop()
   await twin?.stop()
   await server?.stop()
-  fs.rmSync(dataDir, { recursive: true, force: true })
+  await removeDataDir(dataDir)
 })
 
 test('bot starts on a V1 database and answers in an old thread with the old session', async () => {

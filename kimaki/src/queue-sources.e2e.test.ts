@@ -4,13 +4,13 @@
 // idle thread. Split from queue.e2e so both files run in parallel.
 
 import { execFile } from 'node:child_process'
-import fs from 'node:fs'
 import path from 'node:path'
 import { promisify } from 'node:util'
 import type { DeterministicMatcher } from 'opencode-deterministic-provider'
 import { afterAll, beforeAll, expect, test } from 'vitest'
 
 import type { BotHandle } from './main.ts'
+import { removeDataDir } from './test/cleanup.ts'
 import {
   TEST_USER_ID,
   seedProjectChannel,
@@ -57,7 +57,7 @@ afterAll(async () => {
   await bot?.stop()
   await twin?.stop()
   await server?.stop()
-  fs.rmSync(dataDir, { recursive: true, force: true })
+  await removeDataDir(dataDir)
 })
 
 // Starts a slow turn in a new thread and waits until it runs (banner posted).

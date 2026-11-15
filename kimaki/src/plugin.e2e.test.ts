@@ -9,6 +9,7 @@ import path from 'node:path'
 import { afterAll, beforeAll, expect, test } from 'vitest'
 
 import type { BotHandle } from './main.ts'
+import { removeDataDir } from './test/cleanup.ts'
 import {
   seedProjectChannel,
   startOpencodeTestServer,
@@ -39,7 +40,7 @@ afterAll(async () => {
   await bot?.stop()
   await twin?.stop()
   await server?.stop()
-  fs.rmSync(dataDir, { recursive: true, force: true })
+  await removeDataDir(dataDir)
 })
 
 test('bot start writes the plugin shim, OpenCode loads it, a restart does not rewrite it', async () => {
