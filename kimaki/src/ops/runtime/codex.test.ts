@@ -444,6 +444,20 @@ describe('Codex approval surface', () => {
     expect(failures).toEqual([{ id: 12, code: -32601, message: 'Server-initiated request item/tool/requestUserInput unsupported' }])
   })
 
+  it('answers the first request of a connection, whose id is zero', () => {
+    const { controller, results, ask } = approvalHarness()
+    // A real codex 0.169 app-server numbers its first server request 0, so a
+    // positive-only id check made the very first approval unanswerable and left
+    // the turn stalled.
+    ask(0)
+    const digest = digestOf(controller, 0)
+    expect(controller.answerApproval({ requestId: 0, decision: 'accept', expectedDigest: digest })).toEqual({ requestId: 0, decision: 'accept' })
+    expect(results).toEqual([{ id: 0, result: { decision: 'accept' } }])
+    const negative = controller.answerApproval({ requestId: -1, decision: 'accept' })
+    expect(negative).toBeInstanceOf(Error)
+    expect((negative as Error).message).toMatch(/non-negative/)
+  })
+
   it('surfaces command approval scope to the policy', () => {
     const seen: CodexApprovalRequest[] = []
     const { ask } = approvalHarness((request) => { seen.push(request); return 'accept' })

@@ -610,7 +610,9 @@ export function createCodexController({
       if (approvals === undefined) {
         return new ConfigError({ reason: 'This controller was started without an approval channel' })
       }
-      if (!Number.isSafeInteger(requestId) || requestId <= 0) return new ConfigError({ reason: 'Approval request id must be a positive integer' })
+      // JSON-RPC ids are non-negative and codex numbers its first server request
+      // 0, so an id of 0 is a real approval, not a missing one.
+      if (!Number.isSafeInteger(requestId) || requestId < 0) return new ConfigError({ reason: 'Approval request id must be a non-negative integer' })
       if (!isApprovalDecision(decision)) return new ConfigError({ reason: `Unknown approval decision ${String(decision)}` })
       if (expectedDigest !== undefined && typeof expectedDigest !== 'string') {
         return new ConfigError({ reason: 'Approval digest must be a string' })
