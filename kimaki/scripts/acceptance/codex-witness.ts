@@ -82,7 +82,19 @@ wire_api = "responses"
     fs.rmSync(scratch, { recursive: true, force: true })
   }
 
-  return { home, work, port, dump, stop }
+  // A cancelled run must not leave its temporary Codex home behind: two such
+  // directories survived an interrupted session before this existed.
+  let stopped = false
+  const stopOnce = () => {
+    if (stopped) return
+    stopped = true
+    stop()
+  }
+  process.once('SIGINT', () => { stopOnce(); process.exit(130) })
+  process.once('SIGTERM', () => { stopOnce(); process.exit(143) })
+  process.once('exit', stopOnce)
+
+  return { home, work, port, dump, stop: stopOnce }
 }
 
 /** The `function_call_output` entries the model was given, which is what proves a command ran. */
