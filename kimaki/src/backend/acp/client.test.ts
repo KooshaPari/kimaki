@@ -24,6 +24,11 @@ const update = (sessionId, body) => send({
 })
 const rl = readline.createInterface({ input: process.stdin })
 
+// The measured jcode 0.99.1 capabilities, unless a test passes an override.
+const capabilities = process.argv[3]
+  ? JSON.parse(process.argv[3])
+  : { loadSession: true, sessionCapabilities: { close: {}, resume: {} } }
+
 rl.on('line', (line) => {
   const message = JSON.parse(line)
   if (message.method === 'initialize') {
@@ -33,7 +38,7 @@ rl.on('line', (line) => {
       result: {
         protocolVersion: 1,
         agentInfo: { name: 'jcode', title: 'Jcode', version: '0.99.1' },
-        agentCapabilities: { loadSession: true, sessionCapabilities: { close: {}, resume: {} } },
+        agentCapabilities: capabilities,
         authMethods: [],
       },
     })
@@ -110,6 +115,37 @@ rl.on('line', (line) => {
     send({ jsonrpc: '2.0', id: message.id, result: { stopReason: 'end_turn' } })
     return
   }
+  if (text.startsWith('RETRACT_DECLARED')) {
+    // A peer that declared a retraction surface corrects a streamed segment in
+    // place. The shape (agent_message_retraction with messageId + content.text)
+    // is a documented extension of this client, not an observed jcode emission.
+    update(sid, { sessionUpdate: 'agent_message_chunk', messageId: 'message_1', content: { type: 'text', text: 'the sky is grenn' } })
+    update(sid, { sessionUpdate: 'agent_message_retraction', messageId: 'message_1', content: { type: 'text', text: 'the sky is green' } })
+    send({ jsonrpc: '2.0', id: message.id, result: { stopReason: 'end_turn' } })
+    return
+  }
+  if (text.startsWith('RETRACT_UNKNOWN')) {
+    update(sid, { sessionUpdate: 'agent_message_chunk', messageId: 'message_1', content: { type: 'text', text: 'Hello' } })
+    update(sid, { sessionUpdate: 'agent_message_retraction', messageId: 'message_9', content: { type: 'text', text: 'corrupted' } })
+    send({ jsonrpc: '2.0', id: message.id, result: { stopReason: 'end_turn' } })
+    return
+  }
+  if (text.startsWith('RETRACT_AFTER_RESULT')) {
+    update(sid, { sessionUpdate: 'agent_message_chunk', messageId: 'message_1', content: { type: 'text', text: 'Hello' } })
+    send({ jsonrpc: '2.0', id: message.id, result: { stopReason: 'end_turn' } })
+    setTimeout(() => {
+      update(sid, { sessionUpdate: 'agent_message_retraction', messageId: 'message_1', content: { type: 'text', text: 'BOOM' } })
+    }, 40)
+    return
+  }
+  if (text.startsWith('RETRACT_UNDECLARED')) {
+    // Same shape, but the handshake never declared the surface.
+    update(sid, { sessionUpdate: 'agent_message_chunk', messageId: 'message_1', content: { type: 'text', text: 'Hello' } })
+    update(sid, { sessionUpdate: 'agent_message_retraction', messageId: 'message_1', content: { type: 'text', text: 'BOOM' } })
+    send({ jsonrpc: '2.0', id: message.id, result: { stopReason: 'end_turn' } })
+    return
+  }
+
   if (text.startsWith('AUTH_FAIL')) {
     update(sid, { sessionUpdate: 'available_commands_update', availableCommands: [] })
     send({
@@ -142,14 +178,21 @@ const ok = <T>(value: T | Error): T => {
   return value
 }
 
-const startAgent = async (options: { timeoutMs?: number; expectedIdentity?: string; identityLabel?: string } = {}): Promise<AcpClient> => {
+const startAgent = async (options: {
+  timeoutMs?: number
+  expectedIdentity?: string
+  identityLabel?: string
+  capabilities?: Record<string, unknown>
+} = {}): Promise<AcpClient> => {
   dir ??= await fs.mkdtemp(path.join(os.tmpdir(), 'kimaki-acp-'))
   const script = path.join(dir, `agent-${Math.random().toString(36).slice(2)}.cjs`)
   const pidFile = path.join(dir, `${path.basename(script)}.pid`)
   await fs.writeFile(script, AGENT_SOURCE)
+  const args = [script, pidFile]
+  if (options.capabilities) args.push(JSON.stringify(options.capabilities))
   const client = createAcpClient({
     command: process.execPath,
-    args: [script, pidFile],
+    args,
     timeoutMs: options.timeoutMs,
     expectedIdentity: options.expectedIdentity,
     identityLabel: options.identityLabel,
@@ -187,7 +230,8 @@ afterEach(async () => {
 test('initializes and opens a session', async () => {
   const client = await startAgent()
   const initialized = ok(await client.initialize())
-  expect(initialized).toEqual({ protocolVersion: 1, agentName: 'jcode' })
+  // Capabilities are surfaced alongside identity; see the dedicated test below.
+  expect(initialized).toMatchObject({ protocolVersion: 1, agentName: 'jcode' })
   const session = ok(await client.newSession({ cwd: process.cwd() }))
   expect(session).toEqual({ sessionId: 'session_fox_1' })
 })
@@ -275,6 +319,75 @@ test('cannot retract text already streamed: an unknown update kind is ignored, n
   expect(result.text).toBe('the sky is grenn\nthe sky is green')
   expect(result.updateCount).toBe(3)
   expect(result.stopReason).toBe('end_turn')
+})
+
+// The handshake observed from jcode 0.99.1: loadSession and session lifecycle
+// only. No retraction or correction surface is declared, and the client must not
+// invent one.
+const MEASURED_CAPABILITIES = { loadSession: true, sessionCapabilities: { close: {}, resume: {} } }
+// The retraction key is a documented extension this client accepts; jcode does
+// not send it.
+const DECLARED_CAPABILITIES = { ...MEASURED_CAPABILITIES, retractMessages: {} }
+
+test('surfaces the peer capabilities raw and reports no retraction surface for jcode', async () => {
+  const client = await startAgent()
+  const initialized = ok(await client.initialize())
+  expect(initialized.agentCapabilities).toEqual(MEASURED_CAPABILITIES)
+  expect(initialized.supportsRetraction).toBe(false)
+})
+
+test('accepts a declared retraction surface and reports it', async () => {
+  const client = await startAgent({ capabilities: DECLARED_CAPABILITIES })
+  const initialized = ok(await client.initialize())
+  expect(initialized.agentCapabilities).toEqual(DECLARED_CAPABILITIES)
+  expect(initialized.supportsRetraction).toBe(true)
+})
+
+test('a declared retraction corrects the streamed text instead of appending to it', async () => {
+  const client = await startAgent({ capabilities: DECLARED_CAPABILITIES })
+  ok(await client.initialize())
+  const { sessionId } = ok(await client.newSession({ cwd: process.cwd() }))
+  const chunks: string[] = []
+  const result = ok(await client.prompt({ sessionId, text: 'RETRACT_DECLARED', onChunk: (text) => chunks.push(text) }))
+  // Only the original chunk streamed; the correction is applied in place, so the
+  // assembled turn equals the corrected text and never the misspelling plus it.
+  expect(chunks).toEqual(['the sky is grenn'])
+  expect(result.text).toBe('the sky is green')
+  expect(result.text).not.toContain('grenn')
+  expect(result.updateCount).toBe(2)
+})
+
+test('an undeclared retraction is ignored and leaves the text untouched', async () => {
+  const client = await startAgent()
+  const initialized = ok(await client.initialize())
+  expect(initialized.supportsRetraction).toBe(false)
+  const { sessionId } = ok(await client.newSession({ cwd: process.cwd() }))
+  const result = ok(await client.prompt({ sessionId, text: 'RETRACT_UNDECLARED' }))
+  expect(result.text).toBe('Hello')
+  expect(result.text).not.toContain('BOOM')
+  expect(result.updateCount).toBe(2)
+})
+
+test('a declared retraction naming an unknown segment is ignored', async () => {
+  const client = await startAgent({ capabilities: DECLARED_CAPABILITIES })
+  ok(await client.initialize())
+  const { sessionId } = ok(await client.newSession({ cwd: process.cwd() }))
+  const result = ok(await client.prompt({ sessionId, text: 'RETRACT_UNKNOWN' }))
+  expect(result.text).toBe('Hello')
+  expect(result.text).not.toContain('corrupted')
+})
+
+test('a retraction arriving after the turn result is ignored', async () => {
+  const client = await startAgent({ capabilities: DECLARED_CAPABILITIES })
+  ok(await client.initialize())
+  const { sessionId } = ok(await client.newSession({ cwd: process.cwd() }))
+  const first = ok(await client.prompt({ sessionId, text: 'RETRACT_AFTER_RESULT' }))
+  expect(first.text).toBe('Hello')
+  expect(first.updateCount).toBe(1)
+  // The late retraction must not leak into the next turn either.
+  const second = ok(await client.prompt({ sessionId, text: 'hello' }))
+  expect(second.text).toBe('Hello')
+  expect(second.text).not.toContain('BOOM')
 })
 
 test('omits usage when the agent sends none', async () => {

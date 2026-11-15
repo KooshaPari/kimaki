@@ -49,6 +49,19 @@ export type AcpClientOptions = {
 export type AcpInitializeResult = {
   protocolVersion: number
   agentName: string | null
+  /**
+   * The peer's `agentCapabilities` object exactly as it arrived in the
+   * handshake, unmodified. Empty when the peer declared none. Callers inspect
+   * this rather than trusting a summarised boolean.
+   */
+  agentCapabilities: Record<string, unknown>
+  /**
+   * Whether the peer declared a text retraction/correction surface. True only
+   * when the raw payload literally contains one of the accepted keys (see
+   * `RETRACTION_CAPABILITY_KEYS` in client.ts). jcode 0.99.1 declares none, so
+   * this is false for the runtime Kimaki actually ships against.
+   */
+  supportsRetraction: boolean
 }
 
 export type AcpPromptResult = {

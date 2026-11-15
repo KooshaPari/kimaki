@@ -18,6 +18,32 @@ const DEFAULT_TIMEOUT_MS = 30_000
 /** How long close() waits for a graceful exit before killing hard. */
 const CLOSE_GRACE_MS = 2_000
 
+/**
+ * Capability keys accepted as a declaration of a text retraction/correction
+ * surface. ACP itself defines none, and jcode 0.99.1 declares none either, so
+ * this is a documented extension rather than an observed emission. The list is
+ * intentionally short and checked literally: a peer must name one of these keys
+ * itself. The client never infers a correction surface from a message shape.
+ */
+const RETRACTION_CAPABILITY_KEYS = ['retractMessages', 'textCorrection', 'messageRetraction'] as const
+
+/**
+ * True only when the peer's `agentCapabilities` payload literally contains one
+ * of the accepted keys, at the top level or under `sessionCapabilities`, and
+ * does not explicitly disable it. Presence with a `false`/`null` value is a
+ * refusal, not a declaration.
+ */
+const declaresRetraction = (capabilities: Record<string, unknown>): boolean => {
+  for (const scope of [capabilities, record(capabilities.sessionCapabilities)]) {
+    if (!scope) continue
+    for (const key of RETRACTION_CAPABILITY_KEYS) {
+      const value = scope[key]
+      if (value !== undefined && value !== null && value !== false) return true
+    }
+  }
+  return false
+}
+
 type PromptState = {
   sessionId: string
   text: string
@@ -25,6 +51,15 @@ type PromptState = {
   onChunk?: (text: string) => void
   /** Replayed messages, used by session/load to recover native history. */
   history?: Array<{ role: 'user' | 'agent'; text: string }>
+  /**
+   * Assistant text chunks in arrival order, keyed by the `messageId` the peer
+   * put on the chunk (null when it sent none). A retraction addresses one of
+   * these, so the assembled text can be corrected in place instead of being
+   * appended to.
+   */
+  segments: Array<{ id: string | null; text: string }>
+  /** Only a prompt whose peer declared a retraction surface may be corrected. */
+  retractions: boolean
 }
 
 type Pending = {
@@ -54,6 +89,8 @@ export const createAcpClient: CreateAcpClient = (options: AcpClientOptions): Acp
   let failure: Error | null = null
   let exited = false
   let active: { id: number; entry: Pending } | null = null
+  /** Set from the initialize handshake; false until a peer declares it. */
+  let retractionSurface = false
 
   let child: childProcess.ChildProcess | null = null
   try {
@@ -103,10 +140,35 @@ export const createAcpClient: CreateAcpClient = (options: AcpClientOptions): Acp
       if (typeof text === 'string' && prompt.history) prompt.history.push({ role: 'user', text })
       return
     }
+    if (update.sessionUpdate === 'agent_message_retraction') {
+      // Inert unless the peer declared the surface during initialize: an
+      // undeclared retraction-shaped update stays an ignored unknown kind, so
+      // the client never fabricates a correction from an unverified shape.
+      if (!prompt.retractions) return
+      const messageId = typeof update.messageId === 'string' && update.messageId
+        ? update.messageId
+        : typeof update.segmentId === 'string' && update.segmentId ? update.segmentId : null
+      // A retraction that names nothing, or a segment this turn never streamed,
+      // has no defined target: ignore it rather than guess.
+      if (!messageId) return
+      const target = prompt.segments.find((segment) => segment.id === messageId)
+      if (!target) return
+      const replacement = record(update.content)?.text
+      // Absent replacement text withdraws the segment's text entirely.
+      target.text = typeof replacement === 'string' ? replacement : ''
+      // Recompute rather than append: the assembled turn must equal the
+      // corrected text, never the misspelling plus the restatement.
+      prompt.text = prompt.segments.map((segment) => segment.text).join('')
+      return
+    }
     if (update.sessionUpdate !== 'agent_message_chunk') return
     const text = record(update.content)?.text
     if (typeof text !== 'string') return
     if (prompt.history) prompt.history.push({ role: 'agent', text })
+    prompt.segments.push({
+      id: typeof update.messageId === 'string' && update.messageId ? update.messageId : null,
+      text,
+    })
     prompt.text += text
     try {
       prompt.onChunk?.(text)
@@ -217,6 +279,9 @@ export const createAcpClient: CreateAcpClient = (options: AcpClientOptions): Acp
       const agentName = typeof result.agentName === 'string'
         ? result.agentName
         : typeof info?.name === 'string' ? info.name : null
+      // Surfaced raw and unmodified so a caller can audit what the peer really
+      // declared instead of trusting our summary line.
+      const agentCapabilities = record(result.agentCapabilities) ?? {}
       // A fork can reuse another runtime's ACP surface and still misreport who it
       // is, so the profile's expectation is checked here, once, for every caller.
       if (options.expectedIdentity !== undefined && agentName !== options.expectedIdentity) {
@@ -227,7 +292,8 @@ export const createAcpClient: CreateAcpClient = (options: AcpClientOptions): Acp
             : `Runtime profile ${label} expects identity '${options.expectedIdentity}', but the ACP handshake reported '${agentName}'; refusing to route a ${label} session`,
         })
       }
-      return { protocolVersion, agentName }
+      retractionSurface = declaresRetraction(agentCapabilities)
+      return { protocolVersion, agentName, agentCapabilities, supportsRetraction: retractionSurface }
     },
 
     async newSession(input: { cwd: string }): Promise<{ sessionId: string } | Error> {
@@ -275,7 +341,7 @@ export const createAcpClient: CreateAcpClient = (options: AcpClientOptions): Acp
       if (typeof input.cwd !== 'string' || !input.cwd.trim()) {
         return new ConfigError({ reason: 'ACP session/load needs a working directory' })
       }
-      const state: PromptState = { sessionId: input.sessionId, text: '', updateCount: 0, history: [] }
+      const state: PromptState = { sessionId: input.sessionId, text: '', updateCount: 0, history: [], segments: [], retractions: false }
       const frame = await request(
         'session/load',
         { sessionId: input.sessionId, cwd: input.cwd, mcpServers: [] },
@@ -309,7 +375,14 @@ export const createAcpClient: CreateAcpClient = (options: AcpClientOptions): Acp
         return new ConfigError({ reason: 'ACP prompt timeout must be a positive number of milliseconds' })
       }
       const timeoutMs = input.timeoutMs ?? defaultTimeoutMs
-      const state: PromptState = { sessionId: input.sessionId, text: '', updateCount: 0 }
+      const state: PromptState = {
+        sessionId: input.sessionId,
+        text: '',
+        updateCount: 0,
+        segments: [],
+        // The funnel is only armed when the handshake declared the surface.
+        retractions: retractionSurface,
+      }
       if (input.onChunk) state.onChunk = input.onChunk
       const frame = await request(
         'session/prompt',
