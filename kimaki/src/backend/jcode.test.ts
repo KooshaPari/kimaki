@@ -25,7 +25,7 @@ function fakeAcp(overrides: Partial<AcpClient> = {}) {
   const client: AcpClient = {
     async initialize() {
       calls.initialize++
-      return { protocolVersion: 1, agentName: 'jcode' }
+      return { protocolVersion: 1, agentName: 'jcode', agentCapabilities: {}, supportsRetraction: false }
     },
     async newSession(input) {
       calls.newSession.push(input)
@@ -210,7 +210,7 @@ describe('createJcodeBackend', () => {
 describe('Runtime profile identity', () => {
   const kcodeHandshake: Partial<AcpClient> = {
     async initialize() {
-      return { protocolVersion: 1, agentName: 'kcode' }
+      return { protocolVersion: 1, agentName: 'kcode', agentCapabilities: {}, supportsRetraction: false }
     },
   }
 
@@ -283,7 +283,7 @@ describe('Runtime profile identity', () => {
   it('refuses a handshake that reports no identity at all', async () => {
     const silent: Partial<AcpClient> = {
       async initialize() {
-        return { protocolVersion: 1, agentName: null }
+        return { protocolVersion: 1, agentName: null, agentCapabilities: {}, supportsRetraction: false }
       },
     }
     const { backend, fake } = backendWith(silent, { profile: 'kcode' })
