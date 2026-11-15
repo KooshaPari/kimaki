@@ -41,7 +41,7 @@ AC03, AC04, AC05, AC06, AC07, AC09, AC10, AC11, AC13, AC14, AC17, AC18, AC23, AC
 | AC16 | Competing managed launch paths | partial | the hub lease still refuses a second writer, and a managed launch now has a Paperclip claim fence: one claim per `(instanceId, runId)` with monotonic `generation` and `claimSeq`, a sha256 digest over the record, holder-only release, heartbeat expiry, and a stale takeover that advances the generation so the previous holder's write is refused. A second live claim, a release by a non-holder, a superseded or forged generation, and a run already held by the hub are each refused by name, and both directions are covered (a hub claim blocks a Paperclip claim, a Paperclip claim blocks a hub write). 11 launch-fence tests (30 paperclip tests with `index` and `observe`), `tsc` clean in `src/ops/paperclip/**`, commit `9629b7e3`; accepting a competing live claim fails 3 tests and freezing the generation fails 2. Not closed: the fence is a caller-owned JSON record with no cross-process lock and no Paperclip API call, `launchFenceCapabilities` declares `dispatch`, `remoteWrite` and `inference` false, and no shipped command imports `createLaunchFence`, so no two real launchers were raced |
 | AC17 | Cancel request | closed | a real codex 0.169 app-server turn was interrupted mid-flight through `ops codex turn --cancel-after 2500` against a deliberately slow local model: the CLI printed `cancel-requested` and the turn settled with `"status": "interrupted"` and empty text, which is the native turn state. The hub also accepts a cancel and stays inert when idle |
 | AC18 | Approval race/replay | closed | `startCodexAppServer` holds a server-initiated request instead of failing it with `-32601`; `createCodexController` surfaces the full payload (command, cwd, kind, grantRoot, approvalId, startedAtMs), applies an opt-in policy, and answers exactly once. A replay, an unknown id, an id the transport dropped, and a second racing answer are each refused by name. Invalid policy decisions fail closed to `decline`; `humanCommand` refuses `acceptForSession`; `item/permissions/requestApproval` is refused rather than held; the supported capability names the two methods it answers; approvals require `holdsServerRequests: true`; the transport reports delivery only for a live writable child and clears held ids on exit. 43 controller, 6 transport and 7 hub tests pass; `tsc` clean; commit `8ee74cef`. The transport tests use a fake app-server child, and the real-native half is measured too: a real codex 0.169 app-server, driven by a local model that asks for `exec_command`, raised `item/commandExecution/requestApproval` (requestId 0, command `pwsh -Command 'echo approval-ok'`). `ops codex turn --approval accept` delivered `{decision:"accept"}`, the runtime executed the command (`Process exited with code 0 ... Output: approval-ok`), and the turn completed; `--approval decline` produced `exec_command failed: Rejected("rejected by user")` and no execution; with no approval channel at all the same run produced `Rejected("approval request failed")`, so nothing is granted by default. `ops codex serve --approval accept --approval-policy untrusted` surfaced the same request and the same real execution through the hub |
-| AC19 | Artifact changed after approval | partial | The approval request carries a SHA-256 digest over method, threadId, turnId, itemId, command, cwd, kind, grantRoot, approvalId and reason. `answerApproval` requires the digest for accept/acceptForSession and refuses a missing or mismatched digest before any JSON-RPC answer; decline/cancel may omit it. A command mutated between `pendingApprovals()` and the answer is refused; both CLI approval surfaces print the digest. 43 controller tests pass; `tsc` clean; commit `d883083e`. The digest is controller-computed from the approval params, not a runtime artifact hash, and a fileChange's file contents are not in those params; no real-binary digest witness yet |
+| AC19 | Artifact changed after approval | partial | The approval request carries a SHA-256 digest over method, threadId, turnId, itemId, command, cwd, kind, grantRoot, approvalId and reason. `answerApproval` requires the digest for accept/acceptForSession and refuses a missing or mismatched digest before any JSON-RPC answer; decline/cancel may omit it. A command mutated between `pendingApprovals()` and the answer is refused; both CLI approval surfaces print the digest. 43 controller tests pass; `tsc` clean; commit `d883083e`. The digest is controller-computed from the approval params, not a runtime artifact hash, and a fileChange's file contents are not in those params. A real-binary accept witness is now recorded: the real codex 0.169 request carried digest `sha256:7832a9d2...` and the accepted command executed (exit 0, output `approval-ok`); the mismatch and omission refusals remain controller-tested only |
 | AC20 | Credential revocation | partial | A stub Discord REST surface answers 401 after consent, an emptied bot token, and an already-revoked token. Each path returns a DiscordError, makes no successful send, and records zero delivered messages; 9 publication tests pass, commit `73c4cf08`. The revocation is simulated at the REST boundary; no live Discord credential was revoked |
 | AC21 | Prompt injection through chat/output | partial | A model turn containing a prompt-injection instruction, `@everyone` and a raw user mention is posted verbatim as inert content. The request uses `allowed_mentions: { parse: [] }`, the stub records no mention delivery, no side effect or second message occurs, and the cursor advances once; ordinary text follows the same policy. 2 new injection tests (23 in the view file) pass, `tsc` clean, commit `59dbce14`. Only the view path is covered; no agent-side execution or bot-ingest path is tested |
 | AC22 | Worker success, sync-back failure | partial | `WorkerResultSyncBack` holds one record per worker result: `pending-sync` after a failed write-back (never `failed`), `synced` only when an `ack_id` arrives, with monotone `attempts` and a canonical `payload_digest`. Reconcile is idempotent (a duplicate retry delivers nothing) and six refusals fail by name: conflicting payload, same digest different target, concurrent in-flight reconcile, unknown id, blank id/target, non-JSON payload. 7 new tests (24 in `bindings.test.ts`), `tsc` clean, commit `fc333ebd`. The ledger is an in-process `Map` and delivery is a caller-supplied callback, so no live sync-back target is exercised and a restart drops pending records because there is no table or migration |
@@ -221,6 +221,37 @@ Real-binary approval witness, all through the shipped CLI:
 | `ops codex serve --approval accept --approval-policy untrusted` | the hub surfaced the same request on stdout and the command ran (`exit code 0`, `approval-ok`) |
 
 The witness model is a local stub that speaks the Responses API, so no account credential is involved; every other element is the shipped program and the real codex 0.169 binary.
+
+Two approvals open at once, answered differently, driven through the controller rather than the
+single-decision CLI so the ids can be routed separately. The model asked for two commands in one
+output; a scratch driver accepted whichever request named `par-one` and declined the other.
+
+| Observation | Value |
+| --- | --- |
+| Request ids | `0` for `echo par-one`, `1` for `echo par-two`, distinct |
+| Open simultaneously | `2` approvals held at the moment the second arrived |
+| Answers | `0` → `accept`, `1` → `decline`, both delivered |
+| What the runtime did | `par-one` ran; the second command was `Rejected("rejected by user")` |
+| After the turn | turn `completed`, `0` approvals left open |
+
+That run exposed a real defect, now fixed: `answerApproval` required a **positive** request id,
+but codex numbers its first server request `0`, so the first approval of every connection was
+unanswerable through the manual API and the turn stalled (`Approval request id must be a positive
+integer`). The guard now accepts `0` and refuses only negatives, and a regression test pins it.
+The policy path was never affected because it answers through `settleApproval`, which is why every
+`--approval` run above worked.
+
+The file-change approval path is settled as unreachable from this model surface, measured rather
+than assumed:
+
+| Probe | Observed |
+| --- | --- |
+| The runtime's tool list | `exec_command`, `write_stdin`, `request_user_input`, `view_image`, `multi_agent_v1`, `get_goal`, `create_goal`, `update_goal`, `web_search` — no patch tool |
+| A model that names `apply_patch` anyway | the turn completed and the model received `unsupported call: apply_patch`; no approval was raised |
+| A model that writes a file through the shell | `item/commandExecution/requestApproval` for `Set-Content -LiteralPath 'probe-write.txt' -Value written`; accepting it created the file with the expected contents |
+
+So on this runtime writes are gated by command approvals, and `item/fileChange/requestApproval`
+stays covered by unit tests only because nothing in this tool surface can raise it.
 
 | Check | Observed |
 | --- | --- |
