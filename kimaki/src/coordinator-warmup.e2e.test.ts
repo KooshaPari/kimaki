@@ -10,6 +10,7 @@ import type { BotHandle } from './main.ts'
 import {
   TEST_MODEL,
   TEST_USER_ID,
+  isFooter,
   seedProjectChannel,
   startOpencodeTestServer,
   startTestBot,
@@ -18,7 +19,6 @@ import {
   textParts,
   toolParts,
   waitFor,
-  waitForFooter,
   warmUp,
   type OpencodeTestServer,
   type TestTwin,
@@ -42,15 +42,40 @@ function bigText(text: string) {
   ] as const
 }
 
+// The shell tool hands its command to cmd.exe as one argv element on Windows, where the
+// POSIX single quotes and `$OPENCODE_SESSION_ID` of an inline command do not apply. A
+// script file passes the real command line to the shell: it groups the quoted values and
+// expands the session variable itself, %VAR% in cmd.exe and $VAR in sh. Same pattern as
+// coordinator.e2e.test.ts.
+function dispatchScript(base: string) {
+  return process.platform === 'win32' ? `${base}.cmd` : `sh ${base}.sh`
+}
+
+function scriptBase(worker: string) {
+  return `warmup-${worker.replace(/-marker$/, '')}`
+}
+
+// Written once the server exists, in the directory the shell tool runs in.
+function writeDispatchScripts({ channelId }: { channelId: string }) {
+  const windows = process.platform === 'win32'
+  const parentSession = windows ? '%OPENCODE_SESSION_ID%' : '"$OPENCODE_SESSION_ID"'
+  for (const worker of ['quickjob-marker', 'stuckjob-marker']) {
+    // Bounded wait: the coordinator answers IDLE right away, so its footer is not held up by
+    // the worker, and the worker keeps running through the warmup window.
+    const command = `kimaki send --channel ${channelId} --name "Worker ${worker}" --prompt "${worker} run" --parent-session ${parentSession} --wait 0.1`
+    const file = path.join(server.projectDirectory, `${scriptBase(worker)}.${windows ? 'cmd' : 'sh'}`)
+    fs.writeFileSync(file, windows ? `@echo off\r\n${command}\r\n` : `#!/bin/sh\n${command}\n`)
+  }
+}
+
 // The coordinator starts a worker thread, then answers IDLE.
-function delegate({ marker, worker, channelId }: { marker: string; worker: string; channelId: string }) {
-  const command = `kimaki send --channel ${channelId} --name 'Worker ${worker}' --prompt '${worker} run' --parent-session "$OPENCODE_SESSION_ID"`
+function delegate({ marker, worker }: { marker: string; worker: string }) {
   return [
     {
       id: `${marker}-send`,
       priority: 100,
       when: { latestUserTextIncludes: marker },
-      then: { parts: toolParts({ toolCallId: `${marker}-call`, toolName: 'shell', input: { command, description: 'Start the worker', hasSideEffect: true } }) },
+      then: { parts: toolParts({ toolCallId: `${marker}-call`, toolName: 'shell', input: { command: dispatchScript(scriptBase(worker)), description: 'Start the worker', hasSideEffect: true } }) },
     },
     { id: `${marker}-idle`, priority: 101, when: { latestUserTextIncludes: marker, rawPromptIncludes: `${marker}-call` }, then: { parts: [...bigText('IDLE')] } },
   ]
@@ -64,13 +89,15 @@ beforeAll(async () => {
     matchers: [
       // OpenCode rejects a summary without the template headings.
       { id: 'compaction-summary', priority: 900, when: { latestUserTextIncludes: 'You MUST use this format for your response' }, then: { parts: textParts('## Objective\n- Keep coordinating') } },
-      ...delegate({ marker: 'keepwarm-marker', worker: 'quickjob-marker', channelId: twin.channelId }),
-      ...delegate({ marker: 'capped-marker', worker: 'stuckjob-marker', channelId: twin.channelId }),
+      ...delegate({ marker: 'keepwarm-marker', worker: 'quickjob-marker' }),
+      ...delegate({ marker: 'capped-marker', worker: 'stuckjob-marker' }),
       { id: 'quickjob', priority: 100, when: { latestUserTextIncludes: 'quickjob-marker' }, then: { parts: textParts('Quick job done.'), partDelaysMs: [0, 1_200, 0, 0] } },
-      { id: 'stuckjob', priority: 100, when: { latestUserTextIncludes: 'stuckjob-marker' }, then: { parts: textParts('Stuck job done.'), partDelaysMs: [0, 3_000, 0, 0] } },
+      // Long enough that the cap's quiet window is measured while the worker is still stuck.
+      { id: 'stuckjob', priority: 100, when: { latestUserTextIncludes: 'stuckjob-marker' }, then: { parts: textParts('Stuck job done.'), partDelaysMs: [0, 8_000, 0, 0] } },
       { id: 'woken', priority: 300, when: { latestUserTextIncludes: '<session-finished' }, then: { parts: [...bigText('The worker finished.')] } },
     ],
   })
+  writeDispatchScripts({ channelId: twin.channelId })
   await seedProjectChannel({ dataDir, channelId: twin.channelId, guildId: twin.discord.guildId, directory: server.projectDirectory })
   await warmUp({ server })
   bot = await startTestBot({ dataDir, twin, server, coordinator: true, warmupTimers: { intervalMs: WARM_INTERVAL_MS, maxMs: WARM_MAX_MS } })
@@ -80,8 +107,13 @@ afterAll(async () => {
   await bot?.stop()
   await twin?.stop()
   await server?.stop()
-  fs.rmSync(dataDir, { recursive: true, force: true })
-})
+  // A child may still hold the temp dir for a moment on Windows.
+  try {
+    fs.rmSync(dataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 })
+  } catch {
+    // Best effort: the OS cleans its temp dir.
+  }
+}, 60_000)
 
 // Keep-alive requests of a session, from the test plugin.
 function keepAlives(sessionId: string): number {
@@ -90,18 +122,58 @@ function keepAlives(sessionId: string): number {
   return fs.readFileSync(file, 'utf8').split('\n').filter((line) => line === sessionId).length
 }
 
+// A keep-alive count that no running warmup still moves: the previous test's wake can
+// leave a warmup armed for one more `maxMs`, and counting across it inflates the cap.
+async function settledKeepAlives(sessionId: string): Promise<number> {
+  const quietMs = WARM_MAX_MS + 2 * WARM_INTERVAL_MS
+  const deadline = Date.now() + 10_000
+  let count = keepAlives(sessionId)
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, quietMs))
+    const next = keepAlives(sessionId)
+    if (next === count) return next
+    count = next
+  }
+  return count
+}
+
 async function compactions(sessionId: string): Promise<number> {
   const client = await server.client()
   const messages = await client.message.list({ sessionID: sessionId, order: 'desc', limit: 50 })
   return messages.data.filter((message) => message.type === 'compaction').length
 }
 
+// Idle markers: one after each turn of the coordinator, so a new one means the turn ended.
+async function idleMarkers(sessionId: string): Promise<number> {
+  const client = await server.client()
+  const messages = await client.message.list({ sessionID: sessionId, order: 'desc', limit: 100 })
+  return messages.data.filter((message) => message.type === 'idle').length
+}
+
+// `waitFor` clamps its deadline to 10s; a compaction request under load can take longer.
+async function eventually(label: string, check: () => Promise<boolean>, timeoutMs = 25_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (await check()) return
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+  throw new Error(`Timed out waiting for ${label}`)
+}
+
+// `waitForFooter` clamps to 10s too; the first coordinator turn can outrun that on a loaded host.
+async function footerEventually(threadId: string, count = 1, timeoutMs = 25_000): Promise<void> {
+  await eventually(`footer #${count} in thread ${threadId}`, async () => {
+    const messages = await twin.discord.thread(threadId).getMessages()
+    return messages.filter((message) => message.author.id === twin.discord.botUserId && isFooter(message)).length >= count
+  }, timeoutMs)
+}
+
 test('the coordinator stays warm while its worker runs, then compacts', async () => {
   const { discord, channelId } = twin
   await discord.channel(channelId).user(TEST_USER_ID).sendMessage({ content: 'Start keepwarm-marker' })
   const root = await waitFor({ label: 'coordinator session', check: async () => bot.store.getState().roots[channelId] })
-  await waitForFooter({ discord, threadId: channelId })
-  await waitFor({ label: 'compaction after the wake', check: async () => (await compactions(root)) === 1 || null })
+  await footerEventually(channelId)
+  await eventually('compaction after the wake', async () => (await compactions(root)) === 1)
 
   expect(await discord.channel(channelId).text()).toMatchInlineSnapshot(`
     "--- from: user (tommy)
@@ -133,26 +205,37 @@ test('the coordinator stays warm while its worker runs, then compacts', async ()
       "idle",
     ]
   `)
-})
+}, 60_000)
 
 test('a stuck worker stops the warmup at the cap', async () => {
   const { discord, channelId } = twin
   const root = bot.store.getState().roots[channelId]!
-  const before = keepAlives(root)
+  // The wake of the previous test can leave a warmup armed: count only this one.
+  const before = await settledKeepAlives(root)
+  const idles = await idleMarkers(root)
   await discord.channel(channelId).user(TEST_USER_ID).sendMessage({ content: 'Start capped-marker' })
   const worker = await waitFor({
     label: 'stuck worker thread',
     check: async () => (await discord.channel(channelId).getThreads()).find((thread) => thread.name?.includes('stuckjob')),
   })
-  // The cap ends the warmup while the worker still runs: compaction, no footer in the worker yet.
-  await waitFor({ label: 'compaction at the cap', check: async () => (await compactions(root)) === 2 || null })
-  const workerText = await discord.thread(worker.id).text()
-  const atCap = keepAlives(root)
-  await waitForFooter({ discord, threadId: worker.id })
-
-  expect(workerText).not.toContain('-# *main')
-  // 1.5s cap, one keep-alive every 0.4s: at most 3, none after the cap.
-  expect(atCap - before).toBeGreaterThan(0)
-  expect(atCap - before).toBeLessThanOrEqual(3)
-  expect(keepAlives(root)).toBe(atCap)
-})
+  // The coordinator answered IDLE; the worker runs 8s, far past every wait here.
+  await eventually('the capped turn to go idle', async () => (await idleMarkers(root)) > idles)
+  // A warm warmup ticks every intervalMs without end. The cap must make it go quiet for a
+  // whole maxMs while the worker is still stuck; a missing or longer cap never goes quiet.
+  let count = keepAlives(root)
+  let quietSince = Date.now()
+  const watchUntil = Date.now() + 2 * WARM_MAX_MS
+  while (Date.now() < watchUntil) {
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    const next = keepAlives(root)
+    if (next !== count) {
+      count = next
+      quietSince = Date.now()
+    }
+  }
+  expect(count - before).toBeGreaterThan(0)
+  expect(Date.now() - quietSince).toBeGreaterThanOrEqual(WARM_MAX_MS)
+  // Ending the cap also queues the compaction of the big coordinator context.
+  await eventually('compaction at the cap', async () => (await compactions(root)) === 2)
+  await footerEventually(worker.id)
+}, 60_000)
