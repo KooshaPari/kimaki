@@ -56,11 +56,15 @@ const gateHeld = `_${gateHold}_`
 
 function writeGateScript(directory: string): string {
   const flag = path.join(directory, gateFlagName)
+  const scriptPath = path.join(directory, gateScriptName)
   const script = windows
     ? `@echo off\r\n:wait\r\nif exist "${flag}" goto open\r\nping -n 2 127.0.0.1 >nul\r\ngoto wait\r\n:open\r\necho gate-open\r\n`
     : `while [ ! -f "${flag}" ]; do sleep 0.1; done\necho gate-open\n`
-  fs.writeFileSync(path.join(directory, gateScriptName), script)
-  return windows ? gateScriptName : `sh ${gateScriptName}`
+  fs.writeFileSync(scriptPath, script)
+  // The shell tool runs PowerShell on Windows, which does not look in the
+  // current directory for a bare name (`hold-gate.cmd` -> command not found),
+  // so it never held. Call the script by its absolute path instead.
+  return windows ? `cmd /c "${scriptPath}"` : `sh "${scriptPath}"`
 }
 
 let server: OpencodeTestServer
