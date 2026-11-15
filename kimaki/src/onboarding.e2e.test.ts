@@ -90,7 +90,7 @@ afterAll(async () => {
   await twin?.stop()
   await server?.stop()
   await removeDataDir(dataDir)
-})
+}, 300_000)
 
 // A child process or a SQLite handle can still be closing when teardown runs, so
 // the removal is retried (Windows reports the race as EPERM/EBUSY). The retries are
