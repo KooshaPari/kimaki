@@ -195,6 +195,10 @@ export async function startLockServer({ port, dataDir, supervised = false, evict
 
   logger.info(`lock server listening on 127.0.0.1:${port}`)
   const tokenFile = path.join(dataDir, 'lock-token')
+  // 0600 is the intent: the token must stay owner-only. Windows has no POSIX
+  // mode bits, so writeFile's mode and chmod are accepted there but leave the
+  // file at the ACL it inherits from the data directory (typically the user
+  // profile). Only a POSIX host gets the mode actually applied.
   const written = await fs.promises.mkdir(dataDir, { recursive: true, mode: 0o700 })
     .then(() => fs.promises.writeFile(tokenFile, token, { mode: 0o600 }))
     .then(() => fs.promises.chmod(tokenFile, 0o600))

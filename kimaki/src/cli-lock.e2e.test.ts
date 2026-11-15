@@ -4,6 +4,7 @@ import path from 'node:path'
 import { promisify } from 'node:util'
 import { afterAll, beforeAll, expect, test } from 'vitest'
 import type { BotHandle } from './main.ts'
+import { removeTempDirs } from './test/cleanup.ts'
 import { seedProjectChannel, startOpencodeTestServer, startTestBot, startTwin, tempDataDir, waitFor, waitForFooter, warmUp, type OpencodeTestServer, type TestTwin } from './test/harness.ts'
 
 const exec = promisify(execFile)
@@ -21,8 +22,14 @@ beforeAll(async () => {
 afterAll(async () => {
   await bot?.stop()
   await Promise.all([server?.stop(), twin?.stop()])
-  fs.rmSync(dataDir, { recursive: true, force: true })
+  // libSQL can retain Windows handles after close; cleanup must not fail a pass.
+  await removeTempDirs([dataDir])
 })
+
+// Windows has no POSIX mode bits: writeFile's mode and chmod are accepted but
+// not applied there, so 0600 is only observable where the mode exists.
+const posixModes = process.platform !== 'win32'
+const ansi = /\u001b\[[0-9;]*m/g
 
 function cli(args: string[]) {
   return exec(process.execPath, ['--import', 'tsx', path.resolve('src/cli.ts'), ...args, '--data-dir', dataDir], {
@@ -54,7 +61,8 @@ test('CLI send starts and continues a session through the authenticated bot API'
   `)
   expect(ids.sessionId).toMatch(/^ses_/)
   const tokenFile = path.join(dataDir, 'lock-token')
-  expect(fs.statSync(tokenFile).mode & 0o777).toBe(0o600)
+  if (posixModes) expect(fs.statSync(tokenFile).mode & 0o777).toBe(0o600)
+  else expect(fs.statSync(tokenFile).isFile()).toBe(true)
   const unauthorized = await fetch(`http://127.0.0.1:${bot.lock.port}/kimaki/send`, { method: 'POST', body: '{}' })
   expect(unauthorized.status).toBe(401)
   const token = fs.readFileSync(tokenFile, 'utf8')
@@ -114,7 +122,8 @@ test('CLI help documents the supported P7 commands', async () => {
   expect(output.stdout).toContain('send')
   expect(output.stdout).toContain('upload-request')
   // The header is `kimaki/<version>`; keep the snapshot stable across releases.
-  expect(output.stdout.replace(/^kimaki\/[^\n]+/, 'kimaki/<version>')).toMatchInlineSnapshot(`
+  // Vitest exports FORCE_COLOR to its children, so strip styling before the snapshot.
+  expect(output.stdout.replace(ansi, '').replace(/^kimaki\/[^\n]+/, 'kimaki/<version>')).toMatchInlineSnapshot(`
     "kimaki/<version>
 
     Usage:
@@ -298,6 +307,170 @@ test('CLI help documents the supported P7 commands', async () => {
       session cwd [directory]           Show or change the working directory at a native safe boundary
         --data-dir <path>               Data directory (default: ~/.kimaki)
         -s, --session <id>              Session ID, Discord thread ID or thread URL (default: OPENCODE_SESSION_ID)
+
+      Agent operations:
+      ops codex turn                    Run one explicit Codex app-server turn and stream text deltas
+        --binary <path>                 Explicit Codex executable
+        --codex-home <dir>              Explicit isolated Codex state directory
+        --prompt <text>                 Text for one turn
+        --cwd <dir>                     Working directory for the new thread
+        --timeout-ms <n>                Request and turn timeout in milliseconds
+        --cancel-after <ms>             Interrupt the turn after this many milliseconds
+        --thread <id>                   Send this turn on an existing thread instead of starting one
+        --approval <decision>           Answer approval requests: accept, acceptForSession, decline or cancel (default: refuse them)
+        --approval-policy <policy>      Codex approval policy for the new thread: untrusted, on-request or never
+
+      ops follow                        Follow one explicitly authorized OpenCode or Jcode session and publish fixed metadata
+        --source <kind>                 Runtime source: opencode (default) or jcode
+        --service-file <path>           Explicit running OpenCode service file
+        --jcode-home <path>             Explicit Jcode home for polling observation
+        --profile <id>                  Runtime profile: jcode (stock, default) or kcode; a mismatched identity is refused
+        --host <id>                     Explicit runtime host identity
+        --endpoint <id>                 Explicit runtime endpoint identity
+        --native-session <id>           Explicit native session ID
+        --tenant <id>                   Explicit Discord guild ID
+        --surface <id>                  Explicit Discord channel ID
+        --token <token>                 Discord bot token (or KIMAKI_BOT_TOKEN)
+        --consent                       Explicitly authorize metadata publication
+        --timeout <ms>                  Maximum follow duration in milliseconds (default: 60000)
+
+      ops publish                       Publish one explicitly authorized OpenCode metadata event to Discord
+        --tenant <id>                   Explicit Discord guild ID
+        --surface <id>                  Explicit Discord channel ID
+        --host <id>                     Explicit runtime host identity
+        --endpoint <id>                 Explicit runtime endpoint identity
+        --native-session <id>           Explicit OpenCode session ID
+        --event-file <path>             JSON file containing one OpenCodeObservedEvent
+        --token <token>                 Discord bot token (or KIMAKI_BOT_TOKEN)
+        --consent                       Explicitly authorize this one metadata publication
+
+      ops discover                      Read metadata-only herdr, opencode, codex or jcode inventory, never transcripts or terminal input
+        --source <kind>                 Inventory source: herdr (default), opencode, codex or jcode
+        --service-file <path>           Explicit running OpenCode service file, never start a service
+        --codex-home <path>             Explicit Codex state directory for the app-server, never the default home
+        --jcode-home <path>             Explicit Jcode home directory, never the default home
+        --profile <id>                  Runtime profile: jcode (stock, default) or kcode; a mismatched identity is refused
+        --limit <n>                     Page size for jcode discovery (default: 50)
+        --cursor <offset>               Opaque cursor from a previous jcode page
+        --host <id>                     Explicit native runtime host identity
+        --endpoint <id>                 Explicit native runtime endpoint identity
+        --binary <path>                 Explicit herdr or Codex executable (default: herdr on PATH)
+        --herdr-session <name>          Explicit herdr session scope
+        --timeout <ms>                  Bounded inventory timeout in milliseconds (default: 5000)
+
+      ops paperclip run                 Read one Paperclip run as metadata only, never transcript, logs or control
+        --base-url <url>                Explicit Paperclip instance base URL, for example http://127.0.0.1:3199
+        --run-id <id>                   Explicit Paperclip heartbeat run ID
+        --company <id>                  Expected company scope; a different company is refused
+        --agent <id>                    Expected agent scope; a different agent is refused
+        --timeout <ms>                  Bounded read timeout in milliseconds (default: 10000)
+
+      ops bind                          Register metadata-only observe association. No transcript publishing or runtime control
+        --data-dir <path>               Data directory (default: ~/.kimaki)
+        --host <id>                     Explicit runtime host identity
+        --endpoint <id>                 Explicit runtime endpoint identity, not a herdr pane
+        --backend <kind>                Native runtime kind, for example codex or jcode
+        --native-session <id>           Explicit native session ID, not a cwd or reported path
+        --tenant <id>                   Service tenant, for example Discord guild ID
+        --service <kind>                Outward service kind (default: discord)
+        --surface <id>                  Outward conversation/surface ID
+        --request <id>                  Stable idempotency ID for this binding intent
+
+      ops bindings                      List local metadata-only associations in an explicit tenant, including detached rows
+        --data-dir <path>               Data directory (default: ~/.kimaki)
+        --tenant <id>                   Explicit service tenant ID
+        --service <kind>                Outward service kind (default: discord)
+
+      ops detach <binding-id>           Detach metadata association only. Never stop, resume or interrupt the agent
+        --data-dir <path>               Data directory (default: ~/.kimaki)
+        --tenant <id>                   Explicit service tenant ID
+        --service <kind>                Outward service kind (default: discord)
+
+      ops jcode run                     Run one prompt through the Jcode backend over ACP and stream its text
+        --cwd <path>                    Working directory for the Jcode ACP session
+        --prompt <text>                 Prompt text sent as one ACP session/prompt
+        --binary <path>                 Explicit Jcode executable; without it the profile resolves one
+        --profile <id>                  Runtime profile: jcode (stock, default) or kcode; a mismatched identity is refused
+        --model <id>                    Model selected for the ACP session instead of the agent default
+        --tool-profile <kind>           Jcode tool profile: none (default), minimal or full
+        --timeout <ms>                  Per-request ACP deadline in milliseconds
+        --json                          Print the final summary as JSON
+
+      ops jcode serve                   Serve one Jcode session on loopback so several clients can watch the same turns
+        --cwd <path>                    Working directory for the Jcode ACP session
+        --binary <path>                 Explicit Jcode executable; without it the profile resolves one
+        --profile <id>                  Runtime profile: jcode (stock, default) or kcode; a mismatched identity is refused
+        --model <id>                    Model selected for the ACP session instead of the agent default
+        --tool-profile <kind>           Jcode tool profile: none (default), minimal or full
+        --port <n>                      Loopback port (default: 0, an ephemeral port)
+        --token <token>                 Optional shared token required in the x-kimaki-hub header
+        --log <path>                    Append-only JSONL event log; enables resume across restarts and takes a writer lease
+        --timeout <ms>                  Per-request ACP deadline in milliseconds
+        --buffer <n>                    In-memory replay buffer size in events (default: 500)
+
+      ops jcode attach                  Attach to a running hub, stream its events, optionally prompt and acknowledge
+        --url <url>                     Explicit hub URL, as printed by ops jcode serve
+        --client <id>                   Client identity to register in hub presence
+        --cursor <n>                    Start from this cursor (default: 0)
+        --prompt <text>                 Submit one prompt after attaching
+        --request-id <id>               Idempotency id for the prompt; a repeat refers to the existing receipt
+        --ack                           Acknowledge the last sequence once a turn finishes
+        --watch <ms>                    Stream without prompting for at most this long, then detach
+        --timeout <ms>                  Maximum attach duration in milliseconds (default: 120000)
+        --json                          Print a JSON summary instead of streamed text
+
+      ops jcode watch                   Follow a live native Jcode session by polling session/load and emitting new messages
+        --session <id>                  ACP session id to follow
+        --cwd <path>                    Working directory the session belongs to
+        --binary <path>                 Explicit Jcode executable; without it the profile resolves one
+        --profile <id>                  Runtime profile: jcode (stock, default) or kcode; a mismatched identity is refused
+        --interval <ms>                 Polling interval in milliseconds (default: 2000)
+        --iterations <n>                Stop after this many polls; 0 keeps polling (default: 0)
+        --emit-existing                 Emit history already present at attach time
+        --allow-empty                   Accept a session whose first poll replays no history
+        --tenant <id>                   Discord guild ID
+        --surface <id>                  Discord channel ID
+        --token <token>                 Bot token (default: KIMAKI_BOT_TOKEN)
+        --state <path>                  Durable native message cursor file
+
+      ops codex serve                   Serve one Codex thread on loopback so several clients can watch the same turns
+        --binary <path>                 Explicit Codex executable
+        --codex-home <dir>              Explicit isolated Codex state directory
+        --cwd <path>                    Working directory for the thread
+        --thread <id>                   Resume this thread instead of starting a new one
+        --port <n>                      Loopback port (default: 0, an ephemeral port)
+        --token <token>                 Optional shared token required in the x-kimaki-hub header
+        --log <path>                    Append-only JSONL event log; enables resume across restarts and takes a writer lease
+        --timeout-ms <n>                Request and turn timeout in milliseconds
+        --approval <decision>           Answer approval requests on the served thread: accept, acceptForSession, decline or cancel
+        --approval-policy <policy>      Codex approval policy for the served thread: untrusted, on-request or never
+
+      ops codex history                 Read an existing Codex thread through the app-server and print its messages
+        --binary <path>                 Explicit Codex executable
+        --codex-home <dir>              Explicit isolated Codex state directory
+        --thread <id>                   Thread id to read
+        --timeout-ms <n>                Request timeout in milliseconds
+        --json                          Print one JSON document instead of one line per message
+
+      ops jcode history                 Load an existing Jcode session over ACP and print its replayed native history
+        --session <id>                  ACP session id to load
+        --cwd <path>                    Working directory the session belongs to
+        --binary <path>                 Explicit Jcode executable; without it the profile resolves one
+        --profile <id>                  Runtime profile: jcode (stock, default) or kcode; a mismatched identity is refused
+        --timeout <ms>                  Per-request ACP deadline in milliseconds
+        --allow-empty                   Accept a session that replays no history
+        --json                          Print one JSON document instead of one line per message
+
+      ops discord view                  Mirror one hub session into a Discord channel, resuming from a durable cursor
+        --url <url>                     Explicit hub URL, as printed by ops jcode serve
+        --tenant <id>                   Guild id the channel must belong to
+        --surface <id>                  Channel id to post turns into
+        --token <token>                 Bot token (default: KIMAKI_BOT_TOKEN)
+        --state <path>                  Durable cursor file; a restart posts nothing twice
+        --client <id>                   Client identity to register in hub presence (default: discord-view-<surface>, which refuses a second view of the same channel)
+        --cursor <n>                    Start from this cursor when the state file is missing
+        --rebind                        Follow a live session.started that names a different session instead of failing closed (default: refuse)
+        --timeout <ms>                  Maximum viewing duration in milliseconds (default: 0, unbounded)
 
       Channel:
       channel worktrees <value>         Set automatic worktrees: on | off
@@ -575,20 +748,25 @@ test('profile cpu and profile heap write owner-only files; restart needs the sup
   const heap = (await cli(['profile', 'heap'])).stdout.trim()
   const profile = JSON.parse(fs.readFileSync(cpu, 'utf8')) as { nodes: unknown[] }
   expect({
-    cpu: path.relative(dataDir, cpu).replace(/cpu-.*/, 'cpu-<time>.cpuprofile'),
-    heap: path.relative(dataDir, heap).replace(/heap-.*/, 'heap-<time>.heapsnapshot'),
-    cpuMode: (fs.statSync(cpu).mode & 0o777).toString(8),
-    heapMode: (fs.statSync(heap).mode & 0o777).toString(8),
+    // Normalize the platform separator so the snapshot is the same on both hosts.
+    cpu: path.relative(dataDir, cpu).split(path.sep).join('/').replace(/cpu-.*/, 'cpu-<time>.cpuprofile'),
+    heap: path.relative(dataDir, heap).split(path.sep).join('/').replace(/heap-.*/, 'heap-<time>.heapsnapshot'),
     hasNodes: profile.nodes.length > 0,
   }).toMatchInlineSnapshot(`
     {
       "cpu": "profiles/cpu-<time>.cpuprofile",
-      "cpuMode": "600",
       "hasNodes": true,
       "heap": "profiles/heap-<time>.heapsnapshot",
-      "heapMode": "600",
     }
   `)
+  // Owner-only is the intent; only a POSIX host can express and observe it.
+  if (posixModes) {
+    expect((fs.statSync(cpu).mode & 0o777).toString(8)).toBe('600')
+    expect((fs.statSync(heap).mode & 0o777).toString(8)).toBe('600')
+  } else {
+    expect(fs.statSync(cpu).isFile()).toBe(true)
+    expect(fs.statSync(heap).isFile()).toBe(true)
+  }
   // The test bot runs in-process, not under the `kimaki` supervisor.
   const restart = await cli(['restart']).catch((error: { code: number; stderr: string }) => error)
   expect('code' in restart ? { code: restart.code, stderr: restart.stderr.trim() } : restart).toMatchInlineSnapshot(`
