@@ -18,7 +18,7 @@
     "build": "tsc",
     "test": "vitest",
     "generate": "tsx scripts/generate-schema-sql.ts",
-    "acceptance:codex": "bun scripts/acceptance/codex-approvals.ts"
+    "acceptance:codex": "bun scripts/acceptance/codex-approvals.ts && bun scripts/acceptance/codex-parallel-approvals.ts"
   },
   "dependencies": {
     "@clack/prompts": "^1.7.0",
