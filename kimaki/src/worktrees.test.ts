@@ -56,7 +56,8 @@ test('custom worktrees use the exact clone and committed HEAD; cwd resolves subf
   expect(cloneTree.directory).not.toBe(created.directory)
   const listed = await listWorktrees({ projectDirectory: directory })
   if (listed instanceof Error) throw listed
-  expect(listed.map((tree) => tree.directory)).toEqual([created.directory])
+  // Git prints paths with forward slashes; compare resolved paths, not path syntax.
+  expect(listed.map((tree) => path.resolve(tree.directory))).toEqual([created.directory])
 })
 
 test.each(['rebase', 'squash'] as const)('%s merges locally and deletion rejects dirty and unmerged work', async (strategy) => {
