@@ -41,7 +41,10 @@ afterAll(async () => {
   await bot?.stop()
   await twin?.stop()
   await server?.stop()
-  fs.rmSync(dataDir, { recursive: true, force: true })
+  // A Windows temp dir can stay locked for a moment after the bot closes: rmSync
+  // retries EPERM/EBUSY with these options.
+  try { fs.rmSync(dataDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }) }
+  catch (cause) { console.warn(`could not remove ${dataDir}`, cause) }
 })
 
 async function registeredNames() {
@@ -92,17 +95,30 @@ test('a skill change adds its command; catalog events with the same catalog writ
       await new Promise((resolve) => setTimeout(resolve, 100))
     }
   }
-  fs.mkdirSync(path.dirname(skillFile), { recursive: true })
-  fs.writeFileSync(skillFile, skillText)
-  await waitForCommand()
-  expect(await registeredNames()).toContain('demo-skill')
 
-  // Same file content again: OpenCode rescans and publishes skill.updated, the commands stay the same.
+  // Counted from before the first write: adding demo-skill registers the commands
+  // with a bulk write of its own, so that write has to be drained before the test
+  // can claim that the next, identical catalog event wrote nothing.
   const bulkWrites: string[] = []
   const commandsRoute = Routes.applicationGuildCommands(bot.discord.user!.id, twin.discord.guildId)
   bot.discord.rest.on('response', (request) => {
     if (request.method === 'PUT' && request.path === commandsRoute) bulkWrites.push(request.path)
   })
+
+  fs.mkdirSync(path.dirname(skillFile), { recursive: true })
+  fs.writeFileSync(skillFile, skillText)
+  await waitForCommand()
+  expect(await registeredNames()).toContain('demo-skill')
+
+  // waitForCommand polls the twin, which applies a bulk write when the bot sends
+  // it; the bot's registration response is still in flight then. Wait for that
+  // response, then count from an empty list so only later writes are observed.
+  const drained = Date.now() + 8_000
+  while (Date.now() < drained && bulkWrites.length === 0) await new Promise((resolve) => setTimeout(resolve, 25))
+  expect(bulkWrites).toEqual([commandsRoute])
+  bulkWrites.length = 0
+
+  // Same file content again: OpenCode rescans and publishes skill.updated, the commands stay the same.
   const event = nextCatalogEvent()
   fs.writeFileSync(skillFile, skillText)
   await event
