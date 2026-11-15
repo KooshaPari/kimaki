@@ -30,6 +30,31 @@ let server: OpencodeTestServer
 let twin: TestTwin
 let bot: BotHandle
 const dataDir = tempDataDir()
+// The shell tool hands its whole command to cmd.exe as one argv element, so a
+// `"` that should group a multi-word value arrives literal and the value is
+// split on its spaces (argv becomes ["--name","\"Worker","task\""]). A one-line
+// script passes the real command line to the shell instead: it groups the quoted
+// values and expands the session variable itself, %VAR% in cmd.exe and $VAR in
+// sh. One mechanism, both platforms.
+function dispatchScript(base: string) {
+  return process.platform === 'win32' ? `${base}.cmd` : `sh ${base}.sh`
+}
+
+// Written once the server exists, in the directory the shell tool runs in.
+function writeDispatchScripts() {
+  const windows = process.platform === 'win32'
+  const parentSession = windows ? '%OPENCODE_SESSION_ID%' : '"$OPENCODE_SESSION_ID"'
+  const fixtures = [
+    ['dispatch-worker', '--name "Worker task" --prompt "worker-marker do the job"'],
+    ['dispatch-wait', '--name "Waited task" --prompt "waited-worker-marker do the job" --wait'],
+    ['dispatch-bounded', '--name "Bounded task" --prompt "boundedwait-job-marker do the job" --wait 0.1'],
+  ]
+  for (const [base, args] of fixtures) {
+    const command = `kimaki send --channel ${twin.channelId} ${args} --parent-session ${parentSession}`
+    const file = path.join(server.projectDirectory, `${base}.${windows ? 'cmd' : 'sh'}`)
+    fs.writeFileSync(file, windows ? `@echo off\r\n${command}\r\n` : `#!/bin/sh\n${command}\n`)
+  }
+}
 
 beforeAll(async () => {
   // The twin first: the delegating matcher needs its channel ID.
@@ -44,7 +69,7 @@ beforeAll(async () => {
             id: 'call-send-worker',
             tool: 'shell',
             input: {
-              command: `kimaki send --channel ${twin.channelId} --name 'Worker task' --prompt 'worker-marker do the job' --parent-session "$OPENCODE_SESSION_ID"`,
+              command: dispatchScript('dispatch-worker'),
               description: 'Start the worker thread',
               hasSideEffect: true,
             },
@@ -58,7 +83,7 @@ beforeAll(async () => {
             id: 'call-send-wait',
             tool: 'shell',
             input: {
-              command: `kimaki send --channel ${twin.channelId} --name 'Waited task' --prompt 'waited-worker-marker do the job' --parent-session "$OPENCODE_SESSION_ID" --wait`,
+              command: dispatchScript('dispatch-wait'),
               description: 'Run the worker and wait',
               hasSideEffect: true,
             },
@@ -74,7 +99,7 @@ beforeAll(async () => {
               id: 'call-send-bounded',
               tool: 'shell',
               input: {
-                command: `kimaki send --channel ${twin.channelId} --name 'Bounded task' --prompt 'boundedwait-job-marker do the job' --parent-session "$OPENCODE_SESSION_ID" --wait 0.1`,
+                command: dispatchScript('dispatch-bounded'),
                 description: 'Start the worker, wait briefly',
                 hasSideEffect: true,
               },
@@ -110,6 +135,7 @@ beforeAll(async () => {
         { id: 'stale-wake', priority: 350, when: { latestUserTextIncludes: 'stale-wake-marker' }, then: { parts: textParts('Woke on the stale role text.') } },
       ],
   })
+  writeDispatchScripts()
   await seedProjectChannel({ dataDir, channelId: twin.channelId, guildId: twin.discord.guildId, directory: server.projectDirectory })
   await warmUp({ server })
   bot = await startTestBot({ dataDir, twin, server, coordinator: true })

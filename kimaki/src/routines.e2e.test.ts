@@ -32,6 +32,10 @@ import {
 
 const dataDir = tempDataDir()
 const clock = manualClock(Date.parse('2030-01-01T17:00:00Z'))
+// A no-op pre-run. `true` is not a cmd.exe builtin: it only resolves here
+// because Git's true.exe is on PATH, so the fixture depended on the PATH.
+// `node -e 0` exits 0 in every shell.
+const noopPreRun = 'node -e 0'
 let server: OpencodeTestServer
 let twin: TestTwin
 let bot: BotHandle
@@ -132,7 +136,7 @@ function buttons(message: APIMessage) {
 
 test('routine list/edit/run/delete and /routines with Run now and Delete buttons', async () => {
   clock.set(Date.parse('2030-01-02T08:00:00Z'))
-  const daily = await schedule({ prompt: 'Daily digest', sendAt: '0 9 * * *', preRun: 'true', user: TEST_USER_ID })
+  const daily = await schedule({ prompt: 'Daily digest', sendAt: '0 9 * * *', preRun: noopPreRun, user: TEST_USER_ID })
   const once = await schedule({ prompt: 'Renew the certificate', sendAt: '2030-01-05T09:00:00Z', notifyOnly: true })
   expect(await cli(['routine', 'edit', String(daily.routineId), '--prompt', 'Daily digest, short', '--send-at', '30 9 * * 1-5', '--agent', 'plan', '--pre-run', '', '--allow-concurrency', 'true', '--user', ''])).toMatchInlineSnapshot(`
     "{"routineId":4,"updated":["prompt","sendAt","agent","preRun","user","allowConcurrency"]}
