@@ -12,6 +12,7 @@ import { manageWorktree, newWorktree, setAutoWorktrees } from './commands/worktr
 import { runLockRoute } from './lock-routes.ts'
 import { send } from './prompt.ts'
 import { forkBtw } from './sessions.ts'
+import { removeTempDirs } from './test/cleanup.ts'
 
 let server: OpencodeTestServer
 let twin: TestTwin
@@ -39,11 +40,21 @@ afterAll(async () => {
   await bot?.stop()
   await twin?.stop()
   await server?.stop()
-  fs.rmSync(dataDir, { recursive: true, force: true })
+  await removeTempDirs([dataDir])
 })
 
 function hide(text: string) {
-  return text.replaceAll(server.projectDirectory, 'PROJECT').replaceAll(dataDir, 'DATA').replace(/worktrees\/[a-f0-9]{8}/g, 'worktrees/HASH').replace(/<#\d+>/g, '<#THREAD>')
+  return (
+    text
+      .replaceAll(server.projectDirectory, 'PROJECT')
+      .replaceAll(dataDir, 'DATA')
+      // A worktree directory is `<root>/worktrees/<hash>` on POSIX and `<root>\worktrees\<hash>` on Windows.
+      .replace(/worktrees[\\/][a-f0-9]{8}/g, 'worktrees/HASH')
+      // Paths displayed to Discord are OS-native: fold the Windows separator so the snapshots
+      // read the same on every host. A separator not followed by a name character is left alone.
+      .replace(/\\(?=[\w.-])/g, '/')
+      .replace(/<#\d+>/g, '<#THREAD>')
+  )
 }
 
 test('session cwd changes preserve the session and use the new location after restart and btw', async () => {

@@ -4,13 +4,13 @@
 // answers IDLE; its answer is then not a second reply to the same message.
 
 import { execFile } from 'node:child_process'
-import fs from 'node:fs'
 import path from 'node:path'
 import { promisify } from 'node:util'
 import type { DeterministicMatcher } from 'opencode-deterministic-provider'
 import { afterAll, beforeAll, expect, test } from 'vitest'
 
 import type { BotHandle } from './main.ts'
+import { removeTempDirs } from './test/cleanup.ts'
 import {
   TEST_USER_ID,
   isFooter,
@@ -36,7 +36,10 @@ function reply(marker: string, text: string): DeterministicMatcher {
 }
 
 const matchers: DeterministicMatcher[] = [
-  slowTextMatcher({ marker: 'slow-marker', text: 'slow-done', delayMs: 1_200 }),
+  // The CLI cases spawn `kimaki send` (about 1.5s on this host) while this turn is running, and
+  // expect the queued notes to be posted before it finishes. A delay shorter than the spawn
+  // latency turned that expectation into a race; it must outlast the spawn.
+  slowTextMatcher({ marker: 'slow-marker', text: 'slow-done', delayMs: 5_000 }),
   reply('queued-idle', 'IDLE'),
   reply('queued-one', 'queued one ok'),
   reply('queued-two', 'queued two ok'),
@@ -64,7 +67,7 @@ afterAll(async () => {
   await bot?.stop()
   await twin?.stop()
   await server?.stop()
-  fs.rmSync(dataDir, { recursive: true, force: true })
+  await removeTempDirs([dataDir])
 })
 
 // The channel holds every test's turns: the text from the user message that starts with `content`.

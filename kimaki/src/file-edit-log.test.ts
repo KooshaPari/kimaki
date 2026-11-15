@@ -6,35 +6,25 @@ import { expect, test } from 'vitest'
 import { appendFileEditEvents, editorsForFile, extractEditedFiles, loadFileEditEvents } from './file-edit-log.ts'
 
 test('extractEditedFiles reads edit/write paths and every file header of a patch', () => {
-  const patchText = '*** Begin Patch\n*** Add File: a.txt\n+x\n*** Update File: b.txt\n*** Move to: c.txt\n*** Delete File: d.txt\n*** End Patch'
+  const patchText = '*** Begin Patch\n*** Add File: a.txt\n*** Update File: b.txt\n+x\n*** Move to: c.txt\n*** Delete File: d.txt\n*** End Patch'
+  // The product resolves every tool path with `path.resolve`, so the results are OS-native
+  // absolute paths. Resolve the fixture root the same way instead of hard-coding a POSIX `/p`.
+  const directory = path.resolve('/p')
   expect({
-    edit: extractEditedFiles({ tool: 'edit', input: { path: 'src/e.ts' }, directory: '/p' }),
-    write: extractEditedFiles({ tool: 'write', input: { path: '/abs/w.txt' }, directory: '/p' }),
-    patch: extractEditedFiles({ tool: 'patch', input: { patchText }, directory: '/p' }),
-    home: extractEditedFiles({ tool: 'write', input: { path: '~/h.txt' }, directory: '/p' }).map((file) => file.replace(os.homedir(), '~')),
-    shell: extractEditedFiles({ tool: 'shell', input: { command: 'touch f' }, directory: '/p' }),
-    missing: extractEditedFiles({ tool: 'edit', input: undefined, directory: '/p' }),
-  }).toMatchInlineSnapshot(`
-    {
-      "edit": [
-        "/p/src/e.ts",
-      ],
-      "home": [
-        "~/h.txt",
-      ],
-      "missing": [],
-      "patch": [
-        "/p/a.txt",
-        "/p/b.txt",
-        "/p/d.txt",
-        "/p/c.txt",
-      ],
-      "shell": [],
-      "write": [
-        "/abs/w.txt",
-      ],
-    }
-  `)
+    edit: extractEditedFiles({ tool: 'edit', input: { path: 'src/e.ts' }, directory }),
+    write: extractEditedFiles({ tool: 'write', input: { path: '/abs/w.txt' }, directory }),
+    patch: extractEditedFiles({ tool: 'patch', input: { patchText }, directory }),
+    home: extractEditedFiles({ tool: 'write', input: { path: '~/h.txt' }, directory }).map((file) => file.replace(os.homedir(), '~')),
+    shell: extractEditedFiles({ tool: 'shell', input: { command: 'touch f' }, directory }),
+    missing: extractEditedFiles({ tool: 'edit', input: undefined, directory }),
+  }).toEqual({
+    edit: [path.join(directory, 'src', 'e.ts')],
+    write: [path.resolve('/abs/w.txt')],
+    patch: [path.join(directory, 'a.txt'), path.join(directory, 'b.txt'), path.join(directory, 'd.txt'), path.join(directory, 'c.txt')],
+    home: [path.join('~', 'h.txt')],
+    shell: [],
+    missing: [],
+  })
 })
 
 test('a v1 file-edit-events.jsonl is read, extended and compacted by the same code', async () => {
