@@ -158,7 +158,12 @@ export function registerOpsCommands(cli: Goke) {
             // Only a rename justifies a notice. Appends stay counted, not published.
             if (event.type !== 'session.renamed') { counts.ignored++; return }
             pending = (async () => {
-              const result = await publishMetadataNotice({ rest, target, grant, backend: 'jcode' })
+              // The observer refuses an unknown profile before this runs; pass the
+              // same id so the notice label matches the runtime that served the session.
+              const result = await publishMetadataNotice({
+                rest, target, grant, backend: 'jcode',
+                ...(options.profile === undefined ? {} : { profile: options.profile as 'jcode' | 'kcode' }),
+              })
               if (result instanceof Error) throw result
               counts[result.kind]++
             })()
