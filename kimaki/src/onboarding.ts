@@ -145,6 +145,8 @@ export function onboardingPrompt(): string {
     3. Show the folders as a numbered list and ask the user to reply with the numbers to add.
     4. Add each chosen folder with its absolute path: \`kimaki project add <absolute-directory>\`
        The command prints the new channel as a mention like <#123>. Reply with the list of new channels.
+    5. If a command fails or prints no <#...> mention, say which channels were added and which were not.
+       Never report a channel as added without the mention the command printed.
 
     Never add a channel the user did not choose. Keep every message short.
   `

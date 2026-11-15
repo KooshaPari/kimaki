@@ -14,6 +14,7 @@ import { afterAll, beforeAll, expect, test } from 'vitest'
 import type { BotHandle } from './main.ts'
 import { shellQuote } from './lock-server.ts'
 import { runOnboarding } from './onboarding.ts'
+import { readSessionMarkdown } from './session-events.ts'
 import {
   TEST_USER_ID,
   isFooter,
@@ -40,12 +41,17 @@ let defaultProject: string
 // in the tool's command string arrives literal on Windows (cmd.exe keeps the quotes
 // in argv), so the command is a one-line script written next to the session: the
 // script, not the command string, carries the quoted directory.
+//
+// The script runs from the project directory, which is the shell tool's cwd, so it
+// needs an explicit relative path: Windows PowerShell resolves a bare
+// `add-other-project.cmd` from PATH only, so the bare name exits 1 with "not
+// recognized" and the CLI never runs. Same pattern as coordinator.e2e.test.ts.
 function projectAddScript(directory: string): string {
   const windows = process.platform === 'win32'
   const file = path.join(defaultProject, `add-other-project.${windows ? 'cmd' : 'sh'}`)
   const command = `kimaki project add ${windows ? `"${directory}"` : shellQuote(directory)}`
   fs.writeFileSync(file, windows ? `@echo off\r\n${command}\r\n` : `#!/bin/sh\n${command}\n`)
-  return windows ? 'add-other-project.cmd' : 'sh add-other-project.sh'
+  return windows ? '.\\add-other-project.cmd' : 'sh add-other-project.sh'
 }
 
 beforeAll(async () => {
@@ -141,6 +147,17 @@ test('onboarding thread adds a project channel through the kimaki CLI, which ans
 
   await discord.thread(onboarded.threadId).user(TEST_USER_ID).sendMessage({ content: 'yes, add-other-project' })
   await waitForFooterCount({ threadId: onboarded.threadId, count: 2 })
+
+  // The turn's text above says the channel was added, so the channel set below is
+  // what proves it. When one of them is missing, name the cause here instead of
+  // leaving a snapshot diff: the shell run shows whether `kimaki project add` ran
+  // and what it printed (a bare script name exits 1 with "not recognized").
+  const onboardingSession = bot.store.getState().roots[onboarded.threadId]
+  if (!onboardingSession) throw new Error(`no session for onboarding thread ${onboarded.threadId}`)
+  const read = await readSessionMarkdown({ client: await server.client(), sessionId: onboardingSession, full: true, verbose: true })
+  if (read instanceof Error) throw read
+  const run = read.split('\n\n').find((block) => block.startsWith('tool shell') && block.includes('add project channel'))
+  expect(run).toContain('Added <#')
 
   expect(await discord.channel(onboarded.channelId).text()).toMatchInlineSnapshot(`
     "--- from: assistant (TestBot)
