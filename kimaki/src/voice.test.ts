@@ -6,6 +6,16 @@ import { expect, test } from 'vitest'
 import { tempDataDir } from './test/harness.ts'
 import { chatGPTCredential } from './voice.ts'
 
+// libSQL keeps its file handles until its prepared statements are garbage
+// collected (vitest.config.ts passes --expose-gc on Windows). Let go of them
+// before removing the temp dir: a slow finalizer must not fail a test whose
+// assertions already passed, but a real removal failure still throws.
+async function releaseLibsqlHandles(): Promise<void> {
+  global.gc?.()
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  global.gc?.()
+}
+
 test('chatGPTCredential skips token sharing and expired logins', async () => {
   const dir = tempDataDir()
   const file = path.join(dir, 'opencode.db')
@@ -25,5 +35,6 @@ test('chatGPTCredential skips token sharing and expired logins', async () => {
   }
   client.close()
   expect(await chatGPTCredential({ dbFile: file, now: 1_000_000 })).toEqual({ accessToken: 'codex', accountId: null })
-  fs.rmSync(dir, { recursive: true, force: true })
+  await releaseLibsqlHandles()
+  fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
 })
