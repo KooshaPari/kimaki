@@ -11,11 +11,11 @@ import { send, shell } from './prompt.ts'
 const exec = promisify(execFile)
 const dataDir = tempDataDir()
 // The shell tool hands its command to the shell as one argv element, so quotes do
-// not group a multi-word value: on cmd.exe they arrive literal and the value splits
-// on its spaces. Button labels have no spaces, so they need no quotes; the upload
-// prompt does, so it goes through a one-line script that both shells can run.
+// not group a multi-word value: they arrive literal and the value splits on its
+// spaces. Button labels need none; the upload prompt does, so it uses a one-line
+// script. PowerShell (the shell here) skips the cwd: hence the `.\` prefix.
 const windows = process.platform === 'win32'
-const uploadScript = windows ? 'upload-logo.cmd' : 'sh upload-logo.sh'
+const uploadScript = windows ? '.\\upload-logo.cmd' : 'sh upload-logo.sh'
 
 function writeUploadScript() {
   const command = 'kimaki upload-request --prompt "Send the logo" --max-files 2'

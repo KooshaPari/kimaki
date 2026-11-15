@@ -30,13 +30,13 @@ import {
 const WARM_INTERVAL_MS = 200
 
 // The shell tool hands its command to the shell as one argv element: a `"` that
-// should group a multi-word value reaches cmd.exe literally and the value splits
-// on its spaces, and POSIX `'` arrives literal there too, so
-// `--reason 'waiting for the deploy'` reached the CLI as `'waiting`. A one-line
-// script passes the real command line to the shell, which groups the quoted
-// reason on cmd.exe and on POSIX alike.
+// should group a multi-word value reaches the shell literally and the value splits
+// on its spaces, and POSIX `'` arrives literal there too, so `--reason 'waiting
+// for the deploy'` reached the CLI as `'waiting`. A one-line script passes the
+// real command line, grouping the quoted reason. PowerShell skips the current
+// directory for a bare script name, so the invocation carries an explicit `.\`.
 const windows = process.platform === 'win32'
-const sleepScript = windows ? 'sleep-30m.cmd' : 'sh sleep-30m.sh'
+const sleepScript = windows ? '.\\sleep-30m.cmd' : 'sh sleep-30m.sh'
 
 function writeSleepScript() {
   const command = 'kimaki sleep --duration 30m --reason "waiting for the deploy"'
