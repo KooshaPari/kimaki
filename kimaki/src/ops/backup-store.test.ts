@@ -18,12 +18,16 @@ import {
 
 const opened: OpenedDb[] = []
 const dirs: string[] = []
+// Paths a test proves must stay absent. Teardown removes them anyway, so a bug
+// that does write outside the store cannot leave residue for the next run.
+const absentPaths: string[] = []
 afterEach(async () => {
   for (const db of opened.splice(0)) db.close()
   await new Promise((resolve) => setTimeout(resolve, 0))
   global.gc?.()
   await new Promise((resolve) => setTimeout(resolve, 50))
   global.gc?.()
+  for (const target of absentPaths.splice(0)) fs.rmSync(target, { force: true })
   await removeTempDirs(dirs)
 })
 
@@ -234,15 +238,25 @@ test('restoring the same store object twice skips rows already present', async (
 
 test('both stores refuse a key that would leave the store, and a missing key is an error', async () => {
   const { backup } = await seededBackup()
-  const dir = tempDir('store-traversal')
+  // The store sits one level below a directory this test owns, so the traversal
+  // target lives inside that directory instead of the shared temp root. A
+  // leftover `%TEMP%\escape.json` from an unrelated program used to fail this
+  // assertion for a reason that had nothing to do with the store.
+  const root = tempDir('store-traversal')
+  const dir = path.join(root, 'store')
+  fs.mkdirSync(dir)
+  const escapeTarget = path.join(root, 'escape.json')
+  absentPaths.push(escapeTarget)
   const local = createLocalFilesystemStore({ dir })
   const memory = createInMemoryObjectStore()
   for (const store of [local, memory]) {
-    expect(await uploadBindingBackup({ store, key: '../escape.json', backup })).toBeInstanceOf(Error)
+    const escaped = await uploadBindingBackup({ store, key: '../escape.json', backup })
+    expect(escaped).toBeInstanceOf(Error)
+    expect((escaped as Error).message).toContain('Backup object key ../escape.json must be a flat name without path separators')
     expect(await uploadBindingBackup({ store, key: '', backup })).toBeInstanceOf(Error)
     const missing = await restoreBindingBackup({ store, key: 'absent.json', db: (await database()).db })
     expect(missing).toBeInstanceOf(Error)
     expect((missing as Error).message).toContain('no backup object')
   }
-  expect(fs.existsSync(path.join(dir, '..', 'escape.json'))).toBe(false)
+  expect(fs.existsSync(escapeTarget)).toBe(false)
 })

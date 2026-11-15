@@ -3,12 +3,12 @@
 // created, and the slash commands are registered. Split from queue.e2e so
 // both files run in parallel.
 
-import fs from 'node:fs'
 import { setTimeout as sleep } from 'node:timers/promises'
 import type { DeterministicMatcher } from 'opencode-deterministic-provider'
 import { afterAll, beforeAll, expect, test } from 'vitest'
 
 import type { BotHandle } from './main.ts'
+import { removeDataDir } from './test/cleanup.ts'
 import {
   TEST_USER_ID,
   seedProjectChannel,
@@ -59,7 +59,7 @@ afterAll(async () => {
   await bot?.stop()
   await twin?.stop()
   await server?.stop()
-  fs.rmSync(dataDir, { recursive: true, force: true })
+  await removeDataDir(dataDir)
 })
 
 // Starts a slow turn in a new thread and waits until it runs (banner posted).
