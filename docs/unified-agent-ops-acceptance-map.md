@@ -253,6 +253,43 @@ than assumed:
 So on this runtime writes are gated by command approvals, and `item/fileChange/requestApproval`
 stays covered by unit tests only because nothing in this tool surface can raise it.
 
+### The whole approval surface, re-runnable
+
+Every behaviour in this section is one command, so the claims are checkable rather than
+transcribed:
+
+```
+bun scripts/acceptance/codex-approvals.ts      # or: bun run acceptance:codex
+```
+
+The script starts its own witness model (`scripts/acceptance/codex-stub-model.mjs`), writes a
+temporary Codex home pointing at it, and drives `ops codex turn` once per case. A case passes only
+when the CLI's exit code, request count, turn status and what the model was told next all match;
+anything else prints `FAIL` and the pass exits non-zero. No account credential is used and the
+temporary home is removed on exit. `CODEX_BINARY` and `BUN_BINARY` override the two executables.
+
+Last full run on this host against codex-cli 0.169: **12/12 cases passed**, in 5m35s:
+
+| Case | What it proves |
+| --- | --- |
+| accept runs the command | request surfaced, command exits 0, model sees the output |
+| decline refuses the command | model sees `rejected by user`, nothing runs |
+| no approval channel fails closed | no request surfaced, model sees `approval request failed` |
+| cancel interrupts the turn | status `interrupted`, no following model turn |
+| acceptForSession collapses a repeated command | one request, two runs |
+| acceptForSession re-asks for a different command | two requests |
+| acceptForSession re-asks when one argument is added | two requests, so the grant is exact-command |
+| plain accept asks once per command | two requests, the control for the two rows above |
+| escalation accepted runs outside the sandbox | the justification is surfaced, the command runs |
+| escalation declined is refused | `rejected by user` |
+| an unadvertised patch tool is rejected by the runtime | `unsupported call: apply_patch`, no approval raised |
+| a shell write arrives as a command approval | method `item/commandExecution/requestApproval`, file written |
+
+Building the harness caught two defects in the harness itself, not in the approval code, and both
+are worth knowing because each looked like a product failure first: a stale `bun.exe` earlier on
+PATH than the working shim, and a spawn working directory one level too deep, which fails with the
+same `ENOENT` a missing executable does.
+
 | Check | Observed |
 | --- | --- |
 | Policy auto-answer | `accept` delivered once as `{decision:"accept"}`; request surfaced with its command |
