@@ -1,9 +1,11 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import { ChannelType, REST, Routes } from 'discord.js'
+import type { KimakiDb } from '../../db.ts'
 import { ConfigError, DiscordError } from '../../errors.js'
 import { ackHub, openHubStream, readHubState } from '../../backend/hub-client.ts'
 import type { HubEvent } from '../../backend/hub.ts'
+import { claimSurface, type CutoverLedger, type SurfaceClaim, type SurfaceConsumer } from '../cutover.ts'
 
 // A view's hub identity is scoped to the channel it mirrors, not to the process
 // that happens to run it. Two views on one channel therefore claim the same id,
@@ -13,7 +15,18 @@ export function defaultViewClientId(channelId: string): string {
   return `discord-view-${channelId}`
 }
 
-export async function openDiscordView({ rest, tenantId, channelId, clientId, cursor, statePath, baseUrl, signal, onPosted, rebind = false }: {
+// AC34: the durable claim a view holds on its surface. It is the binding row the
+// consumer's identity names, checked through the same writeSurface fence a
+// cutover moves, so the view never keeps posting through a pause or a handover.
+export type ViewClaim = {
+  db: KimakiDb
+  ledger: CutoverLedger
+  consumer: SurfaceConsumer
+  serviceKind?: string
+  onClaim?: (result: SurfaceClaim) => void
+}
+
+export async function openDiscordView({ rest, tenantId, channelId, clientId, cursor, statePath, baseUrl, signal, onPosted, rebind = false, claim }: {
   rest: REST
   tenantId: string
   channelId: string
@@ -26,6 +39,9 @@ export async function openDiscordView({ rest, tenantId, channelId, clientId, cur
   // Following a live session change is an explicit operator decision. Off by
   // default, because switching silently would mix two sessions in one channel.
   rebind?: boolean
+  // Without a claim the view keeps its pre-cutover behavior: one hub subscriber
+  // per channel id and no metadata store. With one, every post is fenced.
+  claim?: ViewClaim
 }): Promise<Error | undefined> {
   let posted = 0
   let savedSession: string | undefined
@@ -65,6 +81,24 @@ export async function openDiscordView({ rest, tenantId, channelId, clientId, cur
   const abort = () => controller.abort()
   signal?.addEventListener('abort', abort, { once: true })
   if (signal?.aborted) controller.abort()
+  // Refreshing the claim is what makes this process a real consumer of the
+  // surface rather than an unattached mirror: the binding row it named is asked
+  // again, and a cutover that paused, superseded or retired it is authoritative.
+  const refreshClaim = async (): Promise<SurfaceClaim | Error | undefined> => {
+    if (claim === undefined) return undefined
+    const taken = await claimSurface({
+      db: claim.db, ledger: claim.ledger, tenantId, surfaceId: channelId, serviceKind: claim.serviceKind, consumer: claim.consumer,
+    })
+    if (taken instanceof Error) return taken
+    claim.onClaim?.(taken)
+    return taken
+  }
+  const initial = await refreshClaim()
+  if (initial instanceof Error) return initial
+  // A paused or staged row is a cutover window: stay attached and post nothing
+  // until the surface settles. A missing, retired or superseded claim can never
+  // write, so the view stops here instead of retrying forever.
+  if (initial !== undefined && !initial.claimed && !initial.retryable) return new ConfigError({ reason: initial.reason })
   let failure: Error | undefined
   let pending = Promise.resolve()
   let text = ''
@@ -107,6 +141,26 @@ export async function openDiscordView({ rest, tenantId, channelId, clientId, cur
       failure = new ConfigError({ reason: 'Cannot publish an empty turn without fabricating text' })
       controller.abort()
       return
+    }
+    // AC34: the pause and the handover are observed here, on the live surface.
+    // The claim is refreshed immediately before the post, so a turn the surface
+    // no longer belongs to is never written.
+    if (claim !== undefined) {
+      const refreshed = await refreshClaim()
+      if (refreshed instanceof Error) {
+        failure = refreshed
+        controller.abort()
+        return
+      }
+      if (refreshed !== undefined && !refreshed.claimed) {
+        // The turn is dropped, not deferred: a cutover window is retried on the
+        // next turn, and a lost claim stops the view with the named refusal.
+        if (!refreshed.retryable) {
+          failure = new ConfigError({ reason: refreshed.reason })
+          controller.abort()
+        }
+        return
+      }
     }
     const sent = await rest.post(Routes.channelMessages(channelId), {
       body: { content, allowed_mentions: { parse: [] } },

@@ -1,8 +1,10 @@
-// AC34: metadata connector cutover. These rows move *ownership of a surface*
-// from one binding to another; they never start, stop, reroute or pause a real
-// Discord or Paperclip connector. What the cutover does prove is that a
-// competing consumer holding the superseded generation cannot write through the
-// pause, and that a failed cutover never strands a surface.
+// AC34: connector cutover. These rows move *ownership of a surface* from one
+// binding to another. The cutover itself never starts, stops, reroutes or pauses
+// a Discord or Paperclip connector; it moves the metadata a connector is fenced
+// by. A running consumer claims the binding that names its own identity and asks
+// writeSurface before every post (claimSurface, below), so a real consumer does
+// stop posting through the pause and a real competitor does take over after the
+// handover. A failed cutover never strands a surface.
 import crypto from 'node:crypto'
 import * as orm from 'drizzle-orm'
 import type { KimakiDb } from '../db.ts'
@@ -321,4 +323,81 @@ export async function writeSurface({ db, ledger, bindingId, generation }: {
     created_at: Date.now(),
   })
   return { accepted: false, binding_id: bindingId, generation, surface_generation: current, reason }
+}
+
+// AC34.5: a real consumer claims a surface through the binding row that names its
+// own identity. The claim is not a second lock: the row's generation and state
+// are the claim, and writeSurface is the same fence every other writer meets.
+// A cutover pauses, supersedes or retires that row, which is what stops the
+// consumer that held it. `retryable` separates a cutover window (the row is
+// paused, or staged for this consumer) from a claim that can never write again,
+// so a standby consumer can wait out a handover instead of treating it as loss.
+export type SurfaceConsumer = {
+  hostId: string
+  endpointId: string
+  backendKind: string
+  nativeSessionId: string
+}
+
+export type SurfaceClaim =
+  | { claimed: true; binding_id: string; generation: number; surface_generation: number; surface: string }
+  | {
+    claimed: false
+    binding_id: string | null
+    generation: number | null
+    surface_generation: number | null
+    surface: string
+    reason: string
+    retryable: boolean
+  }
+
+export async function claimSurface({ db, ledger, tenantId, surfaceId, consumer, serviceKind = 'discord' }: {
+  db: KimakiDb
+  ledger: CutoverLedger
+  tenantId: string
+  surfaceId: string
+  consumer: SurfaceConsumer
+  serviceKind?: string
+}): Promise<SurfaceClaim | ConfigError | DbError> {
+  if (!validIdentifiers([tenantId, surfaceId, serviceKind, consumer?.hostId, consumer?.endpointId, consumer?.backendKind, consumer?.nativeSessionId])) {
+    return new ConfigError({ reason: 'Supply a consumer host, endpoint, backend and native session, plus tenant and surface IDs, to claim a surface' })
+  }
+  const label = `${serviceKind}:${tenantId}:${surfaceId}`
+  const rows = await db.select().from(bindings).where(orm.and(
+    orm.eq(bindings.service_kind, serviceKind),
+    orm.eq(bindings.tenant_id, tenantId),
+    orm.eq(bindings.surface_id, surfaceId),
+  )).catch((cause) => new DbError({ operation: 'read surface claim bindings', cause }))
+  if (rows instanceof Error) return rows
+  const held = rows.filter((row) =>
+    row.host_id === consumer.hostId && row.endpoint_id === consumer.endpointId
+    && row.backend_kind === consumer.backendKind && row.native_session_id === consumer.nativeSessionId)
+  // Identity names exactly one row. Zero rows means this consumer was never
+  // bound; more than one means the store cannot say which row is the claim.
+  if (held.length !== 1) {
+    const consumerLabel = `${consumer.hostId}/${consumer.endpointId}/${consumer.backendKind}/${consumer.nativeSessionId}`
+    return {
+      claimed: false, binding_id: null, generation: null, surface_generation: null, surface: label, retryable: false,
+      reason: held.length === 0
+        ? `Consumer ${consumerLabel} holds no binding on surface ${label}, so it cannot claim the surface. Bind it with kimaki ops bind before it writes`
+        : `Consumer ${consumerLabel} holds ${held.length} bindings on surface ${label}. Exactly one binding can name a consumer's claim`,
+    }
+  }
+  const binding = held[0]!
+  const written = await writeSurface({ db, ledger, bindingId: binding.id, generation: binding.generation })
+  if (written instanceof Error) return written
+  if (written.accepted) {
+    return {
+      claimed: true, binding_id: written.binding_id, generation: written.generation,
+      surface_generation: written.surface_generation, surface: label,
+    }
+  }
+  // The row's own state decides whether the refusal is a window or a loss; the
+  // refusal text stays exactly the one writeSurface named, never rewritten here.
+  const state = stateOf(binding)
+  return {
+    claimed: false, binding_id: written.binding_id, generation: written.generation,
+    surface_generation: written.surface_generation, surface: label, reason: written.reason,
+    retryable: state === 'paused' || state === 'staged',
+  }
 }

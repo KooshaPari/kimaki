@@ -1,5 +1,6 @@
 // Local operations inventory only. Lazy imports preserve normal CLI startup.
 import type { Goke } from 'goke'
+import type { ViewClaim } from '../ops/discord/view.ts'
 import { DATA_DIR_HELP, dataDirOrDefault, fail, openCliDb, printJson } from './shared.ts'
 import { ConfigError } from '../errors.ts'
 import type { DurableLaunchFence } from '../ops/paperclip/launch-fence-durable.ts'
@@ -1055,6 +1056,12 @@ export function registerOpsCommands(cli: Goke) {
     .option('--token <token>', 'Bot token (default: KIMAKI_BOT_TOKEN)')
     .option('--state <path>', 'Durable cursor file; a restart posts nothing twice')
     .option('--client <id>', 'Client identity to register in hub presence (default: discord-view-<surface>, which refuses a second view of the same channel)')
+    .option('--host <id>', 'Consumer host identity; with --endpoint, --backend and --native-session the view claims its surface binding before every post')
+    .option('--endpoint <id>', 'Consumer endpoint identity, naming the binding row this view holds')
+    .option('--backend <kind>', 'Consumer runtime kind recorded on its binding')
+    .option('--native-session <id>', 'Consumer native session recorded on its binding')
+    .option('--service <kind>', 'Outward service kind of the claimed surface (default: discord)')
+    .option('--data-dir <path>', DATA_DIR_HELP)
     .option('--cursor <n>', 'Start from this cursor when the state file is missing')
     .option('--rebind', 'Follow a live session.started that names a different session instead of failing closed (default: refuse)')
     .option('--timeout <ms>', 'Maximum viewing duration in milliseconds (default: 0, unbounded)')
@@ -1068,6 +1075,35 @@ export function registerOpsCommands(cli: Goke) {
       if (cursor !== undefined && (!Number.isSafeInteger(cursor) || cursor < 0)) fail(new ConfigError({ reason: '--cursor must be a non-negative integer' }))
       const timeout = options.timeout === undefined ? 0 : Number(options.timeout)
       if (!Number.isSafeInteger(timeout) || timeout < 0) fail(new ConfigError({ reason: '--timeout must be zero or a positive integer in milliseconds' }))
+      // All four consumer flags or none: a partial identity would claim a row it
+      // cannot name, and no flags keeps the pre-cutover mirror behavior exactly.
+      const consumerFlags = [options.host, options.endpoint, options.backend, options.nativeSession]
+      const suppliedConsumerFlags = consumerFlags.filter((value) => typeof value === 'string' && value.trim() !== '')
+      if (suppliedConsumerFlags.length !== 0 && suppliedConsumerFlags.length !== consumerFlags.length) {
+        fail(new ConfigError({ reason: 'Supply --host, --endpoint, --backend and --native-session together to claim the surface before posting, or none of them to mirror without a claim' }))
+      }
+      let closeDb: (() => void) | undefined
+      let viewClaim: ViewClaim | undefined
+      if (suppliedConsumerFlags.length === consumerFlags.length) {
+        // The claim is the binding row that names this consumer, so it lives in
+        // the same store a cutover moves. Opening it here also refuses a view
+        // whose metadata database was never created.
+        const opened = await openCliDb(options.dataDir)
+        const { createCutoverLedger } = await import('../ops/cutover.ts')
+        closeDb = opened.close
+        viewClaim = {
+          db: opened.db,
+          ledger: createCutoverLedger(),
+          consumer: {
+            hostId: required(options.host, 'host'),
+            endpointId: required(options.endpoint, 'endpoint'),
+            backendKind: required(options.backend, 'backend'),
+            nativeSessionId: required(options.nativeSession, 'native-session'),
+          },
+          ...(options.service === undefined ? {} : { serviceKind: options.service }),
+          onClaim: (result) => printJson({ kind: 'claim', ...result }),
+        }
+      }
       const { REST } = await import('discord.js')
       const { openDiscordView, defaultViewClientId } = await import('../ops/discord/view.ts')
       const rest = new REST({ ...(process.env['KIMAKI_DISCORD_REST_URL'] ? { api: process.env['KIMAKI_DISCORD_REST_URL'] } : {}), version: '10', retries: 0, rejectOnRateLimit: () => true }).setToken(token)
@@ -1087,9 +1123,25 @@ export function registerOpsCommands(cli: Goke) {
         signal: controller.signal,
         rebind: options.rebind === true,
         onPosted: (seq) => printJson({ kind: 'posted', seq }),
+        ...(viewClaim === undefined ? {} : { claim: viewClaim }),
       })
       if (deadline) clearTimeout(deadline)
-      if (failure instanceof Error) fail(failure)
+      // `fail` exits through process.exit, but a live view holds a SQLite handle
+      // and open REST sockets; exiting from under them asserts inside libuv on
+      // Windows (UV_HANDLE_CLOSING) instead of returning the refusal code. Report
+      // the same message chain, keep the code, and let the handles drain.
+      const stop = (error: Error): void => {
+        const lines = [error.message]
+        for (let cause = error.cause; cause instanceof Error; cause = cause.cause) lines.push(`  caused by: ${cause.message}`)
+        process.stderr.write(`${lines.join('\n')}\n`)
+        process.exitCode = 1
+      }
+      if (failure instanceof Error) {
+        closeDb?.()
+        stop(failure)
+        return
+      }
+      closeDb?.()
       printJson({ kind: 'closed' })
     })
 
