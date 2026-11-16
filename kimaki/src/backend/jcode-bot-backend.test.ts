@@ -30,7 +30,11 @@ import { createEventLoop } from '../event-loop.ts'
 import { startBotConnection, type BotConnectionCallbacks } from '../main.ts'
 import { createEventRecorder } from '../session-events.ts'
 import { createBotStore } from '../store.ts'
+import { removeTempDir } from '../test/cleanup.ts'
 import type { Effect } from '../thread-reducer.ts'
+import { AcpApprovalError } from './acp/approvals.ts'
+import { createAcpClient } from './acp/client.ts'
+import type { AcpClient, AcpClientOptions, AcpServerRequest } from './acp/contracts.ts'
 import { createJcodeBotBackend, JcodeBotBackendError, type JcodeBotConnection } from './jcode-bot-backend.ts'
 
 function findJcode(): string | null {
@@ -51,17 +55,16 @@ test('the skip reason is named when the binary is absent', () => {
   else expect(skipReason).toBeNull()
 })
 
-function removeTree(target: string): boolean {
-  for (let attempt = 0; attempt < 10; attempt += 1) {
-    try {
-      fs.rmSync(target, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
-    } catch {
-      // Windows reports EPERM while a just-closed handle drains; retry below.
-    }
-    if (!fs.existsSync(target)) return true
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500)
+// Thin boolean adapter over the shared bounded-retry helper: Windows reports
+// EPERM/EBUSY while a just-closed handle drains, which removeTempDir absorbs
+// within a hard bound. The boolean keeps the call sites' assertions intact.
+async function removeTree(target: string): Promise<boolean> {
+  try {
+    await removeTempDir(target)
+    return true
+  } catch {
+    return false
   }
-  return !fs.existsSync(target)
 }
 
 // Same loopback Responses-API mock the observer suite uses: jcode itself writes
@@ -267,7 +270,7 @@ test('a missing binary is a named error, never a fallback to OpenCode', async ()
     expect((result as Error).message).toContain('binary')
     expect((result as Error).message).toContain(missing)
   } finally {
-    removeTree(root)
+    await removeTree(root)
   }
 })
 
@@ -289,7 +292,7 @@ describe.skipIf(jcodeBinary === null)(`jcode bot seam over a real session${skipR
     // run would leak a locked directory every time. Reuse keeps the leftover at
     // most one path, and it is reported if it still cannot be removed.
     root = path.join(os.tmpdir(), 'kimaki-bot-backend-seam')
-    removeTree(root)
+    await removeTree(root)
     fs.mkdirSync(root, { recursive: true })
     home = path.join(root, 'home')
     cwd = path.join(root, 'cwd')
@@ -309,7 +312,7 @@ describe.skipIf(jcodeBinary === null)(`jcode bot seam over a real session${skipR
     // A Windows handle on a just-closed SQLite file can outlive the test for a
     // moment. Leaving a temp dir is a nuisance; failing the suite over it would
     // hide the result of the claims above. The path is named instead.
-    if (root && !removeTree(root)) process.stderr.write(`jcode seam test: could not remove ${root}\n`)
+    if (root && !(await removeTree(root))) process.stderr.write(`jcode seam test: could not remove ${root}\n`)
   }, 30_000)
 
   test('a session that is not persisted yet is a named construction error', async () => {
@@ -326,7 +329,7 @@ describe.skipIf(jcodeBinary === null)(`jcode bot seam over a real session${skipR
       expect((result as Error).message).toContain('session_awaiting')
       expect((result as Error).message).toContain('no record')
     } finally {
-      expect(removeTree(empty)).toBe(true)
+      expect(await removeTree(empty)).toBe(true)
     }
   })
 
