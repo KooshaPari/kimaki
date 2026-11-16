@@ -2,10 +2,12 @@
 // Discord login in parallel. Returns a handle so tests can drive the bot
 // in-process and stop it cleanly.
 
+import path from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { Client, Events, GatewayIntentBits, Partials } from 'discord.js'
 import * as errore from 'errore'
 
+import { createJcodeBotBackend, type JcodeBotBackendInput, type JcodeBotBackendSpec, type JcodeBotConnection } from './backend/jcode-bot-backend.ts'
 import { createAgentUi } from './agent-ui.ts'
 import type { Analytics } from './analytics.ts'
 import { oc, type Bot, type WarmupTimers } from './bot.ts'
@@ -19,7 +21,7 @@ import { runLockRoute } from './lock-routes.ts'
 import { installShim, type LockServer } from './lock-server.ts'
 import { createLogger } from './logger.ts'
 import { createCoordinatorNotes } from './coordinator.ts'
-import { installPluginShim, watchOpencode, type OpencodeEndpoint } from './opencode-server.ts'
+import { installPluginShim, watchOpencode, type OpencodeConnection, type OpencodeEndpoint } from './opencode-server.ts'
 import { countUserProjects } from './project.ts'
 import { createScheduler, systemClock, type Clock } from './scheduler.ts'
 import { createEventRecorder, syncSessionTranscript } from './session-events.ts'
@@ -77,6 +79,50 @@ export type StartBotOptions = {
   coordinator?: boolean
   // Default: the plugin's prompt cache warmup windows (plugin/coordinator.ts). Tests pass short ones.
   warmupTimers?: WarmupTimers
+  // Drive the event loop from a native Jcode session instead of OpenCode. Absent: the OpenCode
+  // path below, unchanged. Present: the observe-only seam in backend/jcode-bot-backend.ts; a
+  // failure to construct it is returned as an Error, never a fallback to OpenCode.
+  backend?: JcodeBotBackendSpec
+}
+
+// The arguments the OpenCode watcher takes. Exported so the seam's default path can be asserted
+// without starting Discord or an OpenCode service.
+export type BotConnectionCallbacks = Parameters<typeof watchOpencode>[0]
+
+export type BotConnectionSelection = OpencodeConnection | Promise<Error | OpencodeConnection>
+
+/**
+ * The one place startBot chooses its backend.
+ *
+ * With no `backend` this calls watchOpencode with exactly the callbacks it always received and
+ * returns its connection synchronously, so the default path gains no await and no new object.
+ * With a Jcode backend it returns a promise; construction resolves an Error rather than throwing.
+ */
+export function startBotConnection(
+  {
+    backend,
+    callbacks,
+    cursorDir,
+    intervalMs,
+  }: {
+    backend?: JcodeBotBackendSpec
+    callbacks: BotConnectionCallbacks
+    // Durable dedupe for the Jcode observer; must live outside the Jcode store.
+    cursorDir?: string
+    intervalMs?: number
+  },
+  opencodeFactory: (options: BotConnectionCallbacks) => OpencodeConnection = watchOpencode,
+  jcodeFactory: (input: JcodeBotBackendInput) => Promise<Error | JcodeBotConnection> = createJcodeBotBackend,
+): BotConnectionSelection {
+  if (backend?.kind !== 'jcode') return opencodeFactory(callbacks)
+  return jcodeFactory({
+    ...(backend.binary === undefined ? {} : { binary: backend.binary }),
+    ...(backend.home === undefined ? {} : { home: backend.home }),
+    ...(backend.sessionId === undefined ? {} : { sessionId: backend.sessionId }),
+    ...(cursorDir === undefined ? {} : { cursorDir }),
+    ...(intervalMs === undefined ? {} : { intervalMs }),
+    onEvent: callbacks.onEvent,
+  })
 }
 
 export type BotHandle = Bot & {
@@ -167,13 +213,21 @@ export async function startBot(options: StartBotOptions): Promise<Error | BotHan
   // Before the service is used, so a service started by ensure() loads it at once.
   const plugin = await installPluginShim({ configDir: options.opencodeConfigDir })
   if (plugin instanceof Error) return plugin
-  const opencode = watchOpencode({
-    serviceFile: options.opencodeServiceFile,
-    ensure: options.ensureOpencode,
-    onConnect: eventLoop.onConnect,
-    onEvent: eventLoop.onEvent,
-    onDisconnect: eventLoop.onDisconnect,
+  const selected = startBotConnection({
+    backend: options.backend,
+    cursorDir: path.join(options.dataDir, 'jcode-observe'),
+    callbacks: {
+      serviceFile: options.opencodeServiceFile,
+      ensure: options.ensureOpencode,
+      onConnect: eventLoop.onConnect,
+      onEvent: eventLoop.onEvent,
+      onDisconnect: eventLoop.onDisconnect,
+    },
   })
+  // The default path returns synchronously; only the Jcode path awaits construction.
+  const candidate = selected instanceof Promise ? await selected : selected
+  if (candidate instanceof Error) return candidate
+  const opencode: OpencodeConnection = candidate
   cleanup.defer(() => opencode.stop())
   const shim = await installShim({ dataDir: options.dataDir, argv: options.kimakiArgv })
   if (shim instanceof Error) return shim
