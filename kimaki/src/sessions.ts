@@ -69,7 +69,7 @@ export function btwPrompt({
     `Parent session: ${parentSessionId} (thread <#${sourceThreadId}>)`,
     'Do NOT send messages to the parent session unless the user explicitly asks you to.',
     // The instructions entry is copied from the parent (prompt cache); these IDs win.
-    `This fork has its own IDs: OpenCode session ${sessionId}, Discord thread ${threadId}.`,
+    `This fork has its own IDs: agent session ${sessionId}, Discord thread ${threadId}.`,
     '',
     text,
   ].join('\n')

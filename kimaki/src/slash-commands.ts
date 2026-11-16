@@ -197,7 +197,7 @@ function catalogRoutes(): InteractionRoutes {
     commands[kind] = {
       definition: new SlashCommandBuilder()
         .setName(kind)
-        .setDescription(`Run any OpenCode ${kind} in this project`)
+        .setDescription(`Run any ${kind} in this project`)
         .addStringOption((option) => option.setName('name').setDescription(`${kind} name`).setRequired(true).setAutocomplete(true))
         .addStringOption((option) => option.setName('arguments').setDescription(`Arguments to pass to the ${kind}`)),
       async autocomplete(bot, interaction) {

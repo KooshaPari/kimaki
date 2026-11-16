@@ -343,7 +343,7 @@ export function createLoginRoutes(): InteractionRoutes {
   return {
     admin: true,
     commands: {
-      login: { definition: new SlashCommandBuilder().setName('login').setDescription('Connect an OpenCode provider'), run: loginCommand },
+      login: { definition: new SlashCommandBuilder().setName('login').setDescription('Connect a model provider'), run: loginCommand },
       'transcription-key': {
         definition: new SlashCommandBuilder().setName('transcription-key').setDescription('Set the OpenAI or Gemini API key for voice transcription and speech'),
         run: (_bot, interaction) => interaction.showModal(transcriptionKeyModal()),

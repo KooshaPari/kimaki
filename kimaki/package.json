@@ -1,7 +1,7 @@
 {
   "name": "kimaki",
   "version": "1.7.1",
-  "description": "A collaborative agent orchestrator for OpenCode, inside Discord",
+  "description": "A collaborative agent orchestrator, inside Discord",
   "repository": "https://github.com/remorses/kimaki",
   "type": "module",
   "bin": {

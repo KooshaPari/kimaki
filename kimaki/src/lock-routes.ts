@@ -196,7 +196,7 @@ function localSession(bot: Bot, input: { sessionId?: string; threadId?: string }
 function sessionOf(bot: Bot, input: { sessionId?: string; threadId?: string }) {
   if (input.sessionId) return input.sessionId
   const root = input.threadId ? bot.store.getState().roots[input.threadId] : undefined
-  if (!root) return new ConfigError({ reason: 'No local session. Use --session or run inside an OpenCode session.' })
+  if (!root) return new ConfigError({ reason: 'No local session. Use --session or run inside an agent session.' })
   return root
 }
 

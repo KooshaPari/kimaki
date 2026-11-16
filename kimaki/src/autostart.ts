@@ -74,9 +74,9 @@ export async function writeAutostartScript({ dataDir, args }: { dataDir: string;
     node=${quote(stableNodePath())}
     [ -x "$node" ] || node=node
     echo 'Kimaki autostart'
-    echo 'OpenCode started and no Kimaki bot listened on port ${DEFAULT_LOCK_PORT}, so the Kimaki'
-    echo 'OpenCode plugin opened this window to start the Discord bot.'
-    echo 'The bot lets you talk to your OpenCode sessions from Discord.'
+    echo 'The agent service started and no Kimaki bot listened on port ${DEFAULT_LOCK_PORT}, so the Kimaki'
+    echo 'agent plugin opened this window to start the Discord bot.'
+    echo 'The bot lets you talk to your agent sessions from Discord.'
     echo 'Close this window or press Ctrl+C to stop the bot.'
     echo 'To turn autostart off, start kimaki once with --no-autostart.'
     echo "Node: $node"

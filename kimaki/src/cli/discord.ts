@@ -111,7 +111,7 @@ export function registerDiscordCommands(cli: Goke) {
       const target = options.channel ? {} : targetOrEnv(options.session)
       // Voice call shells have no session: KIMAKI_CHANNEL_ID is the voice channel.
       const id = options.channel ?? target.sessionId ?? target.threadId ?? process.env['KIMAKI_CHANNEL_ID']
-      if (!id) fail(new Error('Use --session or --channel, or run inside an OpenCode session'))
+      if (!id) fail(new Error('Use --session or --channel, or run inside an agent session'))
       const input = { id, files: files.map((file) => ({ path: path.resolve(file), name: path.basename(file) })) }
       // Waits for Discord: big files and a busy thread take longer than the 30s default.
       await action({ route: 'upload', dataDir: options.dataDir, input, signal: AbortSignal.timeout(5 * 60_000) })

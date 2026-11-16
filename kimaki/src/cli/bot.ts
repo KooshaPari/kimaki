@@ -97,7 +97,7 @@ export function registerStartCommand(cli: Goke) {
     .option('--disable-prompt <section>', wrapJsonSchema<string[]>({ type: 'array', items: { type: 'string' }, description: `System prompt section to remove from new sessions (repeatable): ${PROMPT_SECTIONS.join(', ')}` }))
     .option('--no-analytics', 'Disable anonymous usage analytics (same as KIMAKI_STRADA_ENABLED=0)')
     .option('--coordinator [enabled]', wrapJsonSchema<boolean>({ type: 'boolean', default: true, description: 'Channel messages go to one long coordinator session that starts threads for the work. "false" turns it off (/toggle-coordinator sets one channel)' }))
-    .option('--no-autostart', 'Do not open a terminal with the bot when OpenCode starts (for bots run by launchd, systemd or pm2)')
+    .option('--no-autostart', 'Do not open a terminal with the bot when the agent service starts (for bots run by launchd, systemd or pm2)')
     .option('--if-not-running', 'Start only if no bot runs; never stop the running one (used by autostart)')
     .action(async (options) => {
       // The IPC check ignores a KIMAKI_SUPERVISED leaked into a shell by an older bot.
@@ -284,9 +284,9 @@ export function registerStartCommand(cli: Goke) {
 
 // login, login credential: OpenCode provider credentials through the bot.
 export function registerLoginCommands(cli: Goke) {
-  cli.command('login <provider>', 'Connect a provider using OpenCode integration credentials')
+  cli.command('login <provider>', 'Connect a provider using integration credentials')
     .option('--data-dir <path>', DATA_DIR_HELP)
-    .option('--key <key>', 'API key to store in OpenCode')
+    .option('--key <key>', 'API key to store for the provider')
     .option('--method <id>', 'OAuth method ID; without flags, list login methods')
     .option('--attempt <id>', 'Check or complete this native OAuth attempt')
     .option('--code <code>', 'Authorization code for the attempt')
@@ -297,7 +297,7 @@ export function registerLoginCommands(cli: Goke) {
       } })
     })
 
-  cli.command('login credential <id>', 'Activate, remove, or label an OpenCode credential')
+  cli.command('login credential <id>', 'Activate, remove, or label a provider credential')
     .option('--data-dir <path>', DATA_DIR_HELP)
     .option('--operation <name>', 'activate | remove | label')
     .option('--label <text>', 'Credential label')
@@ -356,7 +356,7 @@ export function registerToolCommands(cli: Goke) {
 
 // status, logs, bot token / keys set / install-url
 export function registerBotCommands(cli: Goke) {
-  cli.command('status', 'Bot health: running, pid, uptime, OpenCode URL and version, guilds')
+  cli.command('status', 'Bot health: running, pid, uptime, agent service URL and version, guilds')
     .option('--data-dir <path>', DATA_DIR_HELP)
     .option('--json', 'Output as JSON')
     .action(async (options) => {
@@ -388,7 +388,7 @@ export function registerBotCommands(cli: Goke) {
       await followFile(file)
     })
 
-  cli.command('restart', 'Restart the running bot with the code on disk. Sessions keep running in OpenCode')
+  cli.command('restart', 'Restart the running bot with the code on disk. Sessions keep running in the agent service')
     .option('--data-dir <path>', DATA_DIR_HELP)
     .action(async (options) => {
       const result = await callBot({ dataDir: dataDirOrDefault(options.dataDir), route: 'restart', input: {} })

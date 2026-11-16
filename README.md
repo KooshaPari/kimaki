@@ -7,7 +7,7 @@
     <br/>
 </div>
 
-Kimaki is a **collaborative agent orchestrator** that lets you drive every feature of [OpenCode](https://opencode.ai) from Discord. Each Discord **channel is a project**, each **thread is a coding session**. Send a message, an AI agent edits code on your machine.
+Kimaki is a **collaborative agent orchestrator** that lets you drive every feature of your coding agent from Discord. Each Discord **channel is a project**, each **thread is a coding session**. Send a message, an AI agent edits code on your machine.
 
 You can try the bot in the [Kimaki Discord Server](https://discord.gg/qz3hapKcMM) to see what it can do.
 
@@ -23,10 +23,10 @@ Kimaki needs **OpenCode 2**. If no OpenCode is installed, Kimaki installs it for
 
 ## What is Kimaki?
 
-Kimaki turns Discord into the control surface for your coding agents. It connects to [OpenCode](https://opencode.ai), a coding agent similar to Claude Code, and maps your work onto Discord's natural structure:
+Kimaki turns Discord into the control surface for your coding agents. It connects to a coding agent similar to Claude Code and maps your work onto Discord's natural structure:
 
 - **Channels are projects.** Each channel is linked to a project directory on your machine.
-- **Threads are sessions.** Every message you send starts a thread that maps to one OpenCode session.
+- **Threads are sessions.** Every message you send starts a thread that maps to one agent session.
 
 This separation is the whole point. Other Discord/iMessage agent tools cram **everything into a single channel**, so sessions pile on top of each other with no clean way to partition them. Kimaki splits **projects into channels** and **sessions into threads**, so each piece of work has its own place. Switch projects by switching channels. Switch tasks by switching threads. Search, resume, and fork any of them later.
 
@@ -34,9 +34,9 @@ This separation is the whole point. Other Discord/iMessage agent tools cram **ev
                             ┌──────────────────────────────────────────────────┐
    Discord server           │  Your machine                                    │
   ┌──────────────────┐      │                                                  │
-  │ #web-app ────────┼──────┼──▶ /code/web-app   ──▶ OpenCode session (thread) │
-  │ #api ────────────┼──────┼──▶ /code/api       ──▶ OpenCode session (thread) │
-  │ #docs ───────────┼──────┼──▶ /code/docs      ──▶ OpenCode session (thread) │
+  │ #web-app ────────┼──────┼──▶ /code/web-app   ──▶ agent session (thread) │
+  │ #api ────────────┼──────┼──▶ /code/api       ──▶ agent session (thread) │
+  │ #docs ───────────┼──────┼──▶ /code/docs      ──▶ agent session (thread) │
   └──────────────────┘      │        ▲                                         │
         │ thread = session  │        │  reads, edits, runs commands            │
         ▼                   │        ▼  in the project directory               │
@@ -52,7 +52,7 @@ I'm Tommy, the creator of Kimaki. I do **all of my development** through it: eve
 
 ## All your models, including subscriptions
 
-Kimaki gives you access to **every model OpenCode supports**: Anthropic, OpenAI, Google, and more. The best part: you can use your existing **Claude Pro/Max** and **ChatGPT/Codex** subscriptions instead of paying per token.
+Kimaki gives you access to **every model your provider supports**: Anthropic, OpenAI, Google, and more. The best part: you can use your existing **Claude Pro/Max** and **ChatGPT/Codex** subscriptions instead of paying per token.
 
 Run `/login`, pick a provider, choose OAuth, and authenticate with your subscription. Logins are stored by OpenCode, so the same accounts work in Discord and in the OpenCode TUI. Kimaki adds the Claude Pro/Max login to OpenCode with a small plugin.
 
@@ -60,7 +60,7 @@ See [Models & Subscriptions](https://kimaki.dev/docs/getting-started/subscriptio
 
 ## Core Features
 
-Kimaki adds a layer of orchestration features on top of OpenCode. The ones worth knowing first:
+Kimaki adds a layer of orchestration features on top of your coding agent. The ones worth knowing first:
 
 - **[Routines](https://kimaki.dev/docs/features/routines)**: run the bot on a schedule (cron or a future time). For example, every morning read your inbox with a CLI like [Zele](https://github.com/remorses/zele) and post an email digest thread; then reply to mark some read or unsubscribe.
 - **[The queue](https://kimaki.dev/docs/features/queue)**: queue a message to send when the current run finishes. Great for "review this when you're done" or "commit at the end". End any message with `. queue` and even edit it later to update the queued text.

@@ -373,7 +373,7 @@ export const threadRoutes: InteractionRoutes = {
     'queue-command': {
       definition: new SlashCommandBuilder()
         .setName('queue-command')
-        .setDescription('Queue an OpenCode command to run after the current run finishes')
+        .setDescription('Queue an agent command to run after the current run finishes')
         .addStringOption((option) =>
           option.setName('command').setDescription('The command to run').setRequired(true).setAutocomplete(true),
         )
