@@ -278,6 +278,7 @@ export function registerOpsCommands(cli: Goke) {
     .option('--limit <n>', 'Page size for jcode discovery (default: 50)')
     .option('--cursor <offset>', 'Opaque cursor from a previous jcode page')
     .option('--json', 'Print only the JSON document; the human-readable health summary goes to stderr by default')
+    .option('--pid-map <path>', 'Explicit JSON file mapping discovered session IDs to {pid, birthMarker?}; enables one live process enumeration comparison')
     .option('--host <id>', 'Explicit native runtime host identity')
     .option('--endpoint <id>', 'Explicit native runtime endpoint identity')
     .option('--binary <path>', 'Explicit herdr or Codex executable (default: herdr on PATH)')
@@ -306,6 +307,9 @@ export function registerOpsCommands(cli: Goke) {
         if (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 1)) fail(new ConfigError({ reason: '--limit must be a positive integer' }))
         const page = await observer.discover({ limit, cursor: options.cursor })
         if (page instanceof Error) fail(page)
+        const { discoverIdentity, discoverIdentityLine } = await import('./discover-identity.ts')
+        const identity = await discoverIdentity({ source: 'jcode', sessionIds: page.sessions.map(({ key }) => key.nativeSessionId), pidMapPath: options.pidMap })
+        if (identity instanceof Error) fail(identity)
         // observation.health and skippedTransient are what separate a settled
         // page from one where torn records were skipped. Both ride in the JSON
         // document and the named verdict is echoed for a human reader.
@@ -315,8 +319,8 @@ export function registerOpsCommands(cli: Goke) {
           skippedTransient: page.observation.skippedTransient,
           sessions: page.sessions.length,
           cursor: page.cursor,
-        })}\n`)
-        printJson({ source: 'jcode', observedAt: new Date().toISOString(), coverage: 'explicit-jcode-home-metadata-page', endpoint: page.source, health: page.observation.health, skippedTransient: page.observation.skippedTransient, sessions: page.sessions.map(({ key, title }) => ({ key, title })), cursor: page.cursor })
+        })}\n${discoverIdentityLine('jcode', identity)}\n`)
+        printJson({ source: 'jcode', observedAt: new Date().toISOString(), coverage: 'explicit-jcode-home-metadata-page', endpoint: page.source, health: page.observation.health, skippedTransient: page.observation.skippedTransient, sessions: page.sessions.map(({ key, title }) => ({ key, title })), cursor: page.cursor, identity })
         return
       }
       if (source === 'codex') {
@@ -334,7 +338,11 @@ export function registerOpsCommands(cli: Goke) {
           if (observer instanceof Error) fail(observer)
           const page = await observer.discover()
           if (page instanceof Error) fail(page)
-          printJson({ source: 'codex', observedAt: new Date().toISOString(), coverage: 'explicit-app-server-state-db-page', endpoint: page.source, sessions: page.sessions.map(({ key }) => key), cursor: page.cursor })
+          const { discoverIdentity, discoverIdentityLine } = await import('./discover-identity.ts')
+          const identity = await discoverIdentity({ source: 'codex', sessionIds: page.sessions.map(({ key }) => key.nativeSessionId), pidMapPath: options.pidMap })
+          if (identity instanceof Error) fail(identity)
+          if (options.json !== true) process.stderr.write(`${discoverIdentityLine('codex', identity)}\n`)
+          printJson({ source: 'codex', observedAt: new Date().toISOString(), coverage: 'explicit-app-server-state-db-page', endpoint: page.source, sessions: page.sessions.map(({ key }) => key), cursor: page.cursor, identity })
         } finally {
           await server.close()
         }
@@ -353,14 +361,28 @@ export function registerOpsCommands(cli: Goke) {
         if (observer instanceof Error) fail(observer)
         const page = await observer.discover()
         if (page instanceof Error) fail(page)
-        printJson({ source: 'opencode', observedAt: new Date().toISOString(), coverage: 'explicit-native-endpoint-page', endpoint: page.source, sessions: page.sessions.map(({ key, native }) => ({ key, title: native.title })), cursor: page.cursor })
+        const { discoverIdentity, discoverIdentityLine } = await import('./discover-identity.ts')
+        const identity = await discoverIdentity({ source: 'opencode', sessionIds: page.sessions.map(({ key }) => key.nativeSessionId), pidMapPath: options.pidMap })
+        if (identity instanceof Error) fail(identity)
+        if (options.json !== true) process.stderr.write(`${discoverIdentityLine('opencode', identity)}\n`)
+        printJson({ source: 'opencode', observedAt: new Date().toISOString(), coverage: 'explicit-native-endpoint-page', endpoint: page.source, sessions: page.sessions.map(({ key, native }) => ({ key, title: native.title })), cursor: page.cursor, identity })
         return
       }
       if (options.serviceFile !== undefined || options.host !== undefined || options.endpoint !== undefined || options.codexHome !== undefined || options.jcodeHome !== undefined) fail(new ConfigError({ reason: '--service-file, --host, --endpoint, --codex-home and --jcode-home apply only to opencode, codex or jcode' }))
       const { discoverHerdr } = await import('../ops/discovery/herdr.ts')
       const result = await discoverHerdr({ binary: options.binary, session: options.herdrSession, timeoutMs: options.timeout === undefined ? undefined : Number(options.timeout) })
       if (result instanceof Error) fail(result)
-      printJson(result)
+      // herdr carries no native session key, so a pid map is keyed by the
+      // reported candidate value when present, else the herdr pane id.
+      const { discoverIdentity, discoverIdentityLine } = await import('./discover-identity.ts')
+      const identity = await discoverIdentity({
+        source: 'herdr',
+        sessionIds: result.agents.map((agent) => agent.sessionCandidate?.value ?? agent.terminal_id),
+        pidMapPath: options.pidMap,
+      })
+      if (identity instanceof Error) fail(identity)
+      if (options.json !== true) process.stderr.write(`${discoverIdentityLine('herdr', identity)}\n`)
+      printJson({ ...result, identity })
     })
 
   cli.command('ops paperclip run', 'Read one Paperclip run as metadata only, never transcript, logs or control')
