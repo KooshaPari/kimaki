@@ -48,6 +48,29 @@ export const ops_surface_bindings = s.sqliteTable('ops_surface_bindings', {
   s.uniqueIndex('ops_binding_active_surface').on(table.service_kind, table.tenant_id, table.surface_id).where(orm.sql`${table.state} = 'active'`),
 ])
 
+// AC22: a worker result whose write-back to the coordinating surface was not
+// acknowledged. Durable so a process restart keeps the pending record: `payload`
+// is the canonical JSON the digest attests, so a replay needs no worker rerun.
+export const ops_worker_sync_back = s.sqliteTable('ops_worker_sync_back', {
+  id: s.text('id').primaryKey().notNull(),
+  worker_id: s.text('worker_id').notNull(),
+  target: s.text('target').notNull(),
+  payload: s.text('payload').notNull(),
+  payload_digest: s.text('payload_digest').notNull(),
+  attempts: s.integer('attempts', { mode: 'number' }).notNull().default(0),
+  last_error: s.text('last_error'),
+  state: s.text('state', { enum: ['pending-sync', 'synced'] }).notNull().default('pending-sync'),
+  ack_id: s.text('ack_id'),
+  acknowledged_at: s.integer('acknowledged_at'),
+  created_at: s.integer('created_at').notNull(),
+  updated_at: s.integer('updated_at').notNull(),
+}, (table) => [
+  // One record per worker: a second result for the same worker is refused by
+  // name in sync-back.ts, and this index keeps that true across processes.
+  s.uniqueIndex('ops_worker_sync_back_worker').on(table.worker_id),
+  s.index('ops_worker_sync_back_state').on(table.state, table.created_at),
+])
+
 export const thread_sessions = s.sqliteTable('thread_sessions', {
   thread_id: s.text('thread_id').primaryKey().notNull(),
   session_id: s.text('session_id').notNull(),
@@ -194,6 +217,7 @@ export const session_sleeps = s.sqliteTable('session_sleeps', {
 
 export const relations = defineRelations({
   ops_surface_bindings,
+  ops_worker_sync_back,
   thread_sessions,
   bot_tokens,
   bot_api_keys,
@@ -211,6 +235,7 @@ export const relations = defineRelations({
   session_sleeps,
 }, (r) => ({
   ops_surface_bindings: {},
+  ops_worker_sync_back: {},
   thread_sessions: {
     scheduled_tasks: r.many.scheduled_tasks(),
   },

@@ -6,6 +6,7 @@ import type { KimakiDb } from '../db.ts'
 import { ConfigError, DbError } from '../errors.ts'
 import { ops_surface_bindings as bindings } from '../schema.ts'
 import type { SessionKey } from './contracts.ts'
+import { canonicalPayload } from './sync-back.ts'
 
 export type SurfaceBinding = typeof bindings.$inferSelect
 export type BindSurfaceInput = {
@@ -274,70 +275,6 @@ export async function detachBinding({ db, bindingId, tenantId, serviceKind = 'di
   return updated[0] ?? new ConfigError({ reason: 'No binding found in this tenant and service. Run kimaki ops bindings --tenant <id> to inspect local associations' })
 }
 
-// AC22: a worker finished its task but the write-back to the coordinating surface
-// did not land. The result is held as `pending-sync`, which is neither `synced`
-// nor `failed`. Only an acknowledgement from the target surface may move a record
-// to `synced`; a successful worker run alone is never proof of delivery.
-//
-// The ledger is coordination state, not worker state: it owns the digest, the
-// target, the attempt count and the last error, so a replay can be decided
-// without re-running the worker and without a second delivery.
-export type SyncBackState = 'pending-sync' | 'synced'
-
-export type WorkerResultSyncBack = {
-  id: string
-  worker_id: string
-  target: string
-  payload_digest: string
-  attempts: number
-  last_error: string | null
-  state: SyncBackState
-  ack_id: string | null
-  acknowledged_at: number | null
-  created_at: number
-}
-
-// One ledger per coordinating surface. Reconciliation never reorders work: each
-// record settles on its own, so two pending results may land in any order.
-export type SyncBackLedger = {
-  records: Map<string, WorkerResultSyncBack>
-  in_flight: Set<string>
-}
-
-export function createSyncBackLedger(): SyncBackLedger {
-  return { records: new Map(), in_flight: new Set() }
-}
-
-// Deterministic JSON so the same result always yields the same digest, whatever
-// key order the worker used. Values JSON cannot carry are refused, not coerced.
-function canonicalPayload(value: unknown, seen: Set<object> = new Set()): string | undefined {
-  if (value === null) return 'null'
-  if (typeof value === 'string' || typeof value === 'boolean') return JSON.stringify(value)
-  if (typeof value === 'number') return Number.isFinite(value) ? String(value) : undefined
-  if (typeof value !== 'object') return undefined
-  if (seen.has(value)) return undefined
-  seen.add(value)
-  let canonical: string | undefined
-  if (Array.isArray(value)) {
-    const items = value.map((item) => canonicalPayload(item, seen))
-    canonical = items.some((item) => item === undefined) ? undefined : `[${items.join(',')}]`
-  } else {
-    const entries = Object.keys(value as Record<string, unknown>).sort().map((key) => {
-      const item = canonicalPayload((value as Record<string, unknown>)[key], seen)
-      return item === undefined ? undefined : `${JSON.stringify(key)}:${item}`
-    })
-    canonical = entries.some((entry) => entry === undefined) ? undefined : `{${entries.join(',')}}`
-  }
-  seen.delete(value)
-  return canonical
-}
-
-export function payloadDigest(payload: unknown): string | ConfigError {
-  const canonical = canonicalPayload(payload)
-  if (canonical === undefined) return new ConfigError({ reason: 'The worker result payload must be JSON-serializable before it can be recorded for sync-back' })
-  return crypto.createHash('sha256').update(canonical).digest('hex')
-}
-
 // A backup digest attests the restore payload only: schema version, creation
 // timestamp and rows. It is stable across key order and ignores any other
 // top-level property, so an added field cannot change what the digest covers.
@@ -385,107 +322,13 @@ export function verifySealing(sealed: unknown): BindingBackup | ConfigError {
   return payload as BindingBackup
 }
 
-function errorText(cause: unknown): string {
-  if (cause instanceof Error) return cause.message
-  return typeof cause === 'string' && cause.trim() ? cause : 'The write-back to the coordinating surface was not acknowledged'
-}
-
-export function recordWorkerResultSyncBack({ ledger, workerId, target, payload, cause }: {
-  ledger: SyncBackLedger
-  workerId: string
-  target: string
-  payload: unknown
-  cause?: unknown
-}): WorkerResultSyncBack | ConfigError {
-  if (!validIdentifiers([workerId, target])) {
-    return new ConfigError({ reason: 'Supply a non-empty worker ID and sync-back target' })
-  }
-  const digest = payloadDigest(payload)
-  if (digest instanceof Error) return digest
-  for (const existing of ledger.records.values()) {
-    if (existing.worker_id !== workerId) continue
-    // Same worker, same digest, same surface: this is the same result seen twice.
-    if (existing.payload_digest === digest && existing.target === target) return existing
-    if (existing.payload_digest !== digest) {
-      return new ConfigError({ reason: `Worker ${workerId} already has a result with digest ${existing.payload_digest} for ${existing.target}. Refusing a different payload with digest ${digest} instead of overwriting it` })
-    }
-    return new ConfigError({ reason: `Worker ${workerId} already has a result with digest ${digest} destined for ${existing.target}. Refusing to re-record it against ${target}` })
-  }
-  const record: WorkerResultSyncBack = {
-    id: crypto.randomUUID(),
-    worker_id: workerId,
-    target,
-    payload_digest: digest,
-    // A record exists because a delivery was attempted and not acknowledged.
-    attempts: cause === undefined ? 0 : 1,
-    last_error: cause === undefined ? null : errorText(cause),
-    state: 'pending-sync',
-    ack_id: null,
-    acknowledged_at: null,
-    created_at: Date.now(),
-  }
-  ledger.records.set(record.id, record)
-  return record
-}
-
-export type SyncBackDelivery = (record: WorkerResultSyncBack) => Promise<unknown> | unknown
-
-export type ReconcileSyncBackResult =
-  | { status: 'synced'; record: WorkerResultSyncBack; delivered: true }
-  | { status: 'duplicate'; record: WorkerResultSyncBack; delivered: false }
-  | { status: 'pending-sync'; record: WorkerResultSyncBack; delivered: false; error: string }
-
-function ackIdOf(delivered: unknown): string | undefined {
-  if (typeof delivered !== 'object' || delivered === null) return undefined
-  const ack = (delivered as Record<string, unknown>)['ackId']
-  return typeof ack === 'string' && ack.trim().length > 0 ? ack : undefined
-}
-
-// Replays one pending sync-back. The delivery runs outside the ledger, and the
-// record settles in a single write: there is no state where the record claims
-// `synced` without holding the acknowledgement that proves it.
-export async function reconcileSyncBack({ ledger, recordId, deliver }: {
-  ledger: SyncBackLedger
-  recordId: string
-  deliver: SyncBackDelivery
-}): Promise<ReconcileSyncBackResult | ConfigError> {
-  const record = ledger.records.get(recordId)
-  if (!record) return new ConfigError({ reason: `No worker result sync-back record ${recordId} is held by this ledger` })
-  if (record.state === 'synced') return { status: 'duplicate', record, delivered: false }
-  if (ledger.in_flight.has(record.id)) {
-    return new ConfigError({ reason: `A sync-back for worker ${record.worker_id} to ${record.target} is already in flight. Wait for it instead of delivering the result twice` })
-  }
-  ledger.in_flight.add(record.id)
-  let delivered: string | undefined
-  let failure: string | undefined
-  try {
-    delivered = ackIdOf(await deliver(record))
-    if (delivered === undefined) failure = 'The coordinating surface returned no acknowledgement for the write-back'
-  } catch (cause) {
-    failure = errorText(cause)
-  } finally {
-    ledger.in_flight.delete(record.id)
-  }
-  if (failure !== undefined) {
-    // Still unacknowledged: the attempt is counted, the state stays pending-sync.
-    const pending: WorkerResultSyncBack = { ...record, attempts: record.attempts + 1, last_error: failure, state: 'pending-sync' }
-    ledger.records.set(pending.id, pending)
-    return { status: 'pending-sync', record: pending, delivered: false, error: failure }
-  }
-  const synced: WorkerResultSyncBack = {
-    ...record,
-    attempts: record.attempts + 1,
-    last_error: null,
-    state: 'synced',
-    ack_id: delivered as string,
-    acknowledged_at: Date.now(),
-  }
-  ledger.records.set(synced.id, synced)
-  return { status: 'synced', record: synced, delivered: true }
-}
-
-export function listWorkerResultSyncBacks({ ledger }: { ledger: SyncBackLedger }): WorkerResultSyncBack[] {
-  // Insertion order is the record's creation order; equal timestamps must not
-  // reshuffle the list by UUID. Settling a record keeps its key and its position.
-  return [...ledger.records.values()].sort((left, right) => left.created_at - right.created_at)
-}
+// AC22 sync-back lives in its own module (ops/sync-back.ts) because it owns a
+// durable store (ops/sync-back-store.ts). Re-exported here so existing callers
+// of the bindings module keep one import site.
+export {
+  canonicalPayload, createSyncBackLedger, flushSyncBackLedger, listWorkerResultSyncBacks,
+  openSyncBackLedger, payloadDigest, reconcileSyncBack, recordWorkerResultSyncBack,
+} from './sync-back.ts'
+export type {
+  ReconcileSyncBackResult, SyncBackDelivery, SyncBackLedger, SyncBackState, WorkerResultSyncBack,
+} from './sync-back.ts'

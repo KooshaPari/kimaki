@@ -131,6 +131,7 @@ test('fresh install gets kimaki.db with the kimaki tables; subcommands never cre
       "global_models",
       "guild_categories",
       "ops_surface_bindings",
+      "ops_worker_sync_back",
       "scheduled_tasks",
       "session_sleeps",
       "thread_sessions",
