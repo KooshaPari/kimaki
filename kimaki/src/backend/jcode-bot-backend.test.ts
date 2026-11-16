@@ -55,6 +55,49 @@ test('the skip reason is named when the binary is absent', () => {
   else expect(skipReason).toBeNull()
 })
 
+// Per-instance seam roots. A fixed path is shared by every concurrent run of this
+// file, so one run's `jcode run` lands on the other run's home, holds the other's
+// lock, and fails the model lookup. Unique roots cost at worst a leaked locked
+// directory, which teardown reports and the sweep below reaps later; a cross-run
+// collision is the thing that must not happen.
+const STALE_SEAM_ROOT_MS = 60 * 60 * 1000
+
+// Non-destructive: only roots older than an hour, and a root still held open is
+// skipped silently (the next run sweeps it once the daemon releases it).
+function sweepStaleSeamRoots(): void {
+  let names: string[]
+  try {
+    names = fs.readdirSync(os.tmpdir())
+  } catch {
+    return
+  }
+  const cutoff = Date.now() - STALE_SEAM_ROOT_MS
+  for (const name of names) {
+    if (!name.startsWith('kimaki-bot-backend-seam-')) continue
+    const target = path.join(os.tmpdir(), name)
+    try {
+      if (fs.statSync(target).mtimeMs >= cutoff) continue
+      fs.rmSync(target, { recursive: true, force: true, maxRetries: 0 })
+    } catch {
+      // Expected while a daemon still holds the directory; leave it for later.
+    }
+  }
+}
+
+type SeamRoots = { root: string; home: string; cwd: string; cursorDir: string; dataDir: string }
+
+// One fresh root and its subdirectories. Every harness instance calls this, so
+// two instances in one process (or two processes) never share a path.
+function createSeamRoots(): SeamRoots {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-bot-backend-seam-'))
+  const home = path.join(root, 'home')
+  const cwd = path.join(root, 'cwd')
+  const cursorDir = path.join(root, 'cursor')
+  const dataDir = path.join(root, 'data')
+  for (const dir of [home, cwd, cursorDir, dataDir]) fs.mkdirSync(dir, { recursive: true })
+  return { root, home, cwd, cursorDir, dataDir }
+}
+
 // Thin boolean adapter over the shared bounded-retry helper: Windows reports
 // EPERM/EBUSY while a just-closed handle drains, which removeTempDir absorbs
 // within a hard bound. The boolean keeps the call sites' assertions intact.
@@ -255,6 +298,22 @@ test('a jcode backend is constructed through the jcode factory, never OpenCode',
   await expect(result).resolves.toBe(sentinel)
 })
 
+test('two harness instances get distinct temp roots', async () => {
+  const first = createSeamRoots()
+  const second = createSeamRoots()
+  try {
+    // Isolation is the claim: two instances in one process never share a root.
+    expect(first.root).not.toBe(second.root)
+    expect(fs.existsSync(first.root)).toBe(true)
+    expect(fs.existsSync(second.root)).toBe(true)
+    expect(fs.existsSync(first.home)).toBe(true)
+    expect(fs.existsSync(second.home)).toBe(true)
+  } finally {
+    expect(await removeTree(first.root)).toBe(true)
+    expect(await removeTree(second.root)).toBe(true)
+  }
+})
+
 test('a missing binary is a named error, never a fallback to OpenCode', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-bot-backend-missing-'))
   try {
@@ -287,20 +346,17 @@ describe.skipIf(jcodeBinary === null)(`jcode bot seam over a real session${skipR
   let settled: SettledStore
 
   beforeAll(async () => {
-    // One bounded root, reused and re-cleaned: a jcode daemon can hold a lock on
-    // its own home for a while after `jcode run` exits, so a fresh mkdtemp per
-    // run would leak a locked directory every time. Reuse keeps the leftover at
-    // most one path, and it is reported if it still cannot be removed.
-    root = path.join(os.tmpdir(), 'kimaki-bot-backend-seam')
-    await removeTree(root)
-    fs.mkdirSync(root, { recursive: true })
-    home = path.join(root, 'home')
-    cwd = path.join(root, 'cwd')
-    cursorDir = path.join(root, 'cursor')
-    dataDir = path.join(root, 'data')
-    fs.mkdirSync(home, { recursive: true })
-    fs.mkdirSync(cwd, { recursive: true })
-    fs.mkdirSync(cursorDir, { recursive: true })
+    // A unique root per run. The old fixed path let two concurrent runs share a
+    // home, so one run's `jcode run` saw the other's lock and failed in
+    // `beforeAll` with `Unsupported OpenAI model 'mock-model'`. A leaked locked
+    // directory is the accepted cost; the sweep reaps it once it is an hour old.
+    sweepStaleSeamRoots()
+    const roots = createSeamRoots()
+    root = roots.root
+    home = roots.home
+    cwd = roots.cwd
+    cursorDir = roots.cursorDir
+    dataDir = roots.dataDir
     mock = await startMockProvider()
     const run = await runJcodeTurn({ binary, home, cwd, url: mock.url })
     expect(run.code, `jcode run stderr: ${run.stderr}`).toBe(0)
@@ -478,13 +534,19 @@ test('an approval handler sees the payload and its answer reaches the agent exac
 })
 test('without an approval handler no ACP child starts and the projection is unchanged', async () => {
   let factoryCalls = 0; const events: string[] = []
+  // Per-instance home: a shared fixed path lets a concurrent run collide here.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-seam-no-approval-'))
   const connection = await createJcodeBotBackend({
-    binary: process.execPath, probe: async () => undefined, home: path.join(os.tmpdir(), 'kimaki-seam-no-approval'), sessionId: 'session_plain', intervalMs: 25,
+    binary: process.execPath, probe: async () => undefined, home, sessionId: 'session_plain', intervalMs: 25,
     readFile: async () => JSON.stringify({ id: 'session_plain', messages: [{ id: 'm1', role: 'assistant', content: [{ type: 'text', text: 'ok' }], timestamp: '2026-01-01T00:00:00.000Z' }] }), onEvent: (event) => events.push(event.type),
     createApprovalClient: (options) => { factoryCalls += 1; return createAcpClient(options) },
   })
-  if (connection instanceof Error) throw connection
-  expect([factoryCalls, Object.hasOwn(connection, 'approvals'), events]).toEqual([0, false, ['session.text.ended', 'session.execution.succeeded']]); connection.stop()
+  try {
+    if (connection instanceof Error) throw connection
+    expect([factoryCalls, Object.hasOwn(connection, 'approvals'), events]).toEqual([0, false, ['session.text.ended', 'session.execution.succeeded']]); connection.stop()
+  } finally {
+    if (!(await removeTree(home))) process.stderr.write(`jcode seam test: could not remove ${home}\n`)
+  }
 })
 test('a handler that throws fails closed with one refusal, not a stalled agent', async () => {
   const run = await buildApprovalSeam(() => { throw new Error('policy exploded') })
