@@ -71,6 +71,27 @@ export const ops_worker_sync_back = s.sqliteTable('ops_worker_sync_back', {
   s.index('ops_worker_sync_back_state').on(table.state, table.created_at),
 ])
 
+// AC16 (first half): the durable Paperclip launcher fence. One row per
+// (instance_id, run_id); the UNIQUE index is the cross-process exclusion
+// primitive, so two independent processes cannot both hold one claim. Metadata
+// only: it grants no dispatch, cancellation or remote write authority.
+export const ops_paperclip_launch_fence = s.sqliteTable('ops_paperclip_launch_fence', {
+  instance_id: s.text('instance_id').notNull(),
+  run_id: s.text('run_id').notNull(),
+  state: s.text('state', { enum: ['claimed', 'released'] }).notNull(),
+  launcher: s.text('launcher').notNull(),
+  generation: s.integer('generation', { mode: 'number' }).notNull(),
+  claim_seq: s.integer('claim_seq', { mode: 'number' }).notNull(),
+  acquired_at: s.text('acquired_at').notNull(),
+  heartbeat_at: s.text('heartbeat_at').notNull(),
+  expires_at: s.text('expires_at').notNull(),
+  digest: s.text('digest').notNull(),
+  updated_at: s.integer('updated_at', { mode: 'number' }).notNull(),
+}, (table) => [
+  // One claim per run. A second launcher that read "no claim" loses on insert.
+  s.uniqueIndex('ops_paperclip_launch_fence_run').on(table.instance_id, table.run_id),
+])
+
 export const thread_sessions = s.sqliteTable('thread_sessions', {
   thread_id: s.text('thread_id').primaryKey().notNull(),
   session_id: s.text('session_id').notNull(),
@@ -218,6 +239,7 @@ export const session_sleeps = s.sqliteTable('session_sleeps', {
 export const relations = defineRelations({
   ops_surface_bindings,
   ops_worker_sync_back,
+  ops_paperclip_launch_fence,
   thread_sessions,
   bot_tokens,
   bot_api_keys,
@@ -236,6 +258,7 @@ export const relations = defineRelations({
 }, (r) => ({
   ops_surface_bindings: {},
   ops_worker_sync_back: {},
+  ops_paperclip_launch_fence: {},
   thread_sessions: {
     scheduled_tasks: r.many.scheduled_tasks(),
   },

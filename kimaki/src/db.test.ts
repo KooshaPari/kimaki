@@ -130,6 +130,7 @@ test('fresh install gets kimaki.db with the kimaki tables; subcommands never cre
       "channel_worktrees",
       "global_models",
       "guild_categories",
+      "ops_paperclip_launch_fence",
       "ops_surface_bindings",
       "ops_worker_sync_back",
       "scheduled_tasks",
