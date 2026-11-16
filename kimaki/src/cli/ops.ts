@@ -27,6 +27,16 @@ function approvalDecision(value: string | undefined): 'accept' | 'acceptForSessi
   return fail(new ConfigError({ reason: '--approval must be accept, acceptForSession, decline or cancel' }))
 }
 
+// The observer refuses an unknown profile before publication, so the follow
+// notice can forward the same id without re-validating it here. Keeping this
+// pure makes the CLI wiring unit-testable without spawning the full command.
+export function followNoticeInput(profile: string | undefined) {
+  return {
+    backend: 'jcode' as const,
+    ...(profile === undefined ? {} : { profile: profile as 'jcode' | 'kcode' }),
+  }
+}
+
 export function registerOpsCommands(cli: Goke) {
   cli.command('ops codex turn', 'Run one explicit Codex app-server turn and stream text deltas')
     .option('--binary <path>', 'Explicit Codex executable')
@@ -158,12 +168,9 @@ export function registerOpsCommands(cli: Goke) {
             // Only a rename justifies a notice. Appends stay counted, not published.
             if (event.type !== 'session.renamed') { counts.ignored++; return }
             pending = (async () => {
-              // The observer refuses an unknown profile before this runs; pass the
-              // same id so the notice label matches the runtime that served the session.
-              const result = await publishMetadataNotice({
-                rest, target, grant, backend: 'jcode',
-                ...(options.profile === undefined ? {} : { profile: options.profile as 'jcode' | 'kcode' }),
-              })
+              // The observer refuses an unknown profile before this runs; the helper keeps
+              // the notice label aligned with the profile that served the session.
+              const result = await publishMetadataNotice({ rest, target, grant, ...followNoticeInput(options.profile) })
               if (result instanceof Error) throw result
               counts[result.kind]++
             })()
