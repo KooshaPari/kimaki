@@ -20,7 +20,62 @@ export type JcodeObservationHealth = 'consistent' | 'transient'
 // record from one that is still being written.
 const CONFIRM_DELAYS_MS = [1, 2, 4] as const
 
+// Exported so an observer can report the latency its consistency rule adds.
+export const JCODE_CONSISTENCY_CONFIRM_DELAYS_MS: readonly number[] = CONFIRM_DELAYS_MS
+
+// Why a record read was not trustworthy. `unstable` means the two reads
+// differed (a write was in flight), `unparsable` means the bytes were not a
+// complete JSON object, and `mismatch` means the parsed record was a different
+// session. None of them means the session is absent.
+export type JcodeTransientReason = 'unstable' | 'unparsable' | 'mismatch'
+
+export type JcodeRecordRead<T> =
+  | { health: 'consistent'; value: T }
+  | { health: 'transient'; reason: JcodeTransientReason }
+  | { health: 'missing' }
+
 const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
+
+// The one consistency rule every reader of a Jcode session record uses: two
+// reads separated by a bounded backoff must agree byte for byte, parse
+// completely, and name the requested record. Anything else is `transient` (or
+// `missing` when the file never appeared), so a torn record can never surface
+// as a session, a title, or a partial turn.
+export async function readConsistentRecord<T>({ file, readFile, parse, accept, confirmDelaysMs = CONFIRM_DELAYS_MS }: {
+  file: string
+  readFile: (path: string) => Promise<string>
+  parse: (raw: string) => T | undefined
+  accept?: (value: T) => boolean
+  confirmDelaysMs?: readonly number[]
+}): Promise<JcodeRecordRead<T>> {
+  let last: 'missing' | JcodeTransientReason = 'missing'
+  for (const backoff of confirmDelaysMs) {
+    const first = await readFile(file).catch(() => undefined)
+    if (first === undefined) continue
+    await wait(backoff)
+    const second = await readFile(file).catch(() => undefined)
+    if (second === undefined) {
+      last = 'missing'
+      continue
+    }
+    if (second !== first) {
+      last = 'unstable'
+      continue
+    }
+    const value = parse(first)
+    if (value === undefined) {
+      last = 'unparsable'
+      continue
+    }
+    if (accept && !accept(value)) {
+      last = 'mismatch'
+      continue
+    }
+    return { health: 'consistent', value }
+  }
+  if (last === 'missing') return { health: 'missing' }
+  return { health: 'transient', reason: last }
+}
 
 export type JcodeObservedEvent =
   | { schemaVersion: 1; key: SessionKey; seq: number; type: 'session.renamed'; title: string | null }
@@ -106,7 +161,11 @@ export function createJcodeObserver({ jcodeHome, store, profile: requestedProfil
       return undefined
     }
     if (!record(value) || typeof value.id !== 'string' || !value.id.trim()) return undefined
-    const title = typeof value.title === 'string' && value.title.trim() ? value.title : null
+    // `jcode session rename` writes `custom_title` and leaves the first prompt in
+    // `title`, so the human title must win: reading only `title` made every real
+    // rename invisible.
+    const custom = typeof value.custom_title === 'string' && value.custom_title.trim() ? value.custom_title : null
+    const title = custom ?? (typeof value.title === 'string' && value.title.trim() ? value.title : null)
     const updatedAt = typeof value.updated_at === 'string' && value.updated_at.trim() ? value.updated_at : null
     const messageCount = Array.isArray(value.messages) ? value.messages.length : 0
     return { id: value.id, title, updatedAt, messageCount }
@@ -114,40 +173,20 @@ export function createJcodeObserver({ jcodeHome, store, profile: requestedProfil
 
   const keyFor = (nativeSessionId: string): SessionKey => ({ hostId, endpointId, backendKind: 'jcode' as const, nativeSessionId })
 
-  // Read a record only when it is provably settled. A single read can land in
-  // the middle of an append or a replacement, so a candidate is accepted only
-  // when a second read after a bounded backoff returns identical bytes, those
-  // bytes parse completely, and the parsed id is the requested session. Any
-  // other outcome is `transient` (or `missing` if the file never appeared), so a
-  // torn record can never surface as a session, a key or a truncated title.
+  // Read a record only when it is provably settled, via the shared consistency
+  // rule: two reads separated by a bounded backoff must agree and parse to the
+  // requested session id. Anything else is transient (or missing), so a torn
+  // record never surfaces as a session, a key or a truncated title.
   const readConsistent = async (nativeSessionId: string): Promise<ConsistentRead> => {
-    let last: 'missing' | 'unstable' | 'unparsable' | 'mismatch' = 'missing'
-    for (const backoff of CONFIRM_DELAYS_MS) {
-      const first = await readFile(fileFor(nativeSessionId)).catch(() => undefined)
-      if (first === undefined) continue
-      await wait(backoff)
-      const second = await readFile(fileFor(nativeSessionId)).catch(() => undefined)
-      if (second === undefined) {
-        last = 'missing'
-        continue
-      }
-      if (second !== first) {
-        last = 'unstable'
-        continue
-      }
-      const session = parse(first)
-      if (!session) {
-        last = 'unparsable'
-        continue
-      }
-      if (session.id !== nativeSessionId) {
-        last = 'mismatch'
-        continue
-      }
-      return { health: 'consistent', session }
-    }
-    if (last === 'missing') return { health: 'missing' }
-    return { health: 'transient', reason: last }
+    const read = await readConsistentRecord<NativeSession>({
+      file: fileFor(nativeSessionId),
+      readFile,
+      parse,
+      accept: (session) => session.id === nativeSessionId,
+    })
+    if (read.health === 'consistent') return { health: 'consistent', session: read.value }
+    if (read.health === 'missing') return { health: 'missing' }
+    return { health: 'transient', reason: read.reason }
   }
 
   return {
