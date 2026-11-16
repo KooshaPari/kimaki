@@ -7,6 +7,7 @@ import { afterAll, beforeAll, expect, test } from 'vitest'
 import type { BotHandle } from './main.ts'
 import { TEST_USER_ID, seedProjectChannel, startOpencodeTestServer, startTestBot, startTwin, tempDataDir, waitFor, waitForFooter, warmUp, toolParts, textParts, type OpencodeTestServer, type TestTwin } from './test/harness.ts'
 import { send, shell } from './prompt.ts'
+import { removeTempDir } from './test/cleanup.ts'
 
 const exec = promisify(execFile)
 const dataDir = tempDataDir()
@@ -23,12 +24,6 @@ function writeUploadScript() {
   fs.writeFileSync(file, windows ? `@echo off\r\n${command}\r\n` : `#!/bin/sh\n${command}\n`)
 }
 
-// Windows keeps the bot's sqlite file open until the test process exits, so the
-// removal can fail after a passing run: retry briefly, then warn instead of failing.
-function removeTempDir(directory: string) {
-  try { fs.rmSync(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }) }
-  catch (cause) { console.warn(`could not remove ${directory}`, cause) }
-}
 let server: OpencodeTestServer
 let twin: TestTwin
 let bot: BotHandle
@@ -51,9 +46,7 @@ beforeAll(async () => {
 afterAll(async () => {
   await bot?.stop()
   await Promise.all([server?.stop(), twin?.stop()])
-  // A Windows temp dir can stay locked for a moment after the bot closes: rmSync
-  // retries EPERM/EBUSY with these options.
-  removeTempDir(dataDir)
+  await removeTempDir(dataDir)
 })
 async function start(prompt: string) {
   const result = await send(bot, { channelId: twin.channelId, prompt })

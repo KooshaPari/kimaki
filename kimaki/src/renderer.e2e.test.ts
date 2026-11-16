@@ -8,6 +8,7 @@ import type { DeterministicMatcher } from 'opencode-deterministic-provider'
 import { afterAll, beforeAll, expect, test } from 'vitest'
 
 import type { BotHandle } from './main.ts'
+import { removeTempDir } from './test/cleanup.ts'
 import {
   TEST_USER_ID,
   scriptedTurn,
@@ -139,7 +140,7 @@ afterAll(async () => {
   await bot?.stop()
   await twin?.stop()
   await server?.stop()
-  fs.rmSync(dataDir, { recursive: true, force: true })
+  await removeTempDir(dataDir)
 })
 
 async function runTurn({ channelId, content }: { channelId: string; content: string }) {

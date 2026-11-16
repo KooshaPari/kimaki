@@ -19,13 +19,13 @@ const REMOVAL_MAX_RETRIES = 10
 const REMOVAL_ROUND_PAUSE_MS = 500
 const RETRYABLE_CODES = new Set(['EBUSY', 'EPERM', 'ENOTEMPTY'])
 
-// Removes a per-test data directory, retrying while the OS still holds it.
-// Unlike removeTempDirs this never swallows a failure: after the bound is spent
-// the error propagates, so teardown problems stay visible.
-export async function removeDataDir(dir: string): Promise<void> {
+// Removes a temp path, retrying while the OS still holds it. Unlike
+// removeTempDirs this never swallows a failure: after the bound is spent the
+// error propagates, so teardown problems stay visible.
+export async function removeTempDir(target: string): Promise<void> {
   for (let round = 1; round <= REMOVAL_ROUNDS; round++) {
     try {
-      await rm(dir, {
+      await rm(target, {
         recursive: true,
         force: true,
         maxRetries: REMOVAL_MAX_RETRIES,
@@ -39,6 +39,11 @@ export async function removeDataDir(dir: string): Promise<void> {
       await new Promise((resolve) => setTimeout(resolve, REMOVAL_ROUND_PAUSE_MS * round))
     }
   }
+}
+
+// Removes a per-test data directory under the same bound.
+export async function removeDataDir(dir: string): Promise<void> {
+  await removeTempDir(dir)
 }
 
 // Cleanup must not fail an otherwise passing test, so retry and, if the OS

@@ -3,7 +3,6 @@
 // now and Delete buttons. Time is a manual clock.
 
 import { execFile } from 'node:child_process'
-import fs from 'node:fs'
 import path from 'node:path'
 import { promisify } from 'node:util'
 import { ComponentType, type APIMessage } from 'discord.js'
@@ -13,6 +12,7 @@ import { afterAll, beforeAll, expect, test } from 'vitest'
 import type { BotHandle } from './main.ts'
 import * as schema from './schema.ts'
 import { abort } from './prompt.ts'
+import { removeTempDir } from './test/cleanup.ts'
 import {
   TEST_USER_ID,
   manualClock,
@@ -54,7 +54,7 @@ beforeAll(async () => {
 afterAll(async () => {
   await bot?.stop()
   await Promise.all([server?.stop(), twin?.stop()])
-  fs.rmSync(dataDir, { recursive: true, force: true })
+  await removeTempDir(dataDir)
 })
 
 test('runs do not overlap by default; --allow-concurrency starts another session', async () => {

@@ -8,6 +8,7 @@ import type { DeterministicMatcher } from 'opencode-deterministic-provider'
 import { afterAll, beforeAll, expect, test } from 'vitest'
 
 import type { BotHandle } from './main.ts'
+import { removeTempDir } from './test/cleanup.ts'
 import {
   TEST_USER_ID,
   seedProjectChannel,
@@ -41,10 +42,7 @@ afterAll(async () => {
   await bot?.stop()
   await twin?.stop()
   await server?.stop()
-  // A Windows temp dir can stay locked for a moment after the bot closes: rmSync
-  // retries EPERM/EBUSY with these options.
-  try { fs.rmSync(dataDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }) }
-  catch (cause) { console.warn(`could not remove ${dataDir}`, cause) }
+  await removeTempDir(dataDir)
 })
 
 async function registeredNames() {

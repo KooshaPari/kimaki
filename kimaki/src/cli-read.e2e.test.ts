@@ -6,6 +6,7 @@ import { afterAll, beforeAll, expect, test } from 'vitest'
 import type { BotHandle } from './main.ts'
 import { scriptedTurn, seedProjectChannel, startOpencodeTestServer, startTestBot, startTwin, tempDataDir, waitForFooter, waitForSelectMenu, warmUp, type OpencodeTestServer, type TestTwin } from './test/harness.ts'
 import { abort, send } from './prompt.ts'
+import { removeTempDir } from './test/cleanup.ts'
 
 const exec = promisify(execFile)
 const dataDir = tempDataDir()
@@ -21,7 +22,7 @@ beforeAll(async () => {
 afterAll(async () => {
   await bot?.stop()
   await Promise.all([server?.stop(), twin?.stop()])
-  fs.rmSync(dataDir, { recursive: true, force: true })
+  await removeTempDir(dataDir)
 })
 function cli(args: string[]) {
   return exec(process.execPath, ['--import', 'tsx', path.resolve('src/cli.ts'), ...args, '--data-dir', dataDir], {

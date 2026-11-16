@@ -2,12 +2,12 @@
 // one-shot, cron, thread and pre-run routines against the twin and a real
 // OpenCode server. Time is a manual clock; nothing waits for real time.
 
-import fs from 'node:fs'
 import { git } from './worktrees.ts'
 import { afterAll, beforeAll, expect, test } from 'vitest'
 
 import type { BotHandle } from './main.ts'
 import { send } from './prompt.ts'
+import { removeTempDir } from './test/cleanup.ts'
 import {
   manualClock,
   schedulingKit,
@@ -49,7 +49,7 @@ beforeAll(async () => {
 afterAll(async () => {
   await bot?.stop()
   await Promise.all([server?.stop(), twin?.stop()])
-  fs.rmSync(dataDir, { recursive: true, force: true })
+  await removeTempDir(dataDir)
 })
 
 test('a one-shot routine starts a thread at its time, then is gone', async () => {

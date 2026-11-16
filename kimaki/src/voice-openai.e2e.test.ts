@@ -12,6 +12,7 @@ import type { DeterministicMatcher } from 'opencode-deterministic-provider'
 import { afterAll, beforeAll, expect, onTestFinished, test } from 'vitest'
 
 import type { BotHandle } from './main.ts'
+import { removeTempDir } from './test/cleanup.ts'
 import {
   TEST_USER_ID,
   seedProjectChannel,
@@ -84,7 +85,7 @@ afterAll(async () => {
   await chatgpt?.stop()
   await whisper?.stop()
   await releaseLibsqlHandles()
-  fs.rmSync(dataDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
+  await removeTempDir(dataDir)
 }, 120_000)
 
 const ogg = fs.readFileSync(path.join(import.meta.dirname, 'fixtures', 'voice.ogg'))

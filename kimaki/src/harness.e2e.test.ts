@@ -12,6 +12,7 @@ import { afterAll, beforeAll, expect, onTestFinished, test } from 'vitest'
 
 import { startLockServer } from './lock-server.ts'
 import type { BotHandle } from './main.ts'
+import { removeTempDir } from './test/cleanup.ts'
 import {
   startOpencodeTestServer,
   freePort,
@@ -25,13 +26,6 @@ import {
   type OpencodeTestServer,
   type TestTwin,
 } from './test/harness.ts'
-
-// Windows keeps the bot's sqlite file open until the test process exits, so the
-// removal can fail after a passing run: retry briefly, then warn instead of failing.
-function removeTempDir(directory: string) {
-  try { fs.rmSync(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }) }
-  catch (cause) { console.warn(`could not remove ${directory}`, cause) }
-}
 
 let server: OpencodeTestServer
 let twin: TestTwin
@@ -48,9 +42,7 @@ afterAll(async () => {
   await bot?.stop()
   await twin?.stop()
   await server?.stop()
-  // A Windows temp dir can stay locked for a moment after the bot, its shim
-  // child and libsql close: rmSync retries EPERM/EBUSY with these options.
-  removeTempDir(dataDir)
+  await removeTempDir(dataDir)
 })
 
 test('bot answers /health and reaches the OpenCode service', async () => {
@@ -120,7 +112,7 @@ test('a second bot on the same lock port stops the running one and takes over', 
   onTestFinished(async () => {
     if (child.exitCode === null && child.signalCode === null) { child.kill('SIGTERM'); await exited }
     await replacement?.stop()
-    removeTempDir(otherData)
+    await removeTempDir(otherData)
   })
   const ready = new Promise<void>((resolve, reject) => { child.once('message', () => resolve()); child.once('error', reject); child.once('exit', () => reject(new Error(`Old bot exited before ready: ${childStderr.trim()}`))) })
   await ready

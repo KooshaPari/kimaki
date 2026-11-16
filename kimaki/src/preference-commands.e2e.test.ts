@@ -2,7 +2,6 @@
 // switch the session in OpenCode (next step); in a channel they set the
 // default for new sessions.
 
-import fs from 'node:fs'
 import type { DeterministicMatcher } from 'opencode-deterministic-provider'
 import * as orm from 'drizzle-orm'
 import { ComponentType } from 'discord-api-types/v10'
@@ -11,6 +10,7 @@ import { afterAll, beforeAll, expect, onTestFinished, test } from 'vitest'
 import type { BotHandle } from './main.ts'
 import { send } from './prompt.ts'
 import * as schema from './schema.ts'
+import { removeDataDir } from './test/cleanup.ts'
 import {
   TEST_USER_ID,
   scriptedTurn,
@@ -68,13 +68,6 @@ afterAll(async () => {
   await server?.stop()
   await removeDataDir(dataDir)
 })
-
-// A child process or a SQLite handle can still be closing when teardown runs, so
-// the removal is retried (Windows reports the race as EPERM/EBUSY). The retries are
-// bounded: when the directory is really stuck the error still fails the file.
-async function removeDataDir(directory: string) {
-  await fs.promises.rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
-}
 
 async function newThread(channelId: string, content: string) {
   const { discord } = twin

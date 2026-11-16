@@ -4,9 +4,10 @@ import path from 'node:path'
 import { afterEach, expect, test } from 'vitest'
 
 import { createWorktree, deleteWorktree, git, listWorktrees, mergeWorktree, resolveWorkingDirectory } from './worktrees.ts'
+import { removeTempDir } from './test/cleanup.ts'
 
 const roots: string[] = []
-afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }) })
+afterEach(async () => { for (const root of roots.splice(0)) await removeTempDir(root) })
 
 async function repo() {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-worktrees-')))

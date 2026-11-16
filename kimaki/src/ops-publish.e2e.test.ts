@@ -10,6 +10,7 @@ import { ChannelType, REST } from 'discord.js'
 import { DigitalDiscord } from 'discord-digital-twin/src'
 import { publishObservedMetadata } from './ops/discord/publication.ts'
 import type { OpenCodeObservedEvent } from './ops/runtime/opencode.ts'
+import { removeTempDir } from './test/cleanup.ts'
 
 const exec = promisify(execFile)
 const key = { hostId: 'host', endpointId: 'endpoint', backendKind: 'opencode', nativeSessionId: 'session' }
@@ -30,7 +31,7 @@ beforeAll(async () => {
 }, 30_000)
 afterAll(async () => {
   await discord?.stop()
-  if (dir) fs.rmSync(dir, { recursive: true, force: true })
+  if (dir) await removeTempDir(dir)
 })
 function cli(args: string[]) {
   return exec(process.execPath, ['--import', 'tsx', path.resolve('src/cli.ts'), 'ops', 'publish', ...args], {

@@ -13,6 +13,7 @@ import { afterEach, expect, test } from 'vitest'
 import { openDb, verbosityFromV1, verbosityToV1 } from './db.ts'
 import { DbError } from './errors.ts'
 import { LEGACY_DB_FILE } from './migrations.ts'
+import { removeTempDir } from './test/cleanup.ts'
 
 const tempDirs: string[] = []
 
@@ -28,7 +29,7 @@ afterEach(async () => {
   await new Promise((resolve) => setTimeout(resolve, 50))
   global.gc?.()
   for (const dir of tempDirs.splice(0)) {
-    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+    await removeTempDir(dir)
   }
 })
 

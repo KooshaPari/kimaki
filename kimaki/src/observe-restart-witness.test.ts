@@ -26,6 +26,7 @@ import { setTimeout as sleep } from 'node:timers/promises'
 import { afterAll, beforeAll, expect, test } from 'vitest'
 
 import { createJcodeObserver } from './ops/runtime/jcode.ts'
+import { removeTempDir } from './test/cleanup.ts'
 import {
   freePort,
   startOpencodeTestServer,
@@ -288,7 +289,7 @@ afterAll(async () => {
   await twin?.stop()
   await server?.stop()
   if (dataDir) {
-    fs.rmSync(dataDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
+    await removeTempDir(dataDir)
     expect(fs.existsSync(dataDir), `the witness left ${dataDir} behind`).toBe(false)
   }
 })

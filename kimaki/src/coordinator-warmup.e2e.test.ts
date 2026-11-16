@@ -7,6 +7,7 @@ import path from 'node:path'
 import { afterAll, beforeAll, expect, test } from 'vitest'
 
 import type { BotHandle } from './main.ts'
+import { removeTempDir } from './test/cleanup.ts'
 import {
   TEST_MODEL,
   TEST_USER_ID,
@@ -111,12 +112,7 @@ afterAll(async () => {
   await bot?.stop()
   await twin?.stop()
   await server?.stop()
-  // A child may still hold the temp dir for a moment on Windows.
-  try {
-    fs.rmSync(dataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 })
-  } catch {
-    // Best effort: the OS cleans its temp dir.
-  }
+  await removeTempDir(dataDir)
 }, 60_000)
 
 // Keep-alive requests of a session, from the test plugin.

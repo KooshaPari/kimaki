@@ -8,6 +8,7 @@ import { afterAll, beforeAll, expect, test } from 'vitest'
 
 import type { BotHandle } from './main.ts'
 import { send } from './prompt.ts'
+import { removeTempDir } from './test/cleanup.ts'
 import { readSessionMarkdown } from './session-events.ts'
 import {
   TEST_USER_ID,
@@ -187,12 +188,7 @@ afterAll(async () => {
   await bot?.stop()
   await twin?.stop()
   await server?.stop()
-  // A child may still hold the temp dir for a moment on Windows.
-  try {
-    fs.rmSync(dataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 })
-  } catch {
-    // Best effort: the OS cleans its temp dir.
-  }
+  await removeTempDir(dataDir)
 })
 
 test('channel messages go to one session that replies in the channel', async () => {

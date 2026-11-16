@@ -3,12 +3,12 @@
 // are transcribed by Gemini (a local fake here, same HTTP API) with a tool
 // call that also picks the route: steer, queue, btw or new-session.
 
-import fs from 'node:fs'
 import path from 'node:path'
 import type { DeterministicMatcher } from 'opencode-deterministic-provider'
 import { afterAll, beforeAll, expect, test } from 'vitest'
 
 import type { BotHandle } from './main.ts'
+import { removeDataDir } from './test/cleanup.ts'
 import { TRANSCRIPTION_KEY_MODAL } from './voice.ts'
 import {
   TEST_USER_ID,
@@ -95,13 +95,6 @@ afterAll(async () => {
   await gemini?.stop()
   await removeDataDir(dataDir)
 })
-
-// A child process or a SQLite handle can still be closing when teardown runs, so
-// the removal is retried (Windows reports the race as EPERM/EBUSY). The retries are
-// bounded: when the directory is really stuck the error still fails the file.
-async function removeDataDir(directory: string) {
-  await fs.promises.rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
-}
 
 async function newThread(send: () => Promise<unknown>) {
   const { discord, channelId } = twin

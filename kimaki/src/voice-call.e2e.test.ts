@@ -13,6 +13,7 @@ import { afterAll, beforeAll, expect, test } from 'vitest'
 
 import type { BotHandle } from './main.ts'
 import { ensureVoiceChannels, saveVoiceCallVoice, voiceCallSettings } from './voice-call.ts'
+import { removeDataDir } from './test/cleanup.ts'
 import {
   TEST_USER_ID,
   seedProjectChannel,
@@ -91,13 +92,6 @@ afterAll(async () => {
   await live?.stop()
   await removeDataDir(dataDir)
 })
-
-// A child process or a SQLite handle can still be closing when teardown runs, so
-// the removal is retried (Windows reports the race as EPERM/EBUSY). The retries are
-// bounded: when the directory is really stuck the error still fails the file.
-async function removeDataDir(directory: string) {
-  await fs.promises.rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
-}
 
 // The voice shell tool spawns `/bin/sh -c`, a path Windows does not resolve
 // (`spawn /bin/sh ENOENT`), so the two tests whose scripted turns run shell commands

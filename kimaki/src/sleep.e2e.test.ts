@@ -10,6 +10,7 @@ import type { DeterministicMatcher } from 'opencode-deterministic-provider'
 import { afterAll, beforeAll, expect, test } from 'vitest'
 
 import type { BotHandle } from './main.ts'
+import { removeTempDir } from './test/cleanup.ts'
 import {
   TEST_USER_ID,
   manualClock,
@@ -42,13 +43,6 @@ function writeSleepScript() {
   const command = 'kimaki sleep --duration 30m --reason "waiting for the deploy"'
   const file = path.join(server.projectDirectory, windows ? 'sleep-30m.cmd' : 'sleep-30m.sh')
   fs.writeFileSync(file, windows ? `@echo off\r\n${command}\r\n` : `#!/bin/sh\n${command}\n`)
-}
-
-// Windows keeps the bot's sqlite file open until the test process exits, so the
-// removal can fail after a passing run: retry briefly, then warn instead of failing.
-function removeTempDir(directory: string) {
-  try { fs.rmSync(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }) }
-  catch (cause) { console.warn(`could not remove ${directory}`, cause) }
 }
 
 function sleepTurn({ marker, command }: { marker: string; command: string }): DeterministicMatcher[] {
@@ -88,9 +82,7 @@ beforeAll(async () => {
 afterAll(async () => {
   await bot?.stop()
   await Promise.all([server?.stop(), twin?.stop()])
-  // A Windows temp dir can stay locked for a moment after the bot, its shim
-  // child and libsql close: rmSync retries EPERM/EBUSY with these options.
-  removeTempDir(dataDir)
+  await removeTempDir(dataDir)
 })
 
 async function start(prompt: string) {

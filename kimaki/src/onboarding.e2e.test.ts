@@ -15,6 +15,7 @@ import type { BotHandle } from './main.ts'
 import { shellQuote } from './lock-server.ts'
 import { runOnboarding } from './onboarding.ts'
 import { readSessionMarkdown } from './session-events.ts'
+import { removeDataDir } from './test/cleanup.ts'
 import {
   TEST_USER_ID,
   isFooter,
@@ -97,13 +98,6 @@ afterAll(async () => {
   await server?.stop()
   await removeDataDir(dataDir)
 }, 300_000)
-
-// A child process or a SQLite handle can still be closing when teardown runs, so
-// the removal is retried (Windows reports the race as EPERM/EBUSY). The retries are
-// bounded: when the directory is really stuck the error still fails the file.
-async function removeDataDir(directory: string) {
-  await fs.promises.rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
-}
 
 // `waitForFooter` clamps every wait to 8-10s, which fits a quiet Linux runner but not
 // a turn that shells out to the real `kimaki` CLI: that child starts node plus the tsx

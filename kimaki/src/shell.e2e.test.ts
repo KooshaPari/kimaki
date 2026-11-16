@@ -8,6 +8,7 @@ import type { DeterministicMatcher } from 'opencode-deterministic-provider'
 import { afterAll, beforeAll, expect, test } from 'vitest'
 
 import type { BotHandle } from './main.ts'
+import { removeTempDir } from './test/cleanup.ts'
 import {
   TEST_USER_ID,
   seedProjectChannel,
@@ -60,13 +61,6 @@ function writeExitScript() {
   fs.writeFileSync(file, windows ? '@echo off\r\necho from-the-channel\r\nexit 3\r\n' : '#!/bin/sh\necho from-the-channel\nexit 3\n')
 }
 
-// Windows keeps the bot's sqlite file open until the test process exits, so the
-// removal can fail after a passing run: retry briefly, then warn instead of failing.
-function removeTempDir(directory: string) {
-  try { fs.rmSync(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }) }
-  catch (cause) { console.warn(`could not remove ${directory}`, cause) }
-}
-
 beforeAll(async () => {
   dataDir = tempDataDir()
   ;[server, twin] = await Promise.all([
@@ -88,7 +82,7 @@ afterAll(async () => {
   await bot?.stop()
   await twin?.stop()
   await server?.stop()
-  removeTempDir(dataDir)
+  await removeTempDir(dataDir)
 })
 
 async function newThread(content: string) {
