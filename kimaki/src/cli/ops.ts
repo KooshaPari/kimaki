@@ -1,11 +1,61 @@
 // Local operations inventory only. Lazy imports preserve normal CLI startup.
 import type { Goke } from 'goke'
-import { DATA_DIR_HELP, fail, openCliDb, printJson } from './shared.ts'
+import { DATA_DIR_HELP, dataDirOrDefault, fail, openCliDb, printJson } from './shared.ts'
 import { ConfigError } from '../errors.ts'
+import type { DurableLaunchFence } from '../ops/paperclip/launch-fence-durable.ts'
 
 function required(value: string | undefined, flag: string): string {
   if (!value?.trim()) fail(new ConfigError({ reason: `Supply --${flag} explicitly. These commands never infer session or tenant authority` }))
   return value
+}
+
+// A serve command that names a run takes the durable Paperclip claim *at
+// startup*, not at the first prompt: a second launcher for the same
+// (instance, run) is refused by name before it builds a hub or touches a
+// backend. The same fence is then handed to the hub so its own launch claims
+// idempotently under the same launcher.
+type ServeLaunchFence = {
+  launchFence: { fence: DurableLaunchFence; scope: { instanceId: string; runId: string }; launcher: string }
+  close: () => void
+}
+
+async function openServeLaunchFence({ runId, instance, dataDir }: {
+  runId: string | undefined
+  instance: string | undefined
+  dataDir: string | undefined
+}): Promise<ServeLaunchFence | ConfigError | undefined> {
+  if (runId === undefined) return undefined
+  const run = runId.trim()
+  if (run === '') return new ConfigError({ reason: '--run-id must not be blank' })
+  const instanceId = (instance ?? 'local').trim()
+  if (instanceId === '') return new ConfigError({ reason: '--instance must not be blank' })
+  const { dbPath } = await import('../db.ts')
+  const { openLaunchFenceStore } = await import('../ops/paperclip/launch-fence-store.ts')
+  const { createDurableLaunchFence } = await import('../ops/paperclip/launch-fence-durable.ts')
+  const storePath = dbPath({ dataDir: dataDirOrDefault(dataDir) })
+  const store = openLaunchFenceStore({ dbPath: storePath })
+  if (store instanceof ConfigError) return store
+  const fence = createDurableLaunchFence({ store })
+  if (fence instanceof ConfigError) {
+    store.close()
+    return fence
+  }
+  const scope = { instanceId, runId: run }
+  // The pid distinguishes two live launchers; the fence itself decides the winner.
+  const launcher = `kimaki-cli-serve:${process.pid}`
+  const claimed = fence.claim({ scope, launcher })
+  if (claimed instanceof ConfigError) {
+    store.close()
+    return claimed
+  }
+  const generation = claimed.record.generation
+  return {
+    launchFence: { fence, scope, launcher },
+    close: () => {
+      fence.release({ scope, launcher, generation })
+      store.close()
+    },
+  }
 }
 
 // A runtime profile decides which executable, store and environment a Jcode
@@ -515,6 +565,9 @@ export function registerOpsCommands(cli: Goke) {
     .option('--log <path>', 'Append-only JSONL event log; enables resume across restarts and takes a writer lease')
     .option('--timeout <ms>', 'Per-request ACP deadline in milliseconds')
     .option('--buffer <n>', 'In-memory replay buffer size in events (default: 500)')
+    .option('--data-dir <path>', DATA_DIR_HELP)
+    .option('--run-id <id>', 'Paperclip run ID for the durable launch fence; a second launcher for the same run is refused')
+    .option('--instance <id>', 'Paperclip instance ID for the launch fence (default: local)')
     .action(async (options) => {
       const cwd = required(options.cwd, 'cwd')
       const toolProfile = options.toolProfile ?? 'none'
@@ -526,18 +579,30 @@ export function registerOpsCommands(cli: Goke) {
       const model = options.model?.trim() ? options.model : undefined
       const buffer = options.buffer === undefined ? undefined : Number(options.buffer)
       if (buffer !== undefined && (!Number.isSafeInteger(buffer) || buffer < 1)) fail(new ConfigError({ reason: '--buffer must be a positive integer' }))
+      // The fence is taken before any hub or backend exists, so a refused claim
+      // exits here having spawned nothing.
+      const launch = await openServeLaunchFence({ runId: options.runId, instance: options.instance, dataDir: options.dataDir })
+      if (launch instanceof ConfigError) fail(launch)
       const { createJcodeBackend } = await import('../backend/jcode.ts')
       const { createSessionHub } = await import('../backend/hub.ts')
       const { startHubServer } = await import('../backend/hub-server.ts')
       const backend = createJcodeBackend({ binary: options.binary, profile: options.profile, cwd, model, toolProfile: toolProfile as 'none' | 'minimal' | 'full', timeoutMs })
-      const hub = createSessionHub({ backend, model, logFile: options.log, ...(buffer === undefined ? {} : { bufferLimit: buffer }) })
+      const hub = createSessionHub({
+        backend,
+        model,
+        logFile: options.log,
+        ...(buffer === undefined ? {} : { bufferLimit: buffer }),
+        ...(launch === undefined ? {} : { launchFence: launch.launchFence }),
+      })
       if (hub instanceof Error) {
         await backend.close()
+        launch?.close()
         fail(hub)
       }
       const server = await startHubServer({ hub, port, token: options.token })
       if (server instanceof Error) {
         await hub.close()
+        launch?.close()
         fail(server)
       }
       // One line so a supervising client can attach without guessing the port.
@@ -545,6 +610,7 @@ export function registerOpsCommands(cli: Goke) {
       const shutdown = async (): Promise<void> => {
         await server.close()
         await hub.close()
+        launch?.close()
         process.exit(0)
       }
       process.once('SIGINT', () => { void shutdown() })
