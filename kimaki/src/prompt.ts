@@ -125,7 +125,8 @@ export async function prompt(
 // files; it drops other files silently, and one file over 20 MB fails the
 // whole prompt (core/src/session/prompt.ts, session/runner/to-llm-message.ts).
 // Those go to the model as local paths instead.
-const OPENCODE_MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
+// The fork's own guard, set from the runtime's 20 MB prompt limit above.
+const JCODE_MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
 const INLINE_MEDIA_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.pdf'])
 
 // `attachments` keeps every file in the user's order, so "the second image" resolves.
@@ -135,7 +136,7 @@ async function splitPromptFiles(files: readonly PromptFile[]) {
   for (const file of files) {
     const local = promptFilePath(file)
     const stat = await fs.promises.stat(local).catch(() => null)
-    const tooBig = stat !== null && stat.size > OPENCODE_MAX_ATTACHMENT_BYTES
+    const tooBig = stat !== null && stat.size > JCODE_MAX_ATTACHMENT_BYTES
     if (!tooBig) attached.push({ uri: file.uri, name: file.name })
     // Text files count as not inline: the extension cannot tell text from binary.
     attachments.push({ name: file.name, path: local, inline: !tooBig && INLINE_MEDIA_EXTENSIONS.has(path.extname(file.name).toLowerCase()) })
