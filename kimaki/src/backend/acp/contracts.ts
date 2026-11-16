@@ -44,6 +44,46 @@ export type AcpClientOptions = {
   expectedIdentity?: string
   /** Profile id used in a refusal message; defaults to `expectedIdentity`. */
   identityLabel?: string
+  /**
+   * Holds agent-initiated approval requests (`session/request_permission`)
+   * instead of dropping them. ACP inverts the permission direction: the agent
+   * asks the client and waits. Without a handler the transport keeps its
+   * historical behaviour, drops the request, and the agent's own timeout decides.
+   * With one, the capability is declared and each request is surfaced here.
+   */
+  serverRequests?: { onRequest: AcpServerRequestHandler }
+}
+
+/**
+ * A server-initiated ACP request held for a caller-supplied handler. `params`
+ * is the frame payload exactly as received; `toolCall` and `options` are
+ * narrowed copies for convenience, never a reinterpretation of the payload.
+ */
+export type AcpServerRequest = {
+  requestId: number | string
+  method: string
+  sessionId: string
+  params: Record<string, unknown>
+  /** Tool call under review, when the agent names one. */
+  toolCall: Record<string, unknown> | null
+  /** Permission options the agent offered, when it sent any. */
+  options: Array<Record<string, unknown>>
+}
+
+/** Called once per held request. Answers are delivered with `answerServerRequest`. */
+export type AcpServerRequestHandler = (request: AcpServerRequest) => void
+
+/**
+ * One answer to a held request. Exactly one of `result` (a JSON-RPC result,
+ * e.g. `{ outcome: { outcome: 'selected', optionId } }`) or `error` is required.
+ * `sessionId` is optional and, when supplied, must belong to this connection and
+ * to the request being answered.
+ */
+export type AcpServerAnswerInput = {
+  requestId: number | string
+  result?: unknown
+  error?: { code: number; message: string }
+  sessionId?: string
 }
 
 export type AcpInitializeResult = {
@@ -121,6 +161,16 @@ export type AcpClient = {
     timeoutMs?: number
   }): Promise<AcpPromptResult | Error>
   cancel(input: { sessionId: string }): Promise<Error | undefined>
+  /**
+   * Server-initiated requests still waiting for an answer, oldest first. Empty
+   * when no `serverRequests` handler was supplied at construction.
+   */
+  pendingServerRequests(): AcpServerRequest[]
+  /**
+   * Answers one held request. The first answer wins: a repeated, unknown or
+   * foreign-session answer is refused by name instead of being forwarded.
+   */
+  answerServerRequest(input: AcpServerAnswerInput): { requestId: number | string } | Error
   close(): Promise<void>
 }
 

@@ -12,6 +12,7 @@
 import childProcess from 'node:child_process'
 import readline from 'node:readline'
 import { ConfigError } from '../../errors.ts'
+import { createApprovalChannel } from './approvals.ts'
 import type { AcpClient, AcpClientOptions, AcpFrame, AcpInitializeResult, AcpLoadResult, AcpPromptResult, CreateAcpClient } from './contracts.ts'
 
 const DEFAULT_TIMEOUT_MS = 30_000
@@ -91,6 +92,8 @@ export const createAcpClient: CreateAcpClient = (options: AcpClientOptions): Acp
   let active: { id: number; entry: Pending } | null = null
   /** Set from the initialize handshake; false until a peer declares it. */
   let retractionSurface = false
+  /** Sessions this connection opened or attached to; others are not ours to answer. */
+  const ownedSessions = new Set<string>()
 
   let child: childProcess.ChildProcess | null = null
   try {
@@ -107,6 +110,21 @@ export const createAcpClient: CreateAcpClient = (options: AcpClientOptions): Acp
   const stdout = child?.stdout
   const lines = stdout ? readline.createInterface({ input: stdout }) : null
   child?.stderr?.resume()
+
+  /** Approval transport; with no handler it drops inbound requests (approvals.ts). */
+  const approvals = createApprovalChannel({
+    ...(options.serverRequests ? { onRequest: options.serverRequests.onRequest } : {}),
+    send: (frame) => {
+      const stream = child?.stdin
+      if (!stream || exited) return false
+      try {
+        return writeFrame(stream, frame)
+      } catch {
+        return false
+      }
+    },
+    ownsSession: (sessionId) => ownedSessions.has(sessionId),
+  })
 
   const failAll = (error: Error) => {
     for (const [id, entry] of pending) {
@@ -214,12 +232,16 @@ export const createAcpClient: CreateAcpClient = (options: AcpClientOptions): Acp
       return
     }
     const rawId = frame.id
-    // Notifications (no id) and unknown methods are ignored by design.
+    // Notifications (no id) are ignored by design.
     if (typeof rawId !== 'number' && typeof rawId !== 'string') {
       if (frame.method === 'session/update') routeUpdate(record(frame.params) ?? undefined)
       return
     }
-    if (frame.method !== undefined) return
+    if (frame.method !== undefined) {
+      // Server-initiated request: hold it for the approval channel, never correlate it.
+      if (typeof frame.method === 'string') approvals.handle(rawId, frame.method, record(frame.params) ?? {})
+      return
+    }
     const key = typeof rawId === 'number' ? rawId : Number(rawId)
     if (!Number.isSafeInteger(key)) return
     const entry = pending.get(key)
@@ -270,7 +292,11 @@ export const createAcpClient: CreateAcpClient = (options: AcpClientOptions): Acp
 
   return {
     async initialize(): Promise<AcpInitializeResult | Error> {
-      const frame = await request('initialize', { protocolVersion: 1, clientCapabilities: {} }, defaultTimeoutMs)
+      const frame = await request(
+        'initialize',
+        { protocolVersion: 1, clientCapabilities: approvals.clientCapabilities },
+        defaultTimeoutMs,
+      )
       if (frame instanceof Error) return frame
       const result = frame.result ?? {}
       const protocolVersion = typeof result.protocolVersion === 'number' ? result.protocolVersion : null
@@ -306,6 +332,7 @@ export const createAcpClient: CreateAcpClient = (options: AcpClientOptions): Acp
       if (typeof sessionId !== 'string' || !sessionId) {
         return new ConfigError({ reason: 'The ACP agent did not return a session ID' })
       }
+      ownedSessions.add(sessionId)
       return { sessionId }
     },
 
@@ -349,6 +376,7 @@ export const createAcpClient: CreateAcpClient = (options: AcpClientOptions): Acp
         state,
       )
       if (frame instanceof Error) return frame
+      ownedSessions.add(input.sessionId)
       // Replayed chunks arrive before the response, so nothing is still in flight.
       const history = state.history ?? []
       const options = Array.isArray(frame.result?.configOptions) ? frame.result.configOptions : []
@@ -418,10 +446,14 @@ export const createAcpClient: CreateAcpClient = (options: AcpClientOptions): Acp
       return undefined
     },
 
+    pendingServerRequests: approvals.pending,
+    answerServerRequest: approvals.answer,
+
     close(): Promise<void> {
       if (closePromise) return closePromise
       closePromise = (async () => {
         closed = true
+        approvals.close()
         failAll(new ConfigError({ reason: 'The ACP client was closed' }))
         lines?.close()
         const proc = child

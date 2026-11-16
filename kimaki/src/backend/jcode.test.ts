@@ -48,6 +48,12 @@ function fakeAcp(overrides: Partial<AcpClient> = {}) {
       calls.cancel.push(input)
       return undefined
     },
+    pendingServerRequests() {
+      return []
+    },
+    answerServerRequest() {
+      return { requestId: 0 }
+    },
     async close() {
       calls.close++
     },
