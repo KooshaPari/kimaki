@@ -31,21 +31,23 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-import * as errore from 'errore'
 import type { OpenCodeClient, V2Event } from '@opencode/client'
 
 import type { OpencodeEndpoint } from '../opencode-server.ts'
 import { createAcpClient } from './acp/client.ts'
 import type { AcpClient, AcpServerAnswerInput, AcpServerRequest, AcpServerRequestHandler, CreateAcpClient } from './acp/contracts.ts'
+import { JcodeBotBackendError, type JcodeBotRefusal } from './jcode-bot-error.ts'
+import { createJcodeBotWriter, type JcodeBotPromptInput, type JcodeBotPromptOutcome } from './jcode-bot-prompt.ts'
 import { createJcodeTurnObserver, type JcodeObservationLatency, type JcodeTurnEvent, type JcodeTurnHealth } from './jcode-observe.ts'
+
+// The named failure and the refusal record live in their own module so the write
+// path can construct the same error; they stay exported from here unchanged.
+export { JcodeBotBackendError, type JcodeBotRefusal } from './jcode-bot-error.ts'
+export { JCODE_BOT_NOT_PROJECTED, JCODE_BOT_NOT_PROJECTED_REASON, JCODE_BOT_PROJECTED_EVENTS } from './jcode-bot-not-projected.ts'
+export type { JcodeBotPromptInput, JcodeBotPromptOutcome } from './jcode-bot-prompt.ts'
 
 /** How long a `--version` probe may take before the binary counts as unstartable. */
 const PROBE_TIMEOUT_MS = 20_000
-
-export class JcodeBotBackendError extends errore.createTaggedError({
-  name: 'JcodeBotBackendError',
-  message: 'Jcode bot backend $stage failed: $reason',
-}) {}
 
 /**
  * The backend part of StartBotOptions. One bot follows one persisted session.
@@ -58,117 +60,7 @@ export type JcodeBotBackendSpec = {
   sessionId?: string
 }
 
-/** A capability the observer cannot supply, recorded rather than faked. */
-export type JcodeBotRefusal = {
-  name: 'subscribe' | 'durable-dedupe' | 'endpoint'
-  reason: string
-}
-
-/**
- * Every V2 event type this seam does NOT project. The list is exhaustive for the
- * client's union except the two projected above; it is exported so a caller can
- * state the gap instead of discovering it from missing output.
- */
-export const JCODE_BOT_PROJECTED_EVENTS = ['session.text.ended', 'session.execution.succeeded'] as const
-
-export const JCODE_BOT_NOT_PROJECTED = [
-  'location.shutdown',
-  'models.dev.refreshed',
-  'credential.updated',
-  'credential.switched',
-  'integration.updated',
-  'provider.updated',
-  'model.updated',
-  'agent.updated',
-  'session.created',
-  'session.agent.selected',
-  'session.model.selected',
-  'session.moved',
-  'session.renamed',
-  'session.metadata.updated',
-  'session.permissions',
-  'session.viewed',
-  'session.usage.updated',
-  'session.deleted',
-  'session.forked',
-  'session.inbox.delivered',
-  'session.inbox.enqueued',
-  'session.inbox.cancelled',
-  'session.inbox.delivery.changed',
-  'session.execution.started',
-  'session.execution.failed',
-  'session.execution.interrupted',
-  'session.instructions.updated',
-  'session.synthetic',
-  'session.skill.activated',
-  'session.shell.started',
-  'session.shell.ended',
-  'session.step.started',
-  'session.step.streamed',
-  'session.step.ended',
-  'session.step.failed',
-  'session.text.started',
-  'session.text.delta',
-  'session.reasoning.started',
-  'session.reasoning.delta',
-  'session.reasoning.ended',
-  'session.tool.input.started',
-  'session.tool.input.delta',
-  'session.tool.input.ended',
-  'session.tool.called',
-  'session.tool.progress',
-  'session.tool.success',
-  'session.tool.failed',
-  'session.retry.scheduled',
-  'session.compaction.started',
-  'session.compaction.delta',
-  'session.compaction.ended',
-  'session.compaction.failed',
-  'session.revert.staged',
-  'session.revert.cleared',
-  'session.revert.committed',
-  'filesystem.changed',
-  'reference.updated',
-  'permission.asked',
-  'permission.replied',
-  'plugin.updated',
-  'project.updated',
-  'worktree.updated',
-  'worktree.resolved',
-  'command.updated',
-  'config.updated',
-  'skill.updated',
-  'pty.created',
-  'pty.updated',
-  'pty.exited',
-  'pty.deleted',
-  'persistent.pty.added',
-  'persistent.pty.removed',
-  'shell.created',
-  'shell.exited',
-  'shell.deleted',
-  'form.created',
-  'form.replied',
-  'form.cancelled',
-  'websearch.updated',
-  'session.status.updated',
-  'session.idle',
-  'tui.prompt.append',
-  'tui.command.execute',
-  'tui.toast.show',
-  'tui.session.select',
-  'installation.updated',
-  'installation.update.available',
-  'vcs.branch.updated',
-  'mcp.status.changed',
-  'mcp.resources.changed',
-  'server.connected',
-] as const
-
-/** Why exactly these types are absent, in one place for the report. */
-export const JCODE_BOT_NOT_PROJECTED_REASON =
-  'A persisted Jcode record holds messages only. It carries no execution-start marker, no tool/reasoning/step records, no permission or form requests and no catalog hints, so this seam emits nothing for those types rather than synthesizing them.'
-
+/** Construction and runtime knobs for one bot following one persisted session. */
 export type JcodeBotBackendInput = {
   binary?: string
   /** Jcode home (`$JCODE_HOME`) or the parent of its `sessions` store. */
@@ -185,8 +77,18 @@ export type JcodeBotBackendInput = {
   /** Working directory for the session/load that attaches the approval connection. Required with `onApproval`. */
   cwd?: string
   approvalTimeoutMs?: number
+  /** Provider for the write path's ACP connection; omitted keeps the agent's own config. */
+  provider?: string
+  /** Model for the write path's ACP connection; omitted keeps the agent's own config. */
+  model?: string
+  /** Tool profile for the write path. `none` keeps a turn text-only. */
+  toolProfile?: 'none' | 'minimal' | 'full'
+  /** Per-turn deadline for the write path. */
+  promptTimeoutMs?: number
   /** Test seam: replace the ACP client factory used for the approval connection. */
   createApprovalClient?: CreateAcpClient
+  /** Test seam: replace the ACP client factory used for the write path. */
+  createPromptClient?: CreateAcpClient
   /** Test seams; production uses the real filesystem, clock and child process. */
   readFile?: (file: string) => Promise<string>
   now?: () => number
@@ -217,6 +119,13 @@ export type JcodeBotConnection = {
   health: () => JcodeTurnHealth
   latency: JcodeObservationLatency
   refusals: () => readonly JcodeBotRefusal[]
+  /**
+   * Run one turn over ACP. Returns what the agent reported and never emits: the
+   * poller is the only emitter, so the turn reaches the bot exactly once.
+   */
+  prompt: (input: string | JcodeBotPromptInput) => Promise<JcodeBotPromptOutcome | Error>
+  /** One deterministic observer read, so a caller can surface a just-finished turn. */
+  flush: () => Promise<void>
   /** Present only when an approval handler was supplied. Surfaced to the caller, never emitted as an event. */
   approvals?: JcodeBotApprovals
 }
@@ -330,14 +239,16 @@ const refusingClient = (): OpenCodeClient =>
 // supplied: the observer reads a persisted record and has no transport, so this
 // seam must own one for an agent to have somewhere to ask. Initialize declares
 // `serverRequests`; session/load makes the session this connection's to answer for.
-const attachApprovals = async (input: JcodeBotBackendInput, binary: string, sessionId: string): Promise<{ client: AcpClient; approvals: JcodeBotApprovals } | JcodeBotBackendError> => {
+const attachApprovals = async (input: JcodeBotBackendInput, binary: string, home: string, sessionId: string): Promise<{ client: AcpClient; approvals: JcodeBotApprovals } | JcodeBotBackendError> => {
   const workdir = (input.cwd ?? '').trim()
   if (workdir === '') return new JcodeBotBackendError({ stage: 'approvals', reason: 'an approval handler was supplied without a cwd; the ACP connection that carries approvals loads the session in a working directory' })
   let client: AcpClient
   try {
     client = (input.createApprovalClient ?? createAcpClient)({
       command: binary,
-      args: ['acp', '--tool-profile', 'none'],
+      // Same home-pinned socket as the write path, so approvals are asked by the
+      // server that owns this session's store rather than the host's default daemon.
+      args: ['acp', '--tool-profile', 'none', '--socket', path.join(home, 'bot-acp.sock')],
       cwd: workdir,
       ...(input.approvalTimeoutMs === undefined ? {} : { timeoutMs: input.approvalTimeoutMs }),
       serverRequests: { onRequest: input.onApproval! },
@@ -455,7 +366,7 @@ export async function createJcodeBotBackend(input: JcodeBotBackendInput): Promis
   // No handler: no ACP child and the old shape. With one, the connection owns it.
   let approvalClient: AcpClient | null = null; let approvals: JcodeBotApprovals | undefined
   if (input.onApproval !== undefined) {
-    const attached = await attachApprovals(input, binary, sessionId)
+    const attached = await attachApprovals(input, binary, home, sessionId)
     if (attached instanceof Error) {
       observer.stop()
       return attached
@@ -464,6 +375,24 @@ export async function createJcodeBotBackend(input: JcodeBotBackendInput): Promis
     approvals = attached.approvals
   }
   observer.start()
+
+  // The write path is lazy: a caller that only observes reaches no ACP child. When
+  // an approval child exists it is already initialized and loaded, so the turn
+  // runs over it and its permission requests reach the same handler.
+  let stopped = false
+  const writer = createJcodeBotWriter({
+    home,
+    sessionId,
+    ...(approvalClient === null ? {} : { client: approvalClient }),
+    binary,
+    cwd: (input.cwd ?? '').trim(),
+    ...(input.toolProfile === undefined ? {} : { toolProfile: input.toolProfile }),
+    ...(input.provider === undefined ? {} : { provider: input.provider }),
+    ...(input.model === undefined ? {} : { model: input.model }),
+    ...(input.promptTimeoutMs === undefined ? {} : { timeoutMs: input.promptTimeoutMs }),
+    ...(input.createPromptClient === undefined ? {} : { createClient: input.createPromptClient }),
+    closed: () => stopped,
+  })
 
   const marker: OpencodeEndpoint = { client: refusingClient(), url: `jcode://${sessionId}`, version: 'jcode' }
   const refusalsOf = (): readonly JcodeBotRefusal[] => [...refusals]
@@ -487,6 +416,8 @@ export async function createJcodeBotBackend(input: JcodeBotBackendInput): Promis
       return () => undefined
     },
     stop: () => {
+      stopped = true
+      writer.close()
       observer.stop()
       // Closing the child ends every held request; an answer after this is gone.
       if (approvalClient) void approvalClient.close()
@@ -494,6 +425,8 @@ export async function createJcodeBotBackend(input: JcodeBotBackendInput): Promis
     health: () => observer.health(),
     latency: observer.latency,
     refusals: refusalsOf,
+    prompt: (turn) => writer.prompt(typeof turn === 'string' ? { text: turn } : turn),
+    flush: () => observer.poll(),
     ...(approvals === undefined ? {} : { approvals }),
   }
 }

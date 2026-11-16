@@ -36,6 +36,7 @@ import { AcpApprovalError } from './acp/approvals.ts'
 import { createAcpClient } from './acp/client.ts'
 import type { AcpClient, AcpClientOptions, AcpServerRequest } from './acp/contracts.ts'
 import { createJcodeBotBackend, JcodeBotBackendError, type JcodeBotConnection } from './jcode-bot-backend.ts'
+import { botSocketPath } from './jcode-bot-prompt.ts'
 
 function findJcode(): string | null {
   const candidates = [
@@ -113,6 +114,7 @@ async function removeTree(target: string): Promise<boolean> {
 // Same loopback Responses-API mock the observer suite uses: jcode itself writes
 // the user prompt and the assistant answer, so the record under test is native.
 function startMockProvider(): Promise<{ url: string; close: () => Promise<void> }> {
+  const sockets = new Set<import('node:net').Socket>()
   const server = http.createServer((request, response) => {
     request.resume()
     request.on('end', () => {
@@ -157,13 +159,22 @@ function startMockProvider(): Promise<{ url: string; close: () => Promise<void> 
       response.end()
     })
   })
+  server.on('connection', (socket) => {
+    sockets.add(socket)
+    socket.on('close', () => sockets.delete(socket))
+  })
   return new Promise((resolve) => {
     server.listen(0, '127.0.0.1', () => {
       const address = server.address()
       if (address === null || typeof address === 'string') throw new Error('mock provider has no port')
       resolve({
         url: `http://127.0.0.1:${address.port}`,
-        close: () => new Promise<void>((done) => server.close(() => done())),
+        // jcode keeps provider connections alive; a graceful close would wait on
+        // them until the hook timeout. Destroy them so teardown is bounded.
+        close: () => new Promise<void>((done) => {
+          for (const socket of sockets) socket.destroy()
+          server.close(() => done())
+        }),
       })
     })
   })
@@ -173,7 +184,9 @@ function startMockProvider(): Promise<{ url: string; close: () => Promise<void> 
 // goes in" half: the writer is jcode, not this test.
 function runJcodeTurn({ binary, home, cwd, url }: { binary: string; home: string; cwd: string; url: string }): Promise<{ code: number | null; stderr: string }> {
   return new Promise((resolve) => {
-    const child = spawn(binary, ['run', '-p', 'openai-api', '-m', 'mock-model', '--tool-profile', 'none', '--no-update', '--quiet', '-C', cwd, 'Reply with only: ok'], {
+    // A catalog-known id: jcode validates the model against its catalog, not the
+    // endpoint's /models list, so an invented id is rejected on some hosts.
+    const child = spawn(binary, ['run', '-p', 'openai-api', '-m', 'gpt-5.5', '--tool-profile', 'none', '--no-update', '--quiet', '-C', cwd, 'Reply with only: ok'], {
       env: {
         ...process.env,
         JCODE_HOME: home,
@@ -278,6 +291,8 @@ test('a jcode backend is constructed through the jcode factory, never OpenCode',
     health: () => ({ state: 'consistent', lastPollAt: 0, lastTurnId: null }),
     latency: { pollIntervalMs: 1, minPollIntervalMs: 1, maxPollIntervalMs: 1, confirmMs: 0 },
     refusals: () => [],
+    prompt: () => Promise.resolve(new Error('sentinel')),
+    flush: () => Promise.resolve(),
   }
   let opencodeCalled = false
   const onEvent = (): void => {}
@@ -364,12 +379,17 @@ describe.skipIf(jcodeBinary === null)(`jcode bot seam over a real session${skipR
   }, 180_000)
 
   afterAll(async () => {
-    await mock?.close()
+    try { await mock?.close() } catch { /* provider connections are already destroyed */ }
     // A Windows handle on a just-closed SQLite file can outlive the test for a
-    // moment. Leaving a temp dir is a nuisance; failing the suite over it would
-    // hide the result of the claims above. The path is named instead.
-    if (root && !(await removeTree(root))) process.stderr.write(`jcode seam test: could not remove ${root}\n`)
-  }, 30_000)
+    // moment. Fail fast instead of retrying into the hook timeout, and name the
+    // path: leaving a temp dir is a nuisance, failing the suite over it would
+    // hide the result of the claims above.
+    try {
+      fs.rmSync(root, { recursive: true, force: true, maxRetries: 0 })
+    } catch {
+      process.stderr.write(`jcode seam test: could not remove ${root}\n`)
+    }
+  }, 60_000)
 
   test('a session that is not persisted yet is a named construction error', async () => {
     const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-bot-backend-empty-'))
@@ -558,4 +578,286 @@ test('a handler that throws fails closed with one refusal, not a stalled agent',
   } finally {
     run.connection.stop(); expect(await removeTree(run.dir)).toBe(true)
   }
+})
+
+// ---------------------------------------------------------------------------
+// Write path: session/prompt is the ACP call that runs a turn. The scripted
+// peer below is a real ACP child on the wire (the production transport spawns
+// it); only the model is replaced, so the write path is exercised end to end
+// without a provider. The real-binary suite at the end proves the persisted side.
+// ---------------------------------------------------------------------------
+
+const WRITE_AGENT = String.raw`const fs = require('node:fs')
+const readline = require('node:readline')
+const recordFile = process.argv[2]
+const mode = process.argv[3] ?? 'ok'
+const write = (frame) => process.stdout.write(JSON.stringify(frame) + '\n')
+const record = (event) => fs.appendFileSync(recordFile, JSON.stringify(event) + '\n')
+readline.createInterface({ input: process.stdin }).on('line', (line) => {
+  const message = JSON.parse(line)
+  if (message.method === undefined) return
+  if (message.method === 'initialize') return write({ jsonrpc: '2.0', id: message.id, result: { protocolVersion: 1, agentInfo: { name: 'jcode' }, agentCapabilities: {} } })
+  if (message.method === 'session/load') {
+    if (mode === 'reject-load') return write({ jsonrpc: '2.0', id: message.id, error: { code: -32603, message: 'no such session' } })
+    // Replay what this peer has been prompted with, as jcode replays a session's
+    // user messages. The instruction marker is part of that text, so a reconnect
+    // can recover the delivered digest from the transcript.
+    const replay = fs.existsSync(recordFile) ? fs.readFileSync(recordFile, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line)).filter((event) => event.kind === 'prompt').map((event) => event.text) : []
+    for (const text of replay.length === 0 ? ['earlier turn'] : replay) {
+      write({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: message.params.sessionId, update: { sessionUpdate: 'user_message_chunk', content: { type: 'text', text } } } })
+    }
+    return write({ jsonrpc: '2.0', id: message.id, result: { sessionId: message.params.sessionId, configOptions: [] } })
+  }
+  if (message.method !== 'session/prompt') return
+  record({ kind: 'prompt', text: message.params.prompt[0].text })
+  if (mode === 'reject-prompt') return write({ jsonrpc: '2.0', id: message.id, error: { code: -32603, message: 'provider unavailable' } })
+  const reply = () => {
+    write({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: message.params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'scripted' } } } })
+    write({ jsonrpc: '2.0', id: message.id, result: { stopReason: 'end_turn' } })
+  }
+  if (mode === 'slow') setTimeout(reply, 1500)
+  else reply()
+})
+`
+
+const readPrompts = (file: string): string[] =>
+  fs.existsSync(file)
+    ? fs.readFileSync(file, 'utf8').trim().split('\n').filter(Boolean)
+        .map((line) => JSON.parse(line) as { kind?: string; text?: string })
+        .filter((event) => event.kind === 'prompt')
+        .map((event) => event.text ?? '')
+    : []
+
+const primeRecord = (sessionId: string): string =>
+  JSON.stringify({ id: sessionId, messages: [{ id: 'm1', role: 'assistant', content: [{ type: 'text', text: 'prime' }], timestamp: '2026-01-01T00:00:00.000Z' }] })
+
+// The same environment runJcodeTurn gives `jcode run`, so the ACP child reads the
+// same isolated home and the same loopback provider. Stripping the inherited
+// JCODE_* set was measured to send the child to the host daemon instead.
+const isolatedEnv = (home: string, url: string): NodeJS.ProcessEnv => ({
+  ...process.env,
+  JCODE_HOME: home,
+  JCODE_NO_TELEMETRY: '1',
+  OPENAI_BASE_URL: `${url}/v1`,
+  OPENAI_API_BASE: `${url}/v1`,
+  OPENAI_API_KEY: 'jcode-bot-backend-test-key',
+})
+
+const startWriteSeam = async ({ mode, persisted = true, promptTimeoutMs }: { mode: string; persisted?: boolean; promptTimeoutMs?: number }) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-seam-write-'))
+  const home = path.join(dir, 'home')
+  const script = path.join(dir, 'agent.cjs')
+  const recordFile = path.join(dir, 'record.jsonl')
+  fs.writeFileSync(script, WRITE_AGENT)
+  const sessionId = 'session_write'
+  if (persisted) {
+    fs.mkdirSync(path.join(home, 'sessions'), { recursive: true })
+    fs.writeFileSync(path.join(home, 'sessions', `${sessionId}.json`), '{}')
+  }
+  const events: V2Event[] = []
+  const connection = await createJcodeBotBackend({
+    binary: process.execPath,
+    probe: async () => undefined,
+    home,
+    sessionId,
+    cwd: dir,
+    intervalMs: 60_000,
+    ...(promptTimeoutMs === undefined ? {} : { promptTimeoutMs }),
+    readFile: async () => primeRecord(sessionId),
+    onEvent: (event) => events.push(event),
+    createPromptClient: (options) => createAcpClient({ ...options, command: process.execPath, args: [script, recordFile, mode] }),
+  })
+  if (connection instanceof Error) { await removeTree(dir); throw connection }
+  return { connection, dir, home, recordFile, events, sessionId }
+}
+
+const stageOf = (value: unknown): unknown => (value as { stage?: unknown }).stage
+
+test('a prompt runs a turn over ACP and the session instruction is delivered once', async () => {
+  const run = await startWriteSeam({ mode: 'ok' })
+  try {
+    const first = await run.connection.prompt({ text: 'hello', instruction: 'Be terse' })
+    if (first instanceof Error) throw first
+    expect(first).toMatchObject({ sessionId: run.sessionId, stopReason: 'end_turn', text: 'scripted', instruction: { kind: 'prefix' } })
+    const second = await run.connection.prompt({ text: 'again', instruction: 'Be terse' })
+    if (second instanceof Error) throw second
+    // The marker is in the transcript, so the second turn does not repeat it.
+    expect(second.instruction).toEqual({ kind: 'none', digest: first.instruction.digest })
+    const prompts = readPrompts(run.recordFile)
+    expect(prompts).toHaveLength(2)
+    expect(prompts[0]).toContain('kimaki:session-instruction')
+    expect(prompts[0]).toContain('Be terse')
+    expect(prompts[0]!.endsWith('hello')).toBe(true)
+    expect(prompts[1]).toBe('again')
+  } finally {
+    run.connection.stop(); expect(await removeTree(run.dir)).toBe(true)
+  }
+})
+
+test('a prompt while another is in flight is refused by name', async () => {
+  const run = await startWriteSeam({ mode: 'slow' })
+  try {
+    const first = run.connection.prompt('slow turn')
+    await sleep(300)
+    const second = await run.connection.prompt('second')
+    expect(second).toBeInstanceOf(JcodeBotBackendError)
+    expect(stageOf(second)).toBe('prompt-in-flight')
+    const finished = await first
+    if (finished instanceof Error) throw finished
+    expect(finished.text).toBe('scripted')
+  } finally {
+    run.connection.stop(); expect(await removeTree(run.dir)).toBe(true)
+  }
+})
+
+test('a refused load is a named error and emits nothing', async () => {
+  const run = await startWriteSeam({ mode: 'reject-load' })
+  try {
+    const before = run.events.length
+    const refused = await run.connection.prompt('never sent')
+    expect(stageOf(refused)).toBe('prompt-load')
+    expect(readPrompts(run.recordFile)).toEqual([])
+    await run.connection.flush()
+    expect(run.events.length).toBe(before)
+  } finally {
+    run.connection.stop(); expect(await removeTree(run.dir)).toBe(true)
+  }
+})
+
+test('a refused prompt is a named error and emits nothing', async () => {
+  const run = await startWriteSeam({ mode: 'reject-prompt' })
+  try {
+    const before = run.events.length
+    const refused = await run.connection.prompt('rejected turn')
+    expect(stageOf(refused)).toBe('prompt-rejected')
+    expect(readPrompts(run.recordFile)).toEqual(['rejected turn'])
+    await run.connection.flush()
+    expect(run.events.length).toBe(before)
+  } finally {
+    run.connection.stop(); expect(await removeTree(run.dir)).toBe(true)
+  }
+})
+
+test('a prompt before the session is persisted and after stop is refused by name', async () => {
+  const unpersisted = await startWriteSeam({ mode: 'ok', persisted: false })
+  try {
+    expect(stageOf(await unpersisted.connection.prompt('too early'))).toBe('prompt-session')
+  } finally {
+    unpersisted.connection.stop(); expect(await removeTree(unpersisted.dir)).toBe(true)
+  }
+  const closed = await startWriteSeam({ mode: 'ok' })
+  try {
+    closed.connection.stop()
+    expect(stageOf(await closed.connection.prompt('too late'))).toBe('prompt-closed')
+  } finally {
+    expect(await removeTree(closed.dir)).toBe(true)
+  }
+})
+
+test('observer-only mode starts no child and the write factory is never called', async () => {
+  let approvalFactoryCalls = 0
+  let promptFactoryCalls = 0
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-seam-observer-only-'))
+  const events: string[] = []
+  const connection = await createJcodeBotBackend({
+    binary: process.execPath,
+    probe: async () => undefined,
+    home,
+    sessionId: 'session_plain',
+    intervalMs: 25,
+    readFile: async () => primeRecord('session_plain'),
+    onEvent: (event) => events.push(event.type),
+    createApprovalClient: (options) => { approvalFactoryCalls += 1; return createAcpClient(options) },
+    createPromptClient: (options) => { promptFactoryCalls += 1; return createAcpClient(options) },
+  })
+  try {
+    if (connection instanceof Error) throw connection
+    await sleep(100)
+    expect([approvalFactoryCalls, promptFactoryCalls, events]).toEqual([0, 0, ['session.text.ended', 'session.execution.succeeded']])
+    connection.stop()
+  } finally {
+    if (!(await removeTree(home))) process.stderr.write(`jcode seam test: could not remove ${home}\n`)
+  }
+})
+
+describe.skipIf(jcodeBinary === null)(`jcode bot seam write path over a real session${skipReason ? ` [SKIPPED: ${skipReason}]` : ''}`, () => {
+  const binary = jcodeBinary!
+  let root = ''
+  let home = ''
+  let cursorDir = ''
+  let cwd = ''
+  let mock: { url: string; close: () => Promise<void> }
+  let settled: SettledStore
+
+  beforeAll(async () => {
+    sweepStaleSeamRoots()
+    const roots = createSeamRoots()
+    root = roots.root
+    home = roots.home
+    cursorDir = roots.cursorDir
+    cwd = roots.cwd
+    mock = await startMockProvider()
+    const run = await runJcodeTurn({ binary, home, cwd, url: mock.url })
+    expect(run.code, `jcode run stderr: ${run.stderr}`).toBe(0)
+    settled = await settleStore(path.join(home, 'sessions'))
+  }, 180_000)
+
+  afterAll(async () => {
+    try { await mock?.close() } catch { /* connections are already destroyed */ }
+    // The ACP server can still hold a handle for a moment; fail fast and name the
+    // path rather than spending two minutes retrying.
+    try {
+      fs.rmSync(root, { recursive: true, force: true, maxRetries: 0 })
+    } catch {
+      process.stderr.write(`jcode seam write test: could not remove ${root}\n`)
+    }
+    try {
+      fs.rmSync(botSocketPath(home), { force: true })
+    } catch { /* the socket belongs to the OS temp dir */ }
+  }, 60_000)
+
+  test('a prompt runs a real turn and write+observe emits the completed turn exactly once', async () => {
+    const events: V2Event[] = []
+    const connection = await createJcodeBotBackend({
+      binary,
+      home,
+      sessionId: settled.sessionId,
+      cursorDir,
+      cwd,
+      intervalMs: 60_000,
+      provider: 'openai-api',
+      model: 'gpt-5.5',
+      toolProfile: 'none',
+      promptTimeoutMs: 120_000,
+      // Point the ACP child at the same isolated home and loopback provider.
+      createPromptClient: (options) => createAcpClient({ ...options, env: isolatedEnv(home, mock.url) }),
+      onEvent: (event) => events.push(event),
+    })
+    if (connection instanceof Error) throw connection
+    try {
+      // Construction emitted the pre-existing turn once (emitExisting default).
+      const baseline = events.length
+      expect(baseline).toBe(2)
+      const outcome = await connection.prompt('Reply with only: ok')
+      if (outcome instanceof Error) throw outcome
+      expect(outcome.text).toBe('ok')
+      expect(outcome.sessionId).toBe(settled.sessionId)
+      // jcode persists the turn; the poller alone turns it into bot events.
+      for (let attempt = 0; attempt < 150 && events.length - baseline < 2; attempt += 1) {
+        await connection.flush()
+        await sleep(100)
+      }
+      const fresh = events.slice(baseline)
+      expect(fresh.map((event) => event.type)).toEqual(['session.text.ended', 'session.execution.succeeded'])
+      const text = fresh[0] as Extract<V2Event, { type: 'session.text.ended' }>
+      expect(text.data.sessionID).toBe(settled.sessionId)
+      expect(text.data.text).toBe('ok')
+      // Extra reads must not repeat it: the durable cursor is the dedupe.
+      await connection.flush()
+      await connection.flush()
+      expect(events.slice(baseline)).toHaveLength(2)
+    } finally {
+      connection.stop()
+    }
+  }, 180_000)
 })
