@@ -20,6 +20,11 @@
 // explicit `cursorDir` outside the Jcode store. Without that directory the seam
 // still works within one process and records a named `durable-dedupe` refusal,
 // because a restart would then re-emit turns.
+//
+// Approvals are the one thing a persisted record cannot carry: ACP asks the
+// client driving the turn and waits. This seam owns an ACP connection only when
+// the caller supplies a handler; without one it starts no child and keeps the
+// historical drop. An approval is not a turn, so it is never a V2 event.
 
 import { spawn } from 'node:child_process'
 import fs from 'node:fs'
@@ -30,6 +35,8 @@ import * as errore from 'errore'
 import type { OpenCodeClient, V2Event } from '@opencode/client'
 
 import type { OpencodeEndpoint } from '../opencode-server.ts'
+import { createAcpClient } from './acp/client.ts'
+import type { AcpClient, AcpServerAnswerInput, AcpServerRequest, AcpServerRequestHandler, CreateAcpClient } from './acp/contracts.ts'
 import { createJcodeTurnObserver, type JcodeObservationLatency, type JcodeTurnEvent, type JcodeTurnHealth } from './jcode-observe.ts'
 
 /** How long a `--version` probe may take before the binary counts as unstartable. */
@@ -173,11 +180,25 @@ export type JcodeBotBackendInput = {
   intervalMs?: number
   /** The bot's sink. Feeds the same callback watchOpencode uses. */
   onEvent: (event: V2Event) => void
+  /** Surfaces permission requests over an ACP connection to `sessionId`; omitting it starts no child. */
+  onApproval?: AcpServerRequestHandler
+  /** Working directory for the session/load that attaches the approval connection. Required with `onApproval`. */
+  cwd?: string
+  approvalTimeoutMs?: number
+  /** Test seam: replace the ACP client factory used for the approval connection. */
+  createApprovalClient?: CreateAcpClient
   /** Test seams; production uses the real filesystem, clock and child process. */
   readFile?: (file: string) => Promise<string>
   now?: () => number
   random?: () => number
   probe?: (binary: string) => Promise<Error | void>
+}
+
+/** Approval surface of an owned ACP connection; absent without a handler. */
+export type JcodeBotApprovals = {
+  pending: () => AcpServerRequest[]
+  /** The first answer wins; a repeat is refused by name. */
+  answer: (input: AcpServerAnswerInput) => { requestId: number | string } | Error
 }
 
 /**
@@ -196,6 +217,8 @@ export type JcodeBotConnection = {
   health: () => JcodeTurnHealth
   latency: JcodeObservationLatency
   refusals: () => readonly JcodeBotRefusal[]
+  /** Present only when an approval handler was supplied. Surfaced to the caller, never emitted as an event. */
+  approvals?: JcodeBotApprovals
 }
 
 const binaryCandidates = (explicit: string | undefined): string[] => {
@@ -303,6 +326,38 @@ const refusingClient = (): OpenCodeClient =>
     },
   }) as unknown as OpenCodeClient
 
+// The ACP connection that carries approvals, owned only when a handler is
+// supplied: the observer reads a persisted record and has no transport, so this
+// seam must own one for an agent to have somewhere to ask. Initialize declares
+// `serverRequests`; session/load makes the session this connection's to answer for.
+const attachApprovals = async (input: JcodeBotBackendInput, binary: string, sessionId: string): Promise<{ client: AcpClient; approvals: JcodeBotApprovals } | JcodeBotBackendError> => {
+  const workdir = (input.cwd ?? '').trim()
+  if (workdir === '') return new JcodeBotBackendError({ stage: 'approvals', reason: 'an approval handler was supplied without a cwd; the ACP connection that carries approvals loads the session in a working directory' })
+  let client: AcpClient
+  try {
+    client = (input.createApprovalClient ?? createAcpClient)({
+      command: binary,
+      args: ['acp', '--tool-profile', 'none'],
+      cwd: workdir,
+      ...(input.approvalTimeoutMs === undefined ? {} : { timeoutMs: input.approvalTimeoutMs }),
+      serverRequests: { onRequest: input.onApproval! },
+    })
+  } catch (cause) {
+    return new JcodeBotBackendError({ stage: 'approvals', reason: `could not create the ACP connection that carries approvals for ${sessionId}`, cause })
+  }
+  const initialized = await client.initialize()
+  if (initialized instanceof Error) {
+    await client.close()
+    return new JcodeBotBackendError({ stage: 'approvals', reason: `the approval connection to ${binary} failed its ACP initialize`, cause: initialized })
+  }
+  const loaded = await client.loadSession({ sessionId, cwd: workdir })
+  if (loaded instanceof Error) {
+    await client.close()
+    return new JcodeBotBackendError({ stage: 'approvals', reason: `the approval connection could not load session ${sessionId}`, cause: loaded })
+  }
+  return { client, approvals: { pending: () => client.pendingServerRequests(), answer: (answer) => client.answerServerRequest(answer) } }
+}
+
 /**
  * Build the bot's connection onto one persisted Jcode session.
  *
@@ -396,6 +451,18 @@ export async function createJcodeBotBackend(input: JcodeBotBackendInput): Promis
     observer.stop()
     return observer.error()!
   }
+
+  // No handler: no ACP child and the old shape. With one, the connection owns it.
+  let approvalClient: AcpClient | null = null; let approvals: JcodeBotApprovals | undefined
+  if (input.onApproval !== undefined) {
+    const attached = await attachApprovals(input, binary, sessionId)
+    if (attached instanceof Error) {
+      observer.stop()
+      return attached
+    }
+    approvalClient = attached.client
+    approvals = attached.approvals
+  }
   observer.start()
 
   const marker: OpencodeEndpoint = { client: refusingClient(), url: `jcode://${sessionId}`, version: 'jcode' }
@@ -419,9 +486,14 @@ export async function createJcodeBotBackend(input: JcodeBotBackendInput): Promis
       })
       return () => undefined
     },
-    stop: () => observer.stop(),
+    stop: () => {
+      observer.stop()
+      // Closing the child ends every held request; an answer after this is gone.
+      if (approvalClient) void approvalClient.close()
+    },
     health: () => observer.health(),
     latency: observer.latency,
     refusals: refusalsOf,
+    ...(approvals === undefined ? {} : { approvals }),
   }
 }

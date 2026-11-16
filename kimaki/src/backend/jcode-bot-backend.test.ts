@@ -422,3 +422,78 @@ describe.skipIf(jcodeBinary === null)(`jcode bot seam over a real session${skipR
     }
   })
 })
+// Approval channel: a scripted fake agent answers initialize, then asks for
+// permission after session/load and records every frame, agent-side evidence.
+const APPROVAL_AGENT = String.raw`const fs = require('node:fs')
+const readline = require('node:readline')
+const write = (frame) => process.stdout.write(JSON.stringify(frame) + '\n')
+const record = (event) => fs.appendFileSync(process.argv[2], JSON.stringify(event) + '\n')
+let waiting = null
+readline.createInterface({ input: process.stdin }).on('line', (line) => {
+  const message = JSON.parse(line)
+  if (message.method === undefined) { if (message.id === waiting) { record({ kind: 'answer', frame: message }); waiting = null } return }
+  if (message.method === 'initialize') return write({ jsonrpc: '2.0', id: message.id, result: { protocolVersion: 1, agentInfo: { name: 'jcode' }, agentCapabilities: {} } })
+  if (message.method !== 'session/load') return
+  write({ jsonrpc: '2.0', id: message.id, result: { sessionId: message.params.sessionId, configOptions: [] } })
+  setTimeout(() => { waiting = 4242
+    write({ jsonrpc: '2.0', id: 4242, method: 'session/request_permission', params: { sessionId: message.params.sessionId, toolCall: { rawInput: { command: 'rm -rf build' } }, options: [{ optionId: 'allow' }, { optionId: 'reject' }] } }) }, 20)
+})
+`
+const waitAnswers = async (file: string): Promise<Array<Record<string, unknown>>> => {
+  const read = (): Array<Record<string, unknown>> => fs.existsSync(file) ? fs.readFileSync(file, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>).filter((event) => event['kind'] === 'answer') : []
+  for (let attempt = 0; attempt < 100 && read().length === 0; attempt += 1) await sleep(20)
+  return read()
+}
+
+// The seam owns an ACP child only here; handler and answer surface share it.
+const buildApprovalSeam = async (onApproval: (request: AcpServerRequest, client: () => AcpClient) => void) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-seam-approvals-'))
+  const script = path.join(dir, 'agent.cjs')
+  const recordFile = path.join(dir, 'record.jsonl')
+  fs.writeFileSync(script, APPROVAL_AGENT)
+  const requests: AcpServerRequest[] = []; let client: AcpClient
+  const connection = await createJcodeBotBackend({
+    binary: process.execPath, probe: async () => undefined, home: path.join(dir, 'home'), sessionId: 'session_approval', intervalMs: 25, cwd: dir,
+    readFile: async () => JSON.stringify({ id: 'session_approval', messages: [{ id: 'm1', role: 'assistant', content: [{ type: 'text', text: 'ok' }], timestamp: '2026-01-01T00:00:00.000Z' }] }), onEvent: () => {},
+    onApproval: (request) => { requests.push(request); onApproval(request, () => client) },
+    createApprovalClient: (options) => (client = createAcpClient({ ...options, command: process.execPath, args: [script, recordFile] })),
+  })
+  if (connection instanceof Error) { await removeTree(dir); return connection }
+  return { connection, dir, recordFile, requests }
+}
+
+test('an approval handler sees the payload and its answer reaches the agent exactly once', async () => {
+  const run = await buildApprovalSeam((request, client) => client().answerServerRequest({ requestId: request.requestId, result: { outcome: { outcome: 'selected', optionId: 'allow' } } }))
+  if (run instanceof Error) throw run
+  try {
+    for (let attempt = 0; attempt < 100 && run.requests.length === 0; attempt += 1) await sleep(20)
+    expect(run.requests[0]).toMatchObject({ requestId: 4242, method: 'session/request_permission', sessionId: 'session_approval', toolCall: { rawInput: { command: 'rm -rf build' } }, options: [{ optionId: 'allow' }, { optionId: 'reject' }] })
+    expect(run.connection.approvals!.pending()).toEqual([])
+    expect(await waitAnswers(run.recordFile)).toMatchObject([{ frame: { id: 4242, result: { outcome: { outcome: 'selected', optionId: 'allow' } } } }])
+    const again = run.connection.approvals!.answer({ requestId: 4242, result: {} })
+    expect([again instanceof AcpApprovalError, (again as Error).name, (again as Error).message]).toEqual([true, 'AcpApprovalError', expect.stringMatching(/already answered/)])
+  } finally {
+    run.connection.stop(); expect(await removeTree(run.dir)).toBe(true)
+  }
+})
+test('without an approval handler no ACP child starts and the projection is unchanged', async () => {
+  let factoryCalls = 0; const events: string[] = []
+  const connection = await createJcodeBotBackend({
+    binary: process.execPath, probe: async () => undefined, home: path.join(os.tmpdir(), 'kimaki-seam-no-approval'), sessionId: 'session_plain', intervalMs: 25,
+    readFile: async () => JSON.stringify({ id: 'session_plain', messages: [{ id: 'm1', role: 'assistant', content: [{ type: 'text', text: 'ok' }], timestamp: '2026-01-01T00:00:00.000Z' }] }), onEvent: (event) => events.push(event.type),
+    createApprovalClient: (options) => { factoryCalls += 1; return createAcpClient(options) },
+  })
+  if (connection instanceof Error) throw connection
+  expect([factoryCalls, Object.hasOwn(connection, 'approvals'), events]).toEqual([0, false, ['session.text.ended', 'session.execution.succeeded']]); connection.stop()
+})
+test('a handler that throws fails closed with one refusal, not a stalled agent', async () => {
+  const run = await buildApprovalSeam(() => { throw new Error('policy exploded') })
+  if (run instanceof Error) throw run
+  try {
+    expect(await waitAnswers(run.recordFile)).toMatchObject([{ frame: { id: 4242, error: { code: -32603 } } }])
+    const late = run.connection.approvals!.answer({ requestId: 4242, result: {} })
+    expect([late instanceof AcpApprovalError, (late as Error).name, (late as Error).message]).toEqual([true, 'AcpApprovalError', expect.stringMatching(/already answered/)])
+  } finally {
+    run.connection.stop(); expect(await removeTree(run.dir)).toBe(true)
+  }
+})
