@@ -1,21 +1,46 @@
-import { spawn } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
 import fs from 'node:fs'
 import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 import type { AddressInfo } from 'node:net'
+import { promisify } from 'node:util'
 import { afterAll, beforeAll, expect, test } from 'vitest'
-import { startOpencodeTestServer, startTwin, type OpencodeTestServer, type TestTwin } from './test/harness.js'
+import { JCODE_SKIP_NO_BINARY, startJcodeTestHub } from './test/jcode-harness.ts'
+import { startTwin, type TestTwin } from './test/harness.js'
 
-let server: OpencodeTestServer
+const execFileAsync = promisify(execFile)
+
 let twin: TestTwin
-beforeAll(async () => { [server, twin] = await Promise.all([startOpencodeTestServer(), startTwin()]) }, 75_000)
-afterAll(async () => { await Promise.all([server?.stop(), twin?.stop()]) }, 30_000)
+beforeAll(async () => { twin = await startTwin() }, 75_000)
+afterAll(async () => { await twin?.stop() }, 30_000)
 
-test('follow publishes one fixed line only with consent', async () => {
-  const native = await server.client()
-  const created = await native.session.create({ location: { directory: server.projectDirectory }, title: 'External session' })
-  const args = ['--service-file', server.serviceFile, '--host', 'host', '--endpoint', 'endpoint', '--native-session', created.id, '--tenant', twin.discord.guildId, '--surface', twin.channelId, '--timeout', '9000']
+test('follow publishes one fixed line only with consent', async (ctx) => {
+  // Honest skip: the jcode harness names the exact reason the runtime is absent.
+  // The handle also proves the binary path this test will actually execute.
+  const harness = await startJcodeTestHub()
+  const skipReason = harness.skipReason
+  const binary = harness.binary
+  await harness.close()
+  if (skipReason !== null || binary === null) {
+    expect(skipReason).toBe(JCODE_SKIP_NO_BINARY)
+    ctx.skip(true, skipReason ?? JCODE_SKIP_NO_BINARY)
+    return
+  }
+  // A real session record, written by the real binary into an explicit home.
+  // `ops follow --source jcode` polls persisted records, so the seed has to be
+  // one; a synthetic rewrite would only test this test's own JSON.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-jcode-follow-real-'))
+  const home = path.join(root, 'home')
+  const cwd = path.join(root, 'cwd')
+  fs.mkdirSync(home, { recursive: true })
+  fs.mkdirSync(cwd, { recursive: true })
+  const jcodeEnv = { ...process.env, JCODE_HOME: home, JCODE_NO_TELEMETRY: '1' }
+  const secret = 'SYNTHETIC SECRET BODY'
+  await execFileAsync(binary, ['run', secret, '--tool-profile', 'none', '--no-update', '--quiet', '-C', cwd], { env: jcodeEnv, timeout: 120_000 }).catch(() => undefined)
+  const sessions = path.join(home, 'sessions')
+  const nativeId = fs.readdirSync(sessions).find((name) => name.endsWith('.json'))!.replace(/\.json$/, '')
+  const args = ['--source', 'jcode', '--jcode-home', home, '--host', 'host', '--endpoint', 'endpoint', '--native-session', nativeId, '--tenant', twin.discord.guildId, '--surface', twin.channelId, '--timeout', '9000']
   const run = (extra: string[]) => {
     const child = spawn(process.execPath, ['--import', 'tsx', path.join(import.meta.dirname, 'cli.ts'), 'ops', 'follow', ...args, ...extra], {
       env: { ...process.env, KIMAKI_TEST_LOGS: '1', KIMAKI_BOT_TOKEN: twin.discord.botToken, KIMAKI_DISCORD_REST_URL: twin.discord.restUrl },
@@ -31,24 +56,32 @@ test('follow publishes one fixed line only with consent', async () => {
     })
     return { child, done, stderr: () => stderr }
   }
-  const refused = await run([]).done
-  expect(refused.code).not.toBe(0)
-  await native.session.update({ sessionID: created.id, title: 'Without consent' })
-  expect(await twin.discord.channel(twin.channelId).text()).toMatchInlineSnapshot('""')
-  const follow = run(['--consent'])
   try {
-    await expect.poll(() => follow.stderr(), { timeout: 120_000 }).toContain('Follow subscription ready')
-    await native.session.update({ sessionID: created.id, title: 'Private rename @everyone' })
-    await expect.poll(async () => (await twin.discord.channel(twin.channelId).getMessages()).length, { timeout: 60_000 }).toBe(1)
-    const result = await follow.done
-    expect(await twin.discord.channel(twin.channelId).text()).toMatchInlineSnapshot(`
-      "--- from: assistant (TestBot)
-      -# External OpenCode session activity observed."
-    `)
-    expect(result.code, result.stderr).toBe(0)
-    expect(JSON.parse(result.stdout)).toMatchObject({ sent: 1, denied: 0 })
-    expect(await twin.discord.channel(twin.channelId).getMessages()).toHaveLength(1)
-  } finally { follow.child.kill() }
+    const refused = await run([]).done
+    expect(refused.code).not.toBe(0)
+    expect(await twin.discord.channel(twin.channelId).text()).toMatchInlineSnapshot('""')
+    const follow = run(['--consent'])
+    try {
+      await expect.poll(() => follow.stderr(), { timeout: 120_000 }).toContain('Follow subscription ready')
+      // A real rename through the product's own CLI, not a JSON rewrite: this
+      // is the write the follower has to notice.
+      await execFileAsync(binary, ['session', 'rename', nativeId, 'Private rename @everyone', '--no-update', '--quiet', '-C', cwd], { env: jcodeEnv, timeout: 30_000 })
+      await expect.poll(async () => (await twin.discord.channel(twin.channelId).getMessages()).length, { timeout: 60_000 }).toBe(1)
+      const result = await follow.done
+      expect(await twin.discord.channel(twin.channelId).text()).toMatchInlineSnapshot(`
+        "--- from: assistant (TestBot)
+        -# External Jcode session activity observed."
+      `)
+      expect(result.code, result.stderr).toBe(0)
+      expect(JSON.parse(result.stdout)).toMatchObject({ sent: 1, denied: 0 })
+      expect(await twin.discord.channel(twin.channelId).getMessages()).toHaveLength(1)
+      // Only metadata is published: the transcript stays in the native store.
+      expect(await twin.discord.channel(twin.channelId).text()).not.toContain(secret)
+      expect(await twin.discord.channel(twin.channelId).text()).not.toContain('Private rename')
+    } finally { follow.child.kill() }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
+  }
 }, 300_000)
 
 test('follow publishes a Jcode rename from an explicit home', async () => {
