@@ -2,6 +2,17 @@
 // a local receiver instead of strada.sh. One Discord turn produces the funnel
 // events with the common identity props. The deterministic model reports zero
 // tokens, so tokens_used is skipped here; analytics.test.ts covers it.
+//
+// STILL ON OPENCODE. The jcode bot seam (backend/jcode-bot-backend.ts) projects
+// only session.text.ended and session.execution.succeeded out of a persisted
+// Jcode record. This funnel also needs session.execution.started, which emits
+// turn_started and seeds the usage turn_completed is folded from (analytics.ts
+// foldAnalytics), and it needs session_created, emitted by startSession right
+// after session.create (sessions.ts:496-507). The seam neither projects
+// execution.started (named in JCODE_BOT_NOT_PROJECTED) nor offers a session
+// write path: JcodeBotConnection.endpoint is null, so a Discord message cannot
+// become a Jcode prompt. Porting would replace the Discord turn with synthetic
+// events, so the funnel assertion stays here.
 
 import fs from 'node:fs'
 import http from 'node:http'
