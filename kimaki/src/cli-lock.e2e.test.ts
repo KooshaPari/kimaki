@@ -409,6 +409,9 @@ test('CLI help documents the supported P7 commands', async () => {
         --log <path>                    Append-only JSONL event log; enables resume across restarts and takes a writer lease
         --timeout <ms>                  Per-request ACP deadline in milliseconds
         --buffer <n>                    In-memory replay buffer size in events (default: 500)
+        --data-dir <path>               Data directory (default: ~/.kimaki)
+        --run-id <id>                   Paperclip run ID for the durable launch fence; a second launcher for the same run is refused
+        --instance <id>                 Paperclip instance ID for the launch fence (default: local)
 
       ops jcode attach                  Attach to a running hub, stream its events, optionally prompt and acknowledge
         --url <url>                     Explicit hub URL, as printed by ops jcode serve
@@ -473,6 +476,31 @@ test('CLI help documents the supported P7 commands', async () => {
         --cursor <n>                    Start from this cursor when the state file is missing
         --rebind                        Follow a live session.started that names a different session instead of failing closed (default: refuse)
         --timeout <ms>                  Maximum viewing duration in milliseconds (default: 0, unbounded)
+
+      ops paperclip enroll              Explicitly enroll one observed session into the Paperclip surface
+        --action <action>               The explicit operator action; must be exactly "enroll"
+        --host <id>                     Explicit runtime host identity
+        --endpoint <id>                 Explicit runtime endpoint identity, not a surface or thread id
+        --backend <kind>                Native runtime kind, for example opencode or codex
+        --native-session <id>           Explicit native session ID
+        --runtime-backend-kind <kind>   Runtime backend kind; must match --backend
+        --runtime-endpoint <id>         Runtime endpoint identity; must match --endpoint
+        --runtime-version <version>     Optional runtime version metadata; never widens authority
+        --surface <surface>             Enrolled surface; must be paperclip
+        --mode <mode>                   Enrolled mode; must be observe
+        --publication <policy>          Publication policy; must be none
+        --created-at <iso>              Explicit canonical ISO 8601 enrollment timestamp
+        --existing <path>               JSON file holding existing enrollment records; a different record for the same session is refused
+
+      ops paperclip project             Project one explicitly enrolled session into its observed Paperclip entity
+        --file <path>                   JSON file holding the full projection input: enrollment, session and optional metadata
+        --enrollment <path>             JSON file holding one enrollment record, when not using --file
+        --host <id>                     Explicit observed runtime host identity
+        --endpoint <id>                 Explicit observed runtime endpoint identity
+        --backend <kind>                Observed native runtime kind
+        --native-session <id>           Explicit observed native session ID
+        --runtime-version <version>     Observed runtime version metadata
+        --observed-at <iso>             Explicit canonical ISO 8601 observation timestamp
 
       ops analytics                     Read-only analytics sink status: named source health and delivery counters
         --json                          Print the status as JSON
