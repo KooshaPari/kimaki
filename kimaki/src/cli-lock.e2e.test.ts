@@ -352,6 +352,8 @@ test('CLI help documents the supported P7 commands', async () => {
         --profile <id>                  Runtime profile: jcode (stock, default) or kcode; a mismatched identity is refused
         --limit <n>                     Page size for jcode discovery (default: 50)
         --cursor <offset>               Opaque cursor from a previous jcode page
+        --json                          Print only the JSON document; the human-readable health summary goes to stderr by default
+        --pid-map <path>                Explicit JSON file mapping discovered session IDs to {pid, birthMarker?}; enables one live process enumeration comparison
         --host <id>                     Explicit native runtime host identity
         --endpoint <id>                 Explicit native runtime endpoint identity
         --binary <path>                 Explicit herdr or Codex executable (default: herdr on PATH)
@@ -471,6 +473,9 @@ test('CLI help documents the supported P7 commands', async () => {
         --cursor <n>                    Start from this cursor when the state file is missing
         --rebind                        Follow a live session.started that names a different session instead of failing closed (default: refuse)
         --timeout <ms>                  Maximum viewing duration in milliseconds (default: 0, unbounded)
+
+      ops analytics                     Read-only analytics sink status: named source health and delivery counters
+        --json                          Print the status as JSON
 
       Channel:
       channel worktrees <value>         Set automatic worktrees: on | off
