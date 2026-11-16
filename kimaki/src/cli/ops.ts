@@ -27,6 +27,23 @@ function approvalDecision(value: string | undefined): 'accept' | 'acceptForSessi
   return fail(new ConfigError({ reason: '--approval must be accept, acceptForSession, decline or cancel' }))
 }
 
+// The observer already classifies every candidate record as consistent or
+// transient and counts the ones it skipped. A skipped transient means the file
+// was mid-write at read time, not that no session exists, so the verdict is
+// printed beside the JSON document rather than left implicit.
+export function discoverHealthLine({ source, health, skippedTransient, sessions, cursor }: {
+  source: string
+  health: 'consistent' | 'transient'
+  skippedTransient: number
+  sessions: number
+  cursor: string | null
+}): string {
+  const reason = health === 'transient'
+    ? `${skippedTransient} record(s) were mid-write (unstable, unparsable or mismatched) and skipped, not treated as absent`
+    : 'every candidate record was read consistently'
+  return `${source} discovery: health=${health} skippedTransient=${skippedTransient} (${reason}); sessions=${sessions} cursor=${cursor ?? 'null'}`
+}
+
 // The observer refuses an unknown profile before publication, so the follow
 // notice can forward the same id without re-validating it here. Keeping this
 // pure makes the CLI wiring unit-testable without spawning the full command.
@@ -260,6 +277,7 @@ export function registerOpsCommands(cli: Goke) {
     .option('--profile <id>', 'Runtime profile: jcode (stock, default) or kcode; a mismatched identity is refused')
     .option('--limit <n>', 'Page size for jcode discovery (default: 50)')
     .option('--cursor <offset>', 'Opaque cursor from a previous jcode page')
+    .option('--json', 'Print only the JSON document; the human-readable health summary goes to stderr by default')
     .option('--host <id>', 'Explicit native runtime host identity')
     .option('--endpoint <id>', 'Explicit native runtime endpoint identity')
     .option('--binary <path>', 'Explicit herdr or Codex executable (default: herdr on PATH)')
@@ -288,7 +306,17 @@ export function registerOpsCommands(cli: Goke) {
         if (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 1)) fail(new ConfigError({ reason: '--limit must be a positive integer' }))
         const page = await observer.discover({ limit, cursor: options.cursor })
         if (page instanceof Error) fail(page)
-        printJson({ source: 'jcode', observedAt: new Date().toISOString(), coverage: 'explicit-jcode-home-metadata-page', endpoint: page.source, sessions: page.sessions.map(({ key, title }) => ({ key, title })), cursor: page.cursor })
+        // observation.health and skippedTransient are what separate a settled
+        // page from one where torn records were skipped. Both ride in the JSON
+        // document and the named verdict is echoed for a human reader.
+        if (options.json !== true) process.stderr.write(`${discoverHealthLine({
+          source: 'jcode',
+          health: page.observation.health,
+          skippedTransient: page.observation.skippedTransient,
+          sessions: page.sessions.length,
+          cursor: page.cursor,
+        })}\n`)
+        printJson({ source: 'jcode', observedAt: new Date().toISOString(), coverage: 'explicit-jcode-home-metadata-page', endpoint: page.source, health: page.observation.health, skippedTransient: page.observation.skippedTransient, sessions: page.sessions.map(({ key, title }) => ({ key, title })), cursor: page.cursor })
         return
       }
       if (source === 'codex') {
