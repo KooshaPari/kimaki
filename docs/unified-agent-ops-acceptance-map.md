@@ -79,6 +79,21 @@ AC03, AC04, AC05, AC06, AC07, AC09, AC10, AC11, AC13, AC14, AC15, AC17, AC18, AC
 | WP8 | Reliability and acceptance witnesses | partial | Validated on 2026-11-15: 98 backend (hub 38, hub-server 9, hub-client 5, jcode 22, ACP 24), 43 Codex control, 6 Codex transport, 7 Codex hub, 13 publication, 23 Discord view, 3 native mirror, 30 binding, 6 echo, 9 projection, 30 paperclip, 50 discovery, 7 backup-store and 7 engine-identity tests; three real witnesses (three clients on one jcode hub, native terminal mirrored into a channel, real Codex thread served and mirrored); test-suite gate baseline recorded in `docs/release-gate-2026-11-14.md` |
 | WP9 | Migration and retirement | not started | decision matrix and rollback rehearsal only; nothing drained or retired |
 
+## Environment blockers (measured 2026-11-16)
+
+Three of the remaining cases cannot be closed on this host by writing code. Each is stated with the
+check that produced it, so the next person does not repeat the search.
+
+| Blocker | Case it holds | Evidence gathered |
+| --- | --- | --- |
+| No Discord guild credential | AC34's live connector reroute, and every channel row that still cites `discord-digital-twin` | no `.env` and no `.dev.vars` in the package; no `DISCORD_*`, `*_GUILD_*` or `*TOKEN*` variable in the shell environment; no `~/.kimaki` directory to read a stored token from. Nothing to authenticate with, so a real guild send cannot be attempted |
+| No account credential for the Codex default provider | AC17/AC18/WP4's default-provider half | `ops codex turn` against an isolated home exits 1 at `turn/start` with `401 Unauthorized ... Missing bearer or basic authentication`; the approval work therefore runs on a local Responses-API model instead |
+| No Paperclip service | AC29/AC30's service half | the enrolment and projection modules are local records with no client for a Paperclip API, and nothing on this host exposes one to call |
+
+What is *not* blocked and was therefore worked rather than recorded: the bot-side wiring of the view,
+a shipped CLI for the Paperclip records, and a cutover between two real consumer processes all run
+entirely on this host, with the twin standing in only for Discord REST.
+
 ## What would move the most cases
 
 1. AC29, AC30 and AC22 now have a local projection, an explicit enrollment record and a reconciliation ledger; the remaining lever is a live Paperclip API call and a persisted sync-back table, which turns all three from local to live.
