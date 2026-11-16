@@ -22,6 +22,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { ConfigError } from '../errors.js'
+import type { DurableLaunchFence } from '../ops/paperclip/launch-fence-durable.js'
 
 export type HubEvent =
   | { seq: number; type: 'session.started'; sessionId: string; model: string | null }
@@ -171,6 +172,7 @@ export function createSessionHub({
   logFile,
   leaseFile,
   launchTimeoutMs = 30_000,
+  launchFence,
 }: {
   backend: HubBackend
   bufferLimit?: number
@@ -181,6 +183,12 @@ export function createSessionHub({
   leaseFile?: string
   /** Bound on a managed launch that never acknowledges the session. */
   launchTimeoutMs?: number
+  /**
+   * Optional durable Paperclip claim, taken before the backend is spawned and
+   * released on any failed launch. Additive: the advisory writer lease above is
+   * unchanged and both fences apply.
+   */
+  launchFence?: { fence: DurableLaunchFence; scope: { instanceId: string; runId: string }; launcher: string } | undefined
 }): SessionHub | ConfigError {
   if (!Number.isSafeInteger(bufferLimit) || bufferLimit < 1) {
     return new ConfigError({ reason: 'Hub bufferLimit must be a positive integer' })
@@ -262,6 +270,21 @@ export function createSessionHub({
   //   still waiting for an ACK from a process that is already gone), bounded here
   // A launch that never produced a session ID is never a session.
   const launch = async (): Promise<{ sessionId: string; model: string | null } | Error> => {
+    // Cross-process exclusion first: a competing launcher for this run is refused
+    // here, before any process is spawned, rather than after.
+    const fence = launchFence
+    let fenced: number | undefined
+    if (fence !== undefined) {
+      const claimed = fence.fence.claim({ scope: fence.scope, launcher: fence.launcher })
+      if (claimed instanceof ConfigError) return claimed
+      fenced = claimed.record.generation
+    }
+    // A launch that never produced a session must not keep the run fenced.
+    const release = (): void => {
+      if (fence === undefined || fenced === undefined) return
+      fence.fence.release({ scope: fence.scope, launcher: fence.launcher, generation: fenced })
+      fenced = undefined
+    }
     let timer: ReturnType<typeof setTimeout> | undefined
     const deadline = new Promise<Error>((resolve) => {
       timer = setTimeout(() => {
@@ -271,13 +294,18 @@ export function createSessionHub({
     })
     try {
       const outcome = await Promise.race([backend.start(model === undefined ? undefined : { model }), deadline])
-      if (outcome instanceof Error) return outcome
+      if (outcome instanceof Error) {
+        release()
+        return outcome
+      }
       const started = outcome as { sessionId?: unknown; model?: unknown }
       if (typeof started.sessionId !== 'string' || !started.sessionId.trim()) {
+        release()
         return new ConfigError({ reason: 'Backend launch returned no session ID before acknowledging the session' })
       }
       return { sessionId: started.sessionId, model: typeof started.model === 'string' ? started.model : null }
     } catch (cause) {
+      release()
       if (cause instanceof Error) return cause
       return new ConfigError({ reason: 'Backend launch crashed before acknowledging the session', cause })
     } finally {
