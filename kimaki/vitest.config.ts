@@ -24,10 +24,29 @@
 // sub-second). KIMAKI_TEST_WORKERS overrides it for a single-file bisect.
 // testTimeout stays above the 10s waitFor clamp so a slow wait fails with its
 // own label.
+//
+// Why e2e files get their own (larger) timeouts:
+//
+// Teardown of one e2e file stops a bot, a Discord twin and an OpenCode server.
+// On an idle host that takes seconds; on a saturated one the same shutdowns
+// together overrun the 60 s default and fail an `afterAll` whose tests already
+// passed (measured: a full-suite run under outside load reported 5 failures -
+// `Hook timed out in 60000ms` in agent-ui/legacy/queue-sources/routines and one
+// reordered snapshot - and every one of those files passed on a serial re-run).
+// The budget therefore is 120 s per test and 180 s per hook for e2e files only.
+// It stays finite, so a hook that genuinely hangs still fails; retries are not
+// used to hide anything. Unit files keep the root budget so a slow unit test
+// still fails fast.
+//
+// Projects are the only way to scope options per file set in vitest; each one
+// extends the root config, so pool/env/worker options above still apply.
 
-import { defineConfig } from 'vitest/config'
+import { configDefaults, defineConfig } from 'vitest/config'
 
 const workers = Number(process.env['KIMAKI_TEST_WORKERS']) || 2
+
+const E2E_TEST_TIMEOUT = 120_000
+const E2E_HOOK_TIMEOUT = 180_000
 
 export default defineConfig({
   test: {
@@ -41,5 +60,24 @@ export default defineConfig({
     poolOptions: { forks: { execArgv: process.platform === 'win32' ? ['--expose-gc'] : [] } },
     maxWorkers: workers,
     minWorkers: 1,
+    projects: [
+      {
+        extends: true,
+        test: {
+          name: 'unit',
+          include: ['src/**/*.test.ts'],
+          exclude: [...configDefaults.exclude, 'src/**/*.e2e.test.ts'],
+        },
+      },
+      {
+        extends: true,
+        test: {
+          name: 'e2e',
+          include: ['src/**/*.e2e.test.ts'],
+          testTimeout: E2E_TEST_TIMEOUT,
+          hookTimeout: E2E_HOOK_TIMEOUT,
+        },
+      },
+    ],
   },
 })
