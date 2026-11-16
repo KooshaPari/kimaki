@@ -473,6 +473,12 @@ test('CLI help documents the supported P7 commands', async () => {
         --token <token>                 Bot token (default: KIMAKI_BOT_TOKEN)
         --state <path>                  Durable cursor file; a restart posts nothing twice
         --client <id>                   Client identity to register in hub presence (default: discord-view-<surface>, which refuses a second view of the same channel)
+        --host <id>                     Consumer host identity; with --endpoint, --backend and --native-session the view claims its surface binding before every post
+        --endpoint <id>                 Consumer endpoint identity, naming the binding row this view holds
+        --backend <kind>                Consumer runtime kind recorded on its binding
+        --native-session <id>           Consumer native session recorded on its binding
+        --service <kind>                Outward service kind of the claimed surface (default: discord)
+        --data-dir <path>               Data directory (default: ~/.kimaki)
         --cursor <n>                    Start from this cursor when the state file is missing
         --rebind                        Follow a live session.started that names a different session instead of failing closed (default: refuse)
         --timeout <ms>                  Maximum viewing duration in milliseconds (default: 0, unbounded)
@@ -632,6 +638,22 @@ test('CLI help documents the supported P7 commands', async () => {
       bot install-url                   Print the Discord bot install URL
         --data-dir <path>               Data directory (default: ~/.kimaki)
         --gateway-callback-url <url>    Gateway only: redirect here after the install
+
+      discord-view bind                 Mirror one hub session into a Discord channel on every bot start
+        --data-dir <path>               Data directory (default: ~/.kimaki)
+        --tenant <id>                   Guild id the channel must belong to
+        --surface <id>                  Channel id to post turns into
+        --url <url>                     Hub URL, as printed by kimaki ops jcode serve
+        --client <id>                   Client identity in hub presence (default: discord-view-<surface>)
+        --cursor <n>                    Start from this cursor when the durable state file is missing
+        --rebind                        Follow a live session.started that names a different session (default: refuse)
+
+      discord-view unbind               Stop mirroring the hub into its channel on the next bot start
+        --data-dir <path>               Data directory (default: ~/.kimaki)
+
+      discord-view status               Print the persisted Discord view binding
+        --data-dir <path>               Data directory (default: ~/.kimaki)
+        --json                          Output as JSON
 
     Options:
       --data-dir <path>             Data directory (default: ~/.kimaki)
