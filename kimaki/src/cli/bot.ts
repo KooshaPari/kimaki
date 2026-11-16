@@ -13,6 +13,7 @@ import { wrapJsonSchema, type Goke } from 'goke'
 import { distCliEntry, removeAutostartScript, stableNodePath, writeAutostartScript } from '../autostart.ts'
 import { parseDisabledPromptSections, parseDisabledSkills, PROMPT_SECTIONS } from '../builtin-skills.ts'
 import { callBot, DEFAULT_LOCK_PORT, RESTART_EXIT_CODE, startLockServer } from '../lock-server.ts'
+import { ConfigError } from '../errors.ts'
 import { parseDuration } from '../duration.ts'
 import { createLogger, setLogFile } from '../logger.ts'
 import { action, DATA_DIR_HELP, dataDirOrDefault, discordApi, fail, openCliDb, printJson } from './shared.ts'
@@ -229,9 +230,19 @@ export function registerStartCommand(cli: Goke) {
         coordinator: options.coordinator,
       })
       if (bot instanceof Error) failStartup(bot)
+      // Opt-in hub mirror: with no persisted binding this is a no-op, so a plain
+      // start behaves exactly as before. A bad binding is reported, never guessed
+      // at, and leaves the bot running without a view.
+      const { startViewSupervision } = await import('../ops/discord/view-supervision.ts')
+      const view = await startViewSupervision({ dataDir, rest: bot.discord.rest })
+      const viewError = view.error()
+      if (viewError) logger.warn('Discord view not started', viewError)
+      const viewBinding = view.binding()
+      if (viewBinding) logger.info(`discord view mirrors ${viewBinding.baseUrl} into channel ${viewBinding.channelId}`)
+      // The view stops first: it only needs the REST client, which bot.stop() destroys.
       // exit() keeps process.exitCode: the restart route sets RESTART_EXIT_CODE before its SIGTERM.
       const shutdown = () => {
-        void bot.stop().then(() => process.exit())
+        void view.stop().then(() => bot.stop()).then(() => process.exit())
       }
       process.once('SIGTERM', shutdown)
       process.once('SIGINT', shutdown)
@@ -439,5 +450,83 @@ export function registerBotCommands(cli: Goke) {
       const { installUrlFor, gatewayUrlsFromEnv } = await import('../credentials.ts')
       const { credentials } = await discordApi(options.dataDir)
       process.stdout.write(`${installUrlFor({ credentials, website: gatewayUrlsFromEnv().website, callbackUrl: options.gatewayCallbackUrl })}\n`)
+    })
+
+  // The bot starts the hub mirror only for a persisted binding. These commands
+  // are explicit: the operator supplies the guild, channel and hub URL, because
+  // nothing about the bot can infer which session should be mirrored where.
+  cli.command('discord-view bind', 'Mirror one hub session into a Discord channel on every bot start')
+    .option('--data-dir <path>', DATA_DIR_HELP)
+    .option('--tenant <id>', 'Guild id the channel must belong to')
+    .option('--surface <id>', 'Channel id to post turns into')
+    .option('--url <url>', 'Hub URL, as printed by kimaki ops jcode serve')
+    .option('--client <id>', 'Client identity in hub presence (default: discord-view-<surface>)')
+    .option('--cursor <n>', 'Start from this cursor when the durable state file is missing')
+    .option('--rebind', 'Follow a live session.started that names a different session (default: refuse)')
+    .example('kimaki discord-view bind --tenant 123 --surface 456 --url http://127.0.0.1:8787')
+    .action(async (options) => {
+      const tenantId = options.tenant?.trim()
+      if (!tenantId) fail(new ConfigError({ reason: 'Supply --tenant <guildId> explicitly. The view never infers a guild' }))
+      const channelId = options.surface?.trim()
+      if (!channelId) fail(new ConfigError({ reason: 'Supply --surface <channelId> explicitly. The view never infers a channel' }))
+      const baseUrl = options.url?.trim()
+      if (!baseUrl) fail(new ConfigError({ reason: 'Supply --url <hubUrl> explicitly. The view never infers a hub' }))
+      const { viewBindingPath, writeViewBinding } = await import('../ops/discord/view-supervision.ts')
+      const dataDir = dataDirOrDefault(options.dataDir)
+      const written = await writeViewBinding({
+        dataDir,
+        binding: {
+          tenantId,
+          channelId,
+          baseUrl,
+          ...(options.client === undefined ? {} : { clientId: options.client }),
+          ...(options.cursor === undefined ? {} : { cursor: Number(options.cursor) }),
+          ...(options.rebind === true ? { rebind: true } : {}),
+        },
+      })
+      if (written instanceof Error) fail(written)
+      process.stdout.write(`Bound the Discord view to channel ${channelId} in guild ${tenantId} (${viewBindingPath(dataDir)}). Start or restart the bot to run it.\n`)
+    })
+
+  cli.command('discord-view unbind', 'Stop mirroring the hub into its channel on the next bot start')
+    .option('--data-dir <path>', DATA_DIR_HELP)
+    .action(async (options) => {
+      const { removeViewBinding, viewBindingPath } = await import('../ops/discord/view-supervision.ts')
+      const dataDir = dataDirOrDefault(options.dataDir)
+      const removed = await removeViewBinding({ dataDir })
+      if (removed instanceof Error) fail(removed)
+      process.stdout.write(removed ? `Removed ${viewBindingPath(dataDir)}\n` : `No Discord view binding at ${viewBindingPath(dataDir)}\n`)
+    })
+
+  cli.command('discord-view status', 'Print the persisted Discord view binding')
+    .option('--data-dir <path>', DATA_DIR_HELP)
+    .option('--json', 'Output as JSON')
+    .action(async (options) => {
+      const { readViewBinding, viewBindingPath, viewStatePath } = await import('../ops/discord/view-supervision.ts')
+      const dataDir = dataDirOrDefault(options.dataDir)
+      const binding = await readViewBinding({ dataDir })
+      if (binding instanceof Error) fail(binding)
+      const status = binding === null
+        ? { bound: false, path: viewBindingPath(dataDir) }
+        : {
+            bound: true,
+            path: viewBindingPath(dataDir),
+            tenantId: binding.tenantId,
+            channelId: binding.channelId,
+            baseUrl: binding.baseUrl,
+            clientId: binding.clientId ?? `discord-view-${binding.channelId}`,
+            statePath: viewStatePath({ dataDir, channelId: binding.channelId }),
+            ...(binding.cursor === undefined ? {} : { cursor: binding.cursor }),
+            rebind: binding.rebind === true,
+          }
+      if (options.json) {
+        printJson(status)
+        return
+      }
+      if (binding === null) {
+        process.stdout.write(`No Discord view binding at ${viewBindingPath(dataDir)}\n`)
+        return
+      }
+      process.stdout.write(`Discord view bound: guild ${binding.tenantId}, channel ${binding.channelId}, hub ${binding.baseUrl}\n`)
     })
 }
