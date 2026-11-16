@@ -1,7 +1,9 @@
 // Product analytics end to end: the real Strada SDK exports OTLP JSON logs to
 // a local receiver instead of strada.sh. One Discord turn produces the funnel
 // events with the common identity props. The deterministic model reports zero
-// tokens, so tokens_used is skipped here; analytics.test.ts covers it.
+// tokens, so tokens_used is skipped here; analytics.test.ts covers it. The turn
+// is slowed by a model delay so its wall-clock duration is measurable, which is
+// what makes `duration_sec` assertable at all (see slowZeroTokenMatcher).
 //
 // STILL ON OPENCODE. The jcode bot seam (backend/jcode-bot-backend.ts) projects
 // only session.text.ended and session.execution.succeeded out of a persisted
@@ -22,6 +24,7 @@ import { removeDataDir } from './test/cleanup.ts'
 
 import { createAnalytics } from './analytics.ts'
 import type { BotHandle } from './main.ts'
+import type { DeterministicMatcher } from 'opencode-deterministic-provider'
 import {
   freePort,
   seedProjectChannel,
@@ -36,6 +39,30 @@ import {
   type OpencodeTestServer,
   type TestTwin,
 } from './test/harness.ts'
+
+// duration_sec is wall-clock: analytics.ts foldAnalytics rounds the difference
+// between the OpenCode server's own execution.succeeded and execution.started
+// timestamps. This test process never sees those timestamps, so the only way to
+// pin the value is to make the turn genuinely long. Two seconds of model delay
+// puts the duration deterministically at 2 or more whole seconds on any machine.
+const SLOW_MARKER = 'analytics-slow-turn-marker'
+const TURN_DELAY_MS = 2_000
+// Same zero-token reply the bare deterministic model gives (so tokens_used stays
+// skipped), streamed after TURN_DELAY_MS.
+const slowZeroTokenMatcher: DeterministicMatcher = {
+  id: SLOW_MARKER,
+  priority: 1,
+  when: { latestUserTextIncludes: SLOW_MARKER },
+  then: {
+    parts: [
+      { type: 'text-start', id: 'text' },
+      { type: 'text-delta', id: 'text', delta: 'analytics turn done' },
+      { type: 'text-end', id: 'text' },
+      { type: 'finish', finishReason: 'stop', usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 } },
+    ],
+    partDelaysMs: [0, TURN_DELAY_MS, 0, 0],
+  },
+}
 
 type OtlpValue = { stringValue?: string; intValue?: string | number; doubleValue?: number; boolValue?: boolean }
 type OtlpLogs = {
@@ -66,7 +93,7 @@ beforeAll(async () => {
   })
   const port = await freePort()
   await new Promise<void>((resolve) => receiver.listen(port, '127.0.0.1', resolve))
-  ;[server, twin] = await Promise.all([startOpencodeTestServer(), startTwin()])
+  ;[server, twin] = await Promise.all([startOpencodeTestServer({ matchers: [slowZeroTokenMatcher] }), startTwin()])
   await warmUp({ server })
   await seedProjectChannel({ dataDir, channelId: twin.channelId, guildId: twin.discord.guildId, directory: server.projectDirectory })
   bot = await startTestBot({
@@ -86,7 +113,7 @@ afterAll(async () => {
 })
 
 test('a Discord turn sends the funnel events with anonymous identity props', async () => {
-  await twin.discord.channel(twin.channelId).user(TEST_USER_ID).sendMessage({ content: 'analytics turn' })
+  await twin.discord.channel(twin.channelId).user(TEST_USER_ID).sendMessage({ content: `${SLOW_MARKER} analytics turn` })
   const thread = await twin.discord.channel(twin.channelId).waitForThread({ timeout: 8_000 })
   await waitForFooter({ discord: twin.discord, threadId: thread.id })
   await waitFor({
@@ -97,11 +124,31 @@ test('a Discord turn sends the funnel events with anonymous identity props', asy
     },
   })
   const installId = fs.readFileSync(`${dataDir}/install-id`, 'utf8').trim()
+  // duration_sec cannot be frozen here: it is measured on the server's clock.
+  // Assert its shape and the floor the model delay guarantees, then blank it so
+  // the snapshot below stays exact for every other property.
+  const durations = received.flatMap((event) => {
+    const duration = event['custom.duration_sec']
+    return typeof duration === 'number' ? [duration] : []
+  })
+  expect(durations).toHaveLength(1)
+  const [duration = Number.NaN] = durations
+  expect(Number.isInteger(duration)).toBe(true)
+  expect(duration).toBeGreaterThanOrEqual(Math.floor(TURN_DELAY_MS / 1_000))
+  // Generous ceiling: a real turn, not a value frozen by the code under test.
+  expect(duration).toBeLessThan(60)
   expect(
     received.map((event) => {
-      const { ['custom.install_id']: id, ['custom.platform']: platform, ['custom.arch']: arch, ...rest } = event
+      const {
+        ['custom.install_id']: id,
+        ['custom.platform']: platform,
+        ['custom.arch']: arch,
+        ['custom.duration_sec']: secs,
+        ...rest
+      } = event
       return {
         ...rest,
+        ...(secs === undefined ? {} : { 'custom.duration_sec': '<duration_sec>' }),
         'custom.install_id': id === installId ? '<install-id>' : id,
         'custom.platform': platform === process.platform ? '<platform>' : platform,
         'custom.arch': arch === process.arch ? '<arch>' : arch,
@@ -140,7 +187,7 @@ test('a Discord turn sends the funnel events with anonymous identity props', asy
       {
         "custom.arch": "<arch>",
         "custom.bot_mode": "self_hosted",
-        "custom.duration_sec": 0,
+        "custom.duration_sec": "<duration_sec>",
         "custom.install_id": "<install-id>",
         "custom.platform": "<platform>",
         "custom.schema_version": 1,
