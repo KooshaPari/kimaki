@@ -12,12 +12,12 @@ Checksums from the bundle's own `SHA256SUMS.txt`: 7 of 7 documents match.
 
 | Status | Cases |
 | --- | --- |
-| Closed at the plan's standard | 17 |
-| Partial | 21 |
+| Closed at the plan's standard | 18 |
+| Partial | 20 |
 | Not started | 2 |
 | Total | 40 |
 
-AC03, AC04, AC05, AC06, AC07, AC09, AC10, AC11, AC13, AC14, AC15, AC17, AC18, AC23, AC25, AC35, AC38 are closed. Every other case still lacks both a real native surface and a live service path in the same piece of evidence, which is the standard the plan sets.
+AC03, AC04, AC05, AC06, AC07, AC09, AC10, AC11, AC13, AC14, AC15, AC16, AC17, AC18, AC23, AC25, AC35, AC38 are closed. Every other case still lacks both a real native surface and a live service path in the same piece of evidence, which is the standard the plan sets.
 
 ## Acceptance cases
 
@@ -38,7 +38,7 @@ AC03, AC04, AC05, AC06, AC07, AC09, AC10, AC11, AC13, AC14, AC15, AC17, AC18, AC
 | AC13 | Stream gap/overflow | closed | `hub.test.ts` covers the explicit gap path: a cursor behind the retained buffer returns `clipped: true` with the retained tail, a cursor at the head returns `clipped: false`, and a durable log replays in full from cursor 0. Observed cursor values and delivered event ids recorded in the test; 36 hub tests and `tsc` clean |
 | AC14 | Duplicate incoming event | closed | real run through the public CLI and HTTP API: first submit admitted with `duplicate: false`, the same request id returned `duplicate: true` without a second turn, the sequence advanced exactly once (4), the same id with different text was refused with 409, and a fresh id was admitted |
 | AC15 | Crash after launch before ACK | closed | A throwing or rejecting `backend.start()` is still normalized to an Error, and the hub now bounds a pre-ACK launch (`launchTimeoutMs`, default 30 s) and refuses to fabricate a session when a launch returns no id. Two tests spawn a real `node` child that writes its pid and `process.exit(7)` without answering, driven through the real `createAcpClient` transport: `start()` returns the death error well under the timeout with no `session.started`, `seq` stays 0, a later submit fails closed, the child pid is dead, a real dead pid in the holder file is taken over, and a second test pins the deadline for a child whose exit the transport never observes. 38 hub tests plus 2 real-launch tests, `tsc` clean; commits `1ffb6d9c` and `95dd2dcd`. The real-runtime witness is `kimaki/src/backend/hub.real-launch.test.ts`: it launches the real `jcode.exe` through the real `createAcpClient` transport in a fresh temp `JCODE_HOME` and issues `SIGKILL` to the exact pid the transport spawned once the child answers `initialize` (`agentCapabilities` seen) and before it can answer `session/new`, so the kill lands inside the handshake. The hub reports the literal `The ACP agent process exited before responding` 66 ms from launch (7 ms after the kill), asserted below 5 s and a quarter of the 30 s bound; it publishes no `session.started`, keeps `seq 0`, the killed pid is dead, and a later submit fails closed with `spawned` still 1. A companion case pins the other half: a launch that resolves with no session ID is refused with `Backend launch returned no session ID before acknowledging the session`. Still untested and recorded: the crash is a test-issued `SIGKILL` on the child's stdout rather than a spontaneous runtime abort, the no-id companion is a synthetic backend rather than a real runtime, the 250 ms deadline case is timing-sensitive under parallel load (it failed once in a 4-file parallel run and passed alone), and only jcode was exercised, not kcode |
-| AC16 | Competing managed launch paths | partial | the hub lease still refuses a second writer, and a managed launch now has a Paperclip claim fence: one claim per `(instanceId, runId)` with monotonic `generation` and `claimSeq`, a sha256 digest over the record, holder-only release, heartbeat expiry, and a stale takeover that advances the generation so the previous holder's write is refused. A second live claim, a release by a non-holder, a superseded or forged generation, and a run already held by the hub are each refused by name, and both directions are covered (a hub claim blocks a Paperclip claim, a Paperclip claim blocks a hub write). 11 launch-fence tests (30 paperclip tests with `index` and `observe`), `tsc` clean in `src/ops/paperclip/**`, commit `9629b7e3`; accepting a competing live claim fails 3 tests and freezing the generation fails 2. Not closed: the fence is a caller-owned JSON record with no cross-process lock and no Paperclip API call, `launchFenceCapabilities` declares `dispatch`, `remoteWrite` and `inference` false, and no shipped command imports `createLaunchFence`, so no two real launchers were raced |
+| AC16 | Competing managed launch paths | closed | the hub lease still refuses a second writer, and a managed launch takes a Paperclip claim fence: one claim per `(instanceId, runId)` with monotonic `generation` and `claimSeq`, a sha256 digest over the record, holder-only release, heartbeat expiry, and a stale takeover that advances the generation so the previous holder's write is refused. A second live claim, a release by a non-holder, a superseded or forged generation, and a run already held by the hub are each refused by name, and both directions are covered (a hub claim blocks a Paperclip claim, a Paperclip claim blocks a hub write). The fence is now cross-process durable (`fe86423b`): table `ops_paperclip_launch_fence` with `UNIQUE (instance_id, run_id)`, a row store (`launch-fence-store.ts`) and CAS rules (`launch-fence-durable.ts`), where the insert is the exclusion primitive and a takeover is a compare-and-set on the row just read. Two real `node --import tsx claim-worker.ts` processes open one database file, wait on a shared start barrier and claim the same run: exactly one `claimed` at generation 1, the loser refused as a `ConfigError` naming `run run-1 on instance pc-instance` and the winner's launcher, and one row survives which a fresh connection reads back at generation 1 (the fresh read verifies the record digest); replacing the unique index with a plain index fails that race with two winners (`expected [ { ok: true, ... }, ... ] to have a length of 1 but got 2`). The shipped hub claims too (`7c4582b4`): `createSessionHub` takes an optional `launchFence`, claims before `backend.start()` and releases on every failure path, proven by `src/backend/hub-launch-fence.test.ts` (3 tests) where the rival hub is refused by name with `second.calls.starts === 0` and no events, and a failed or session-less launch frees the run for the next launcher; removing the release fails with the next launcher refused for `run-1`. The shipped command reaches it (`a47fa5ed`): `ops jcode serve --run-id/--instance/--data-dir` claims against `kimaki.db` before any hub or backend exists, and a refused claim exits non-zero printing the fence text; `src/cli/ops-launch-fence.test.ts` spawns the real CLI twice, the first serves and prints a URL, the second exits non-zero naming `kimaki-cli-serve:<first pid>` with no URL on stdout, and suppressing the refusal fails with `expected 'served' to be 'exited'`. Caveats that survive: the fence is a local metadata claim in `kimaki.db`, and `launchFenceCapabilities` declares `dispatch`, `cancellation`, `remoteWrite` and `inference` false, so it grants no work authority and makes no Paperclip API call; `ops jcode serve` is fenced only when `--run-id` is supplied, so a serve without a managed-run identity takes no claim; `ops jcode run` has no hub and is not fenced; and the hub-level witness uses counting backend doubles while the CLI witness is the real two-process serve path |
 | AC17 | Cancel request | closed | a real codex 0.169 app-server turn was interrupted mid-flight through `ops codex turn --cancel-after 2500` against a deliberately slow local model: the CLI printed `cancel-requested` and the turn settled with `"status": "interrupted"` and empty text, which is the native turn state. The hub also accepts a cancel and stays inert when idle |
 | AC18 | Approval race/replay | closed | `startCodexAppServer` holds a server-initiated request instead of failing it with `-32601`; `createCodexController` surfaces the full payload (command, cwd, kind, grantRoot, approvalId, startedAtMs), applies an opt-in policy, and answers exactly once. A replay, an unknown id, an id the transport dropped, and a second racing answer are each refused by name. Invalid policy decisions fail closed to `decline`; `humanCommand` refuses `acceptForSession`; `item/permissions/requestApproval` is refused rather than held; the supported capability names the two methods it answers; approvals require `holdsServerRequests: true`; the transport reports delivery only for a live writable child and clears held ids on exit. 43 controller, 6 transport and 7 hub tests pass; `tsc` clean; commit `8ee74cef`. The transport tests use a fake app-server child, and the real-native half is measured too: a real codex 0.169 app-server, driven by a local model that asks for `exec_command`, raised `item/commandExecution/requestApproval` (requestId 0, command `pwsh -Command 'echo approval-ok'`). `ops codex turn --approval accept` delivered `{decision:"accept"}`, the runtime executed the command (`Process exited with code 0 ... Output: approval-ok`), and the turn completed; `--approval decline` produced `exec_command failed: Rejected("rejected by user")` and no execution; with no approval channel at all the same run produced `Rejected("approval request failed")`, so nothing is granted by default. `ops codex serve --approval accept --approval-policy untrusted` surfaced the same request and the same real execution through the hub |
 | AC19 | Artifact changed after approval | partial | The approval request carries a SHA-256 digest over method, threadId, turnId, itemId, command, cwd, kind, grantRoot, approvalId and reason. `answerApproval` requires the digest for accept/acceptForSession and refuses a missing or mismatched digest before any JSON-RPC answer; decline/cancel may omit it. A command mutated between `pendingApprovals()` and the answer is refused; both CLI approval surfaces print the digest. 43 controller tests pass; `tsc` clean; commit `d883083e`. The digest is controller-computed from the approval params, not a runtime artifact hash, and a fileChange's file contents are not in those params. A real-binary accept witness is recorded: the real codex 0.169 app-server raised `item/commandExecution/requestApproval`, the accepted command executed (exit 0, output `approval-ok`), and the shipped CLI prints the controller-computed digest on that request line. No real-binary half refuses a mutated or replayed artifact: the committed driver `scripts/acceptance/codex-approvals.ts` (commits `7e012713`, `fb61e18f`, `761102ee`) counts requests and checks method, turn status and model output, but never asserts, mutates or replays the digest, so the mismatch, omission and mutation refusals stay controller-tested only |
@@ -552,7 +552,7 @@ serialization it pins, so AC40 cites both commits. Package-wide
 | Case | Commit | What changed | Why the status did or did not move |
 | --- | --- | --- | --- |
 | AC12 | `eb116314` | Text correction is armed only by a declared peer capability; a declared retraction replaces a named segment's text and recomputes the turn | not started -> partial: the client half now exists and is gated, but jcode 0.99.1 declares no retraction surface, so the path is inert and no live correction was observed |
-| AC16 | `9629b7e3` | A Paperclip claim record fences one launcher per managed run, with generation, claimSeq, digest, heartbeat expiry and stale takeover | still partial: a caller-owned record with no cross-process lock, no Paperclip API call and no shipped command, so no two real launchers were raced |
+| AC16 | `9629b7e3` | A Paperclip claim record fences one launcher per managed run, with generation, claimSeq, digest, heartbeat expiry and stale takeover | still partial at that commit: a caller-owned record with no cross-process lock, no Paperclip API call and no shipped command, so no two real launchers were raced (superseded 2026-11-16: the fence is cross-process durable and `ops jcode serve` reaches it; see the final entry) |
 | AC33 | `f734d976` | Restore crosses an object-store boundary with a sealed digest, create-only put and verification before a single-transaction import | still partial: both stores are local or stub, so remote behaviour, server-side checksums and a live cutover are unproven |
 | AC37 | `23c29ac3` | A torn read is reported transient instead of surfacing a truncated title or a phantom session, with health on discover, snapshot and observe | still partial: the concurrent writer is the test's own filesystem, and `ops discover --source jcode` drops `page.observation` |
 | AC40 | `1b788fff`, `8e7646d7` | Unaccepted events are retained in order across an outage, with a capped buffer, serialized passes and a typed source health | not started -> partial: the collector is a scripted fake transport and the buffer is in-memory, so no real collector was taken down |
@@ -562,7 +562,9 @@ path, but the only peer that declares the surface is the lane's own fake, so the
 client is inert until a peer declares one. AC33's report calls the boundary an object store;
 the two implementations are a local filesystem and an in-memory stub, so digest and
 conditional-put are harness-enforced. AC16's report fences a managed launch; the fence is a
-local record with `dispatch` and `remoteWrite` false. AC40's report describes a collector
+local record with `dispatch` and `remoteWrite` false (superseded 2026-11-16: the fence is now a
+durable cross-process claim that a real second `ops jcode serve` process is refused by name at,
+while `dispatch`, `remoteWrite` and `inference` stay false; see the final entry). AC40's report describes a collector
 outage; no collector process was stopped. AC37's report describes health reporting, which the
 library now has, but the shipped `ops discover` discards it.
 
@@ -635,12 +637,59 @@ Per-case verdicts:
   `Restarting kimaki...` only on 75, because it is not readable across the supervisor.
 
 Summary table and the closed-list sentence were re-derived from the 40 row statuses, not edited
-by hand. Count after this pass, from
+by hand. Count after the observe/restart pass, from
 `Get-Content docs/unified-agent-ops-acceptance-map.md | Select-Object -Skip 22 -First 45 | Select-String '^\| AC\d\d \|'`:
 
 ```
 partial        21
 closed         17
+not started     2
+total=40
+```
+
+## Durable launch fence and shipped serve claim (2026-11-16)
+
+`fe86423b`, `7c4582b4` and `a47fa5ed` on `feat/passive-session-bindings` were checked with
+`git show --stat`, and the three cited test files plus `claim-worker.ts` were read in the
+committed tree. The suite was not re-run for this pass; each outcome below is the one recorded
+by the commit that introduced the test, and every cited file and test name is present in the
+tree.
+
+| Case | Commits | What changed | Status |
+| --- | --- | --- | --- |
+| AC16 | `fe86423b`, `7c4582b4`, `a47fa5ed` | The claim became a durable `(instance_id, run_id)` row with a UNIQUE index and CAS takeover; the hub claims before spawn and releases on failure; `ops jcode serve` claims at startup and refuses a second launcher by name | partial -> closed |
+
+Per-row verdict:
+
+- AC16 — 2026-11-16 — `fe86423b`, `7c4582b4`, `a47fa5ed` — **closed**. Two real `node`
+  processes raced one claim on one database file and exactly one won (`claimed`, generation 1)
+  while the loser was refused as a `ConfigError` naming the winner's launcher; the unique index
+  is load-bearing, because as a plain index the same race yields two winners. The shipped hub
+  then claimed before `backend.start()` and released on failure, and the shipped
+  `ops jcode serve` spawned twice against one `kimaki.db` served on the first and exited
+  non-zero on the second, naming `kimaki-cli-serve:<first pid>` with no URL printed. That is a
+  real native surface and a live path in one body of evidence.
+
+Caveats that survive and are recorded in the row: the fence is a local metadata claim in
+`kimaki.db`, not a Paperclip API call; `launchFenceCapabilities` keeps `dispatch`,
+`cancellation`, `remoteWrite` and `inference` false, so nothing is dispatched or written
+remotely; the fence is opt-in on `--run-id`, so `ops jcode serve` without a managed-run identity
+takes no claim; `ops jcode run` has no hub and is not fenced; and the hub test's backends are
+counting doubles, with the real two-process path being the CLI test.
+
+No entry in "What would move the most cases" named AC16, so that section is unchanged. No other
+row changed. The 20 remaining partials and 2 not-started rows are the ones the summary lists;
+the reachable levers among them are unchanged by these commits (AC01, AC08, AC19, AC22, AC24,
+AC27, AC28, AC33, AC37, AC39, AC40), while AC02 needs a live external native client, AC12 an
+agent-side correction surface, AC21 a product decision, AC26/AC34 a Discord guild, AC29/AC30 a
+Paperclip service, AC20 a live Discord credential, AC36 a Linux host, and AC31/AC32 live outside
+this repository.
+
+Counts re-derived from the 40 row statuses after this pass:
+
+```
+partial        20
+closed         18
 not started     2
 total=40
 ```
