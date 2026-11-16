@@ -20,6 +20,61 @@ import { action, DATA_DIR_HELP, dataDirOrDefault, discordApi, fail, openCliDb, p
 
 const logger = createLogger('CLI')
 
+// The two bot backends the root command can start. `opencode` is the default and
+// keeps the existing path byte-identical; `jcode` drives the native Jcode observer
+// in backend/jcode-bot-backend.ts instead of discovering an OpenCode service.
+export type BotBackend = 'opencode' | 'jcode'
+export const BOT_BACKENDS = ['opencode', 'jcode'] as const
+
+// Root-command options that only the OpenCode path can honor: they configure
+// OpenCode sessions, their skills and prompts, coordinator threads, or voice
+// (which reads OpenCode credentials and config). The Jcode observer has no
+// equivalent, so passing one with --backend jcode is refused instead of ignored.
+export const OPENCODE_ONLY_OPTIONS = ['--worktrees', '--disable-skills', '--disable-prompt', '--coordinator', '--voice'] as const
+
+// Reads an explicitly passed option without relying on goke's parsed defaults, so
+// an option that defaults to on (--coordinator) only counts when the operator
+// actually typed it. Handles both `--flag value` and `--flag=value`.
+function explicitOption(argv: readonly string[], flag: string): { present: boolean; value?: string } {
+  const prefix = `${flag}=`
+  for (let index = 0; index < argv.length; index++) {
+    const arg = argv[index]
+    if (arg === undefined) continue
+    if (arg === flag) {
+      const next = argv[index + 1]
+      if (next !== undefined && !next.startsWith('-')) return { present: true, value: next }
+      return { present: true }
+    }
+    if (arg.startsWith(prefix)) return { present: true, value: arg.slice(prefix.length) }
+  }
+  return { present: false }
+}
+
+// Pure so the refusal can be tested without spawning a child or touching Discord.
+// Returns the resolved backend, or a ConfigError the caller fails with before any
+// supervisor child, lock port, database or Discord connection starts.
+export function resolveBotBackend({ backend, argv }: { backend: string | undefined; argv: readonly string[] }): ConfigError | { backend: BotBackend } {
+  const requested = backend ?? 'opencode'
+  if (!(BOT_BACKENDS as readonly string[]).includes(requested)) {
+    return new ConfigError({ reason: `Unknown --backend ${JSON.stringify(requested)}. Use one of: ${BOT_BACKENDS.join(', ')}` })
+  }
+  if (requested === 'opencode') return { backend: 'opencode' }
+  const conflicts = OPENCODE_ONLY_OPTIONS.filter((flag) => {
+    const found = explicitOption(argv, flag)
+    if (!found.present) return false
+    // A jcode bot has no coordinator either, so `--coordinator false` asks for
+    // exactly what jcode does. Every other form turns an OpenCode feature on.
+    if (flag === '--coordinator' && found.value === 'false') return false
+    return true
+  })
+  if (conflicts.length > 0) {
+    return new ConfigError({
+      reason: `--backend jcode cannot use ${conflicts.join(', ')}: ${conflicts.length === 1 ? 'it is an OpenCode-only option' : 'they are OpenCode-only options'} with no jcode equivalent. Remove ${conflicts.length === 1 ? 'it' : 'them'}, or drop --backend jcode`,
+    })
+  }
+  return { backend: 'jcode' }
+}
+
 // null when the file vanished meanwhile (bot restart).
 async function readRange({ file, start, end }: { file: string; start: number; end: number }): Promise<Buffer | null> {
   const handle = await fs.promises.open(file, 'r').catch(() => null)
@@ -84,6 +139,7 @@ async function supervise(): Promise<never> {
 export function registerStartCommand(cli: Goke) {
   cli.command('', 'Start the bot. Runs onboarding on first start')
     .option('--data-dir <path>', DATA_DIR_HELP)
+    .option('--backend <name>', 'Bot backend: opencode (default) or jcode. jcode drives a native Jcode session and needs no OpenCode install')
     .option('-g, --guild <guildId>', 'Server to onboard when the bot is in several')
     .option('--gateway', 'Use the shared Kimaki bot, no Discord app needed')
     .option('--gateway-callback-url <url>', 'Redirect here after the gateway install (appends ?guild_id=<id>)')
@@ -100,6 +156,11 @@ export function registerStartCommand(cli: Goke) {
     .option('--no-autostart', 'Do not open a terminal with the bot when the agent service starts (for bots run by launchd, systemd or pm2)')
     .option('--if-not-running', 'Start only if no bot runs; never stop the running one (used by autostart)')
     .action(async (options) => {
+      // Before the supervisor child (which spawns this same argv) and before any
+      // Discord or database work, so a bad flag never leaves a process behind.
+      const backendChoice = resolveBotBackend({ backend: options.backend, argv: process.argv })
+      if (backendChoice instanceof Error) fail(backendChoice)
+      const backend = backendChoice.backend
       // The IPC check ignores a KIMAKI_SUPERVISED leaked into a shell by an older bot.
       if (process.env['KIMAKI_SUPERVISED'] !== '1' || !process.connected) return supervise()
       // OpenCode and agent shells inherit process.env: a bot started from a
@@ -180,11 +241,14 @@ export function registerStartCommand(cli: Goke) {
       const opened = await openDb({ dataDir, migrate: true })
       if (opened instanceof Error) failStartup(opened)
 
-      // Before onboarding: without OpenCode the bot cannot start, so fail (or install it) before the Discord install.
-      const opencodeCheck = await ensureOpencode({ serviceFile: process.env['KIMAKI_OPENCODE_SERVICE_FILE'] })
-      if (opencodeCheck instanceof Error) {
-        opened.close()
-        failStartup(opencodeCheck)
+      // Before onboarding: without OpenCode the OpenCode backend cannot start, so fail
+      // (or install it) before the Discord install. The jcode backend needs no OpenCode.
+      if (backend === 'opencode') {
+        const opencodeCheck = await ensureOpencode({ serviceFile: process.env['KIMAKI_OPENCODE_SERVICE_FILE'] })
+        if (opencodeCheck instanceof Error) {
+          opened.close()
+          failStartup(opencodeCheck)
+        }
       }
 
       startCaffeinate()
@@ -219,7 +283,8 @@ export function registerStartCommand(cli: Goke) {
         discordRestUrl: restApiUrl(credentials),
         lock,
         opencodeServiceFile: process.env['KIMAKI_OPENCODE_SERVICE_FILE'],
-        ensureOpencode: true,
+        ensureOpencode: backend === 'opencode',
+        ...(backend === 'jcode' ? { backend: { kind: 'jcode' as const } } : {}),
         opencodeConfigDir: opencodeConfigDir(),
         opencodeDbFile: opencodeDbFile(),
         analytics: createAnalytics({ dataDir, botMode: credentials.mode, enabled: !options.noAnalytics }),
@@ -268,6 +333,7 @@ export function registerStartCommand(cli: Goke) {
         if (removed instanceof Error) logger.warn('cannot remove the autostart script', removed)
       } else if (lock.port === DEFAULT_LOCK_PORT) {
         const autostart = await writeAutostartScript({ dataDir, args: [
+          ...(backend === 'jcode' ? ['--backend', 'jcode'] : []),
           ...(options.worktrees ? ['--worktrees'] : []),
           ...(options.allowAllUsers ? ['--allow-all-users'] : []),
           ...(options.disableSkills ? ['--disable-skills', options.disableSkills] : []),
