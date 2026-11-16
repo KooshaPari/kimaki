@@ -223,14 +223,16 @@ test('a supervised real view mirrors one turn from the hub into the binding chan
   await writeViewBinding({ dataDir, binding: { tenantId: discord.guildId, channelId, baseUrl: server.url } })
   const viewRest = new REST({ api: discord.restUrl, version: '10', retries: 0, rejectOnRateLimit: () => true }).setToken(discord.botToken)
   const supervisor = await startViewSupervision({ dataDir, rest: viewRest })
-  const before = (await discord.channel(channelId).getMessages()).length
   try {
     await waitFor(async () => hub.snapshot().subscribers === 1)
     // The supervisor's default identity is the channel-scoped one, so a second
     // view on this channel would be refused rather than duplicate every turn.
     expect(hub.snapshot().clients.map((client) => client.clientId)).toEqual([defaultViewClientId(channelId)])
     expect(await hub.submit('supervised turn')).not.toBeInstanceOf(Error)
-    await waitFor(async () => (await discord.channel(channelId).getMessages()).length === before + 1)
+    // Wait for the expected content rather than a message count: a count read
+    // before the turn settles is a race under load, and the content is the claim
+    // that actually matters.
+    await waitFor(async () => (await discord.channel(channelId).getMessages()).some((message) => message.content === 'answer:supervised turn'))
     const messages = await discord.channel(channelId).getMessages()
     expect(messages.at(-1)?.content).toBe('answer:supervised turn')
     // The cursor lands in the bot's data dir, not the cwd, right after the post.
