@@ -1092,4 +1092,110 @@ export function registerOpsCommands(cli: Goke) {
       if (failure instanceof Error) fail(failure)
       printJson({ kind: 'closed' })
     })
+
+  // Enrolment is only ever written by this explicit action: every field the
+  // record carries is supplied here, including the literal surface, mode,
+  // publication policy and canonical timestamp. A widened value reaches the
+  // module and is refused by it, so the command never grants more than the
+  // module's fixed observe/none boundary.
+  cli.command('ops paperclip enroll', 'Explicitly enroll one observed session into the Paperclip surface')
+    .option('--action <action>', 'The explicit operator action; must be exactly "enroll"')
+    .option('--host <id>', 'Explicit runtime host identity')
+    .option('--endpoint <id>', 'Explicit runtime endpoint identity, not a surface or thread id')
+    .option('--backend <kind>', 'Native runtime kind, for example opencode or codex')
+    .option('--native-session <id>', 'Explicit native session ID')
+    .option('--runtime-backend-kind <kind>', 'Runtime backend kind; must match --backend')
+    .option('--runtime-endpoint <id>', 'Runtime endpoint identity; must match --endpoint')
+    .option('--runtime-version <version>', 'Optional runtime version metadata; never widens authority')
+    .option('--surface <surface>', 'Enrolled surface; must be paperclip')
+    .option('--mode <mode>', 'Enrolled mode; must be observe')
+    .option('--publication <policy>', 'Publication policy; must be none')
+    .option('--created-at <iso>', 'Explicit canonical ISO 8601 enrollment timestamp')
+    .option('--existing <path>', 'JSON file holding existing enrollment records; a different record for the same session is refused')
+    .action(async (options) => {
+      const existing = options.existing === undefined ? [] : await readExplicitJson(options.existing, 'existing')
+      if (!Array.isArray(existing)) fail(new ConfigError({ reason: '--existing must hold one JSON array of enrollment records' }))
+      const { enrollSession } = await import('../ops/paperclip/enrollment.ts')
+      const outcome = enrollSession({
+        action: required(options.action, 'action'),
+        session: {
+          hostId: required(options.host, 'host'),
+          endpointId: required(options.endpoint, 'endpoint'),
+          backendKind: required(options.backend, 'backend'),
+          nativeSessionId: required(options.nativeSession, 'native-session'),
+        },
+        runtime: {
+          backendKind: required(options.runtimeBackendKind, 'runtime-backend-kind'),
+          endpointId: required(options.runtimeEndpoint, 'runtime-endpoint'),
+          ...(options.runtimeVersion === undefined ? {} : { version: options.runtimeVersion }),
+        },
+        surface: required(options.surface, 'surface'),
+        mode: required(options.mode, 'mode'),
+        publication: required(options.publication, 'publication'),
+        createdAt: required(options.createdAt, 'created-at'),
+      }, existing)
+      if (outcome instanceof Error) fail(outcome)
+      printJson(outcome.record)
+    })
+
+  // Projection reads an enrollment that already carries its own digest, so the
+  // record always comes from a file. Session fields name the observed session
+  // explicitly and the module refuses one that is not the enrolled session.
+  cli.command('ops paperclip project', 'Project one explicitly enrolled session into its observed Paperclip entity')
+    .option('--file <path>', 'JSON file holding the full projection input: enrollment, session and optional metadata')
+    .option('--enrollment <path>', 'JSON file holding one enrollment record, when not using --file')
+    .option('--host <id>', 'Explicit observed runtime host identity')
+    .option('--endpoint <id>', 'Explicit observed runtime endpoint identity')
+    .option('--backend <kind>', 'Observed native runtime kind')
+    .option('--native-session <id>', 'Explicit observed native session ID')
+    .option('--runtime-version <version>', 'Observed runtime version metadata')
+    .option('--observed-at <iso>', 'Explicit canonical ISO 8601 observation timestamp')
+    .action(async (options) => {
+      const { projectObservedSession } = await import('../ops/paperclip/project.ts')
+      let input: unknown
+      if (options.file !== undefined) {
+        const alongside = [options.enrollment, options.host, options.endpoint, options.backend, options.nativeSession, options.runtimeVersion, options.observedAt]
+        if (alongside.some((value) => value !== undefined)) {
+          fail(new ConfigError({ reason: '--file supplies the whole projection input; do not combine it with --enrollment or session flags' }))
+        }
+        input = await readExplicitJson(options.file, 'file')
+      } else {
+        const enrollment = await readExplicitJson(required(options.enrollment, 'enrollment'), 'enrollment')
+        const metadata = {
+          ...(options.runtimeVersion === undefined ? {} : { runtimeVersion: options.runtimeVersion }),
+          ...(options.observedAt === undefined ? {} : { observedAt: options.observedAt }),
+        }
+        input = {
+          enrollment,
+          session: {
+            hostId: required(options.host, 'host'),
+            endpointId: required(options.endpoint, 'endpoint'),
+            backendKind: required(options.backend, 'backend'),
+            nativeSessionId: required(options.nativeSession, 'native-session'),
+          },
+          ...(Object.keys(metadata).length === 0 ? {} : { metadata }),
+        }
+      }
+      const entity = projectObservedSession(input)
+      if (entity instanceof Error) fail(entity)
+      printJson(entity)
+    })
+}
+
+// Reads an explicitly provided JSON document for the Paperclip commands. A
+// missing or unparsable file is a CLI input error, not a Paperclip record, so it
+// is refused here before the module sees anything.
+async function readExplicitJson(filePath: string, flag: string): Promise<unknown> {
+  const { readFileSync } = await import('node:fs')
+  let text: string
+  try {
+    text = readFileSync(filePath, 'utf8')
+  } catch (cause) {
+    return fail(new ConfigError({ reason: `Cannot read --${flag} file ${filePath}: ${(cause as Error).message}` }))
+  }
+  try {
+    return JSON.parse(text) as unknown
+  } catch (cause) {
+    return fail(new ConfigError({ reason: `--${flag} file ${filePath} is not valid JSON: ${(cause as Error).message}` }))
+  }
 }
