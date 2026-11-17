@@ -13,6 +13,21 @@ before and after (`5ac313c6…`), so the read-only attach is real and not a clai
 metadata only: `credential.value` is never selected, and the manifest lists that redaction. A drifted
 schema (for example a `part` table without `data`) is refused before anything is written.
 
+Direction checks run the same day, because "do not install OpenCode 2" is only sound if the jcode
+path actually stands on its own:
+
+| Check | Observed |
+| --- | --- |
+| Unknown backend is refused, not defaulted | `kimaki --backend nonexistent` prints `Unknown --backend "nonexistent". Use one of: opencode, jcode` |
+| The flag's own help states the direction | `--backend <name>` is documented as `Bot backend: opencode (default) or jcode. jcode drives a native Jcode session and needs no OpenCode install` |
+| A jcode-backed start does not need the binary | `kimaki --backend jcode --data-dir <temp>` prints no OpenCode version error; it proceeds into startup and its log stays empty while it waits on onboarding/gateway, whereas the opencode-backed start dies immediately at the version gate |
+| jcode already holds credentials | `jcode auth status` reports `openai available` (OAuth, account `openai-otter`, automatic refresh) and `opencode-go available`; `jcode login`, `auth status`, `auth doctor`, `auth-test` and `provider` all exist, so Phase 2.4 is a kimaki wiring task, not a capability gap |
+| Packaging: the shipped build carries the export | `npx tsc` builds clean and `node dist/cli.js export verify --help` resolves the command from `dist`, not only from `src` |
+
+One gap the checks found: step 0.1 asked for `KIMAKI_BACKEND` as well as the flag, and the env half
+does not exist (`rg KIMAKI_BACKEND src` is empty), so a bot started without `--backend` still routes to
+OpenCode. That is a real hole in Phase 0, not a documentation detail.
+
 ## 0. Method and measured facts
 
 Counts were produced with ripgrep, case-insensitive, from `kimaki/`:
@@ -456,7 +471,7 @@ Only after every existing thread is either migrated or explicitly abandoned.
 | 2.1 Delete the startup gate and `ensureOpencode` | `src/cli/bot.ts:183-188`, `src/onboarding.ts:82-114` | Medium: removes the last automatic install path | `kimaki bot` starts on a machine with no `opencode` in PATH (CI job with a scrubbed PATH) |
 | 2.2 Delete `resolveOpencode`/`watchOpencode`/`serve` spawn and the service-file options | `src/opencode-server.ts:281-480`, `src/main.ts:47-56,170-177` | High: the biggest single deletion; keep the version/`PATH` helpers only if the read-only legacy path needs them | full e2e on jcode harness; a `rg opencode src --glob '!*.test.ts'` count of near-zero |
 | 2.3 Delete the plugin shim installer/remover and the anthropic plugin | `src/opencode-server.ts:138-278`, `src/plugin/**`, `src/sessions.ts:252-295` | Medium: `plugin/anthropic` also holds the Anthropic subscription login — replace with a jcode credential path first (see 2.4) or accept its loss explicitly | `src/plugin.e2e.test.ts` deleted with it; new `src/credentials-jcode.e2e.test.ts` if replaced |
-| 2.4 Replace provider login with a jcode-native path | `src/commands/login-commands.ts`, `src/cli/bot.ts:285-300`, `src/plugin/anthropic/index.ts` | High: this is the only way users authenticate. **Blocking** — cannot ship until a jcode equivalent exists | login e2e for the chosen jcode mechanism |
+| 2.4 Replace provider login with a jcode-native path | `src/commands/login-commands.ts`, `src/cli/bot.ts:285-300`, `src/plugin/anthropic/index.ts` | High: this is the only way users authenticate. **Blocking, but not on capability** — corrected 2026-11-17: jcode already ships the whole surface (`jcode login` for OAuth/API key/local credentials, `jcode auth status`, `auth doctor`, `auth-test`, `provider`, and ~40 providers), and on this host `jcode auth status` reports `openai available` (OAuth, account `openai-otter`, automatic refresh) and `opencode-go available`. The gap is kimaki's wiring: nothing in kimaki calls or reads that surface yet | login e2e for the chosen jcode mechanism, plus a negative case where jcode holds no credential |
 | 2.5 Drop `@opencode/client`, `@opencode/plugin`, `@opencode/cli` deps | `kimaki/package.json:28,29,58` | Low once code is gone | `pnpm install && tsc --noEmit` |
 | 2.6 Rewrite `system-prompt.ts` prose and the `OPENCODE_SESSION_ID` env var (rename to `KIMAKI_SESSION_ID`, keep reading the old name for one release) | `src/system-prompt.ts:18,113,344,534,722,815,901`, `src/cli/shared.ts:22,57-59`, `src/lock-routes.ts:88`, `src/prompt.ts:60`, `src/cli/session.ts:62,142` | Medium: agents quoting the old name; dual-read avoids breakage | grep test asserting no `OPENCODE_` in shipped strings, plus agent-shell test |
 
