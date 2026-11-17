@@ -79,6 +79,21 @@ Re-derived from the 40 AC rows on 2026-11-16 (not edited by hand) after the rena
 | WP8 | Reliability and acceptance witnesses | partial | Validated on 2026-11-15: 98 backend (hub 38, hub-server 9, hub-client 5, jcode 22, ACP 24), 43 Codex control, 6 Codex transport, 7 Codex hub, 13 publication, 23 Discord view, 3 native mirror, 30 binding, 6 echo, 9 projection, 30 paperclip, 50 discovery, 7 backup-store and 7 engine-identity tests; three real witnesses (three clients on one jcode hub, native terminal mirrored into a channel, real Codex thread served and mirrored); test-suite gate baseline recorded in `docs/release-gate-2026-11-14.md` |
 | WP9 | Migration and retirement | not started | decision matrix and rollback rehearsal only; nothing drained or retired |
 
+## Regression gate (2026-11-17, at `b06538a5`)
+
+A clean worktree at HEAD (no uncommitted work from any lane) ran the suites this map cites for its
+closed cases, as one pass: **17 files, 235 tests, all green in 4m09s**. Files: `hub`, `hub-server`,
+`hub-client`, `runtime/jcode`, `runtime/codex`, `runtime/codex-app-server`, `runtime/codex-hub`,
+`discord/publication`, `discord/view`, `discord/view-supervision`, `bindings`,
+`ops-cutover-consumers.e2e`, and all of `ops/paperclip`.
+
+A full-suite run is **not** reported here, and deliberately so: the repository has 118 test files, 51
+of them e2e, and several of those need OpenCode 2, which this host does not have (`opencode
+--version` is `1.18.25`, and the product refuses to start on it). A 40-minute whole-repo run was
+started, produced a long tail of failures with no attributable cause, and was stopped rather than
+recorded as a number. Ten test files guard themselves with a binary check; the rest do not, so a
+whole-repo red here says "environment", not "regression".
+
 ## Environment blockers (measured 2026-11-16)
 
 Three of the remaining cases cannot be closed on this host by writing code. Each is stated with the
