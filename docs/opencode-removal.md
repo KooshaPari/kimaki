@@ -1,7 +1,17 @@
 # Removing OpenCode from kimaki: reference map and phased plan
 
-Status: planning document, no code changed. All line numbers are from the working tree at
+Status: planning document for Phases 0 and 2-3; **Phase 1.2 (the export) is implemented and
+exercised** on 2026-11-17. All line numbers are from the working tree at
 `E:\koosh\CodeProjects\kimaki` (package `kimaki/`), recorded 2026-11-16.
+
+Phase 1.2 landed as `src/ops/export-opencode.ts` plus `src/cli/export.ts`
+(`kimaki export opencode --out <dir>` and `kimaki export verify --dir <dir>`), with
+`src/export-opencode.e2e.test.ts` (4 cases). Measured on the real OpenCode database of this host,
+`C:\Users\koosh\AppData\Local\opencode\opencode.db`: 3 sessions, 4 messages, 7 parts, 0 credentials
+exported, `export verify` re-checked every digest, and the source file's SHA-256 was byte-identical
+before and after (`5ac313c6…`), so the read-only attach is real and not a claim. Credentials are
+metadata only: `credential.value` is never selected, and the manifest lists that redaction. A drifted
+schema (for example a `part` table without `data`) is refused before anything is written.
 
 ## 0. Method and measured facts
 
