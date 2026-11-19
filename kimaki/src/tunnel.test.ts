@@ -2,7 +2,6 @@ import fs from 'node:fs'
 import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
-// @ts-ignore - vite types are not installed in this package worktree
 import { createServer } from 'vite'
 import { expect, test } from 'vitest'
 import { detectPortFromText, parseNetstatListeningPids, routeName, startHostProxy } from './tunnel.ts'
