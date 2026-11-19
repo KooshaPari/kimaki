@@ -381,6 +381,19 @@ export function registerLoginCommands(cli: Goke) {
     .action(async (id, options) => {
       await action({ route: 'credential', dataDir: options.dataDir, input: { id, operation: options.operation ?? 'activate', label: options.label } })
     })
+
+  // Read-only view of jcode's own provider auth state. Kimaki neither reads nor
+  // persists credentials here; the JSON output is jcode's status metadata only.
+  cli.command('auth status', 'Read jcode provider auth status as JSON (read-only)')
+    .option('--backend <name>', 'Auth backend: jcode (the only supported backend)')
+    .action(async (options) => {
+      const backend = options.backend ?? 'jcode'
+      if (backend !== 'jcode') fail(new Error(`Unsupported auth backend ${JSON.stringify(backend)}. Use --backend jcode`))
+      const { jcodeAuthStatus } = await import('../ops/jcode-auth.ts')
+      const status = await jcodeAuthStatus({})
+      if (status instanceof Error) fail(status)
+      printJson(status)
+    })
 }
 
 // tunnel, tts
