@@ -14,12 +14,12 @@
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
-import type { OpenCodeClient, V2Event } from '@opencode/client'
+import type { OpenCodeClient, SessionInboxItem, V2Event } from '@opencode/client'
 
 import type { KimakiDb } from './db.ts'
 import { ConfigError, DbError, OpenCodeError } from './errors.ts'
 import { createLogger } from './logger.ts'
-import type { ThreadEvent } from './thread-reducer.ts'
+import { eventSessionId, isKimakiEvent, type ThreadEvent } from './thread-reducer.ts'
 
 const logger = createLogger('EVENTS')
 
@@ -244,12 +244,15 @@ export async function readSessionMarkdown({
   full,
   thinking,
   verbose,
+  now = Date.now(),
 }: {
   client: OpenCodeClient
   sessionId: string
   full?: boolean
   thinking?: boolean
   verbose?: boolean
+  // Fixed clock for callers that compare two renders (the mirror parity test).
+  now?: number
 }): Promise<OpenCodeError | string> {
   const [session, messages] = await Promise.all([
     client.session.get({ sessionID: sessionId }).catch((e) => new OpenCodeError({ operation: 'session.get', cause: e })),
@@ -257,7 +260,7 @@ export async function readSessionMarkdown({
   ])
   if (session instanceof Error) return session
   if (messages instanceof Error) return messages
-  const usage = usageLine(sessionUsage(messages), Date.now())
+  const usage = usageLine(sessionUsage(messages), now)
   if (!full && !thinking && !verbose) return renderAnswers({ session, messages, usage })
   return renderSession({ session, messages, thinking, verbose, usage })
 }
@@ -441,4 +444,263 @@ export async function waitForSessions({ client, sessionIds, signal }: { client: 
   if (result instanceof Error && !signal?.aborted) return result
   for (const sessionId of sessionIds) settle(sessionId, 'running')
   return statuses
+}
+
+// ---------------------------------------------------------------------------
+// Durable mirror reads: `kimaki session read --from-mirror`.
+//
+// createEventRecorder above writes every event the reducer saw, which carries
+// enough to rebuild what message.list returns. Only recorded values are used;
+// a field the mirror cannot know is either marked MIRROR_UNKNOWN or omitted:
+//
+//   title      session.created/session.renamed of the session, else MIRROR_UNKNOWN
+//   directory  the location of the newest event of the session, else MIRROR_UNKNOWN
+//   idle       message.list ends a run with an `idle` message whose id is not
+//              recorded, so it is omitted (the default output never shows it)
+//   ids        user (inboxID) and assistant (assistantMessageID) ids equal live;
+//              a compaction id equals live only when compaction.started has inputID
+//   streamed   message.time.streamed comes from session.step.streamed, which the
+//              recorder skips, so it is omitted (nothing renders it)
+//   long text  the recorder truncates strings over MAX_STRING, so a huge tool
+//              input or output differs from live after that many characters
+//   --json     refused: the verbatim records would miss the idle marker and id
+
+export const MIRROR_UNKNOWN = '(not recorded in the mirror)'
+
+export type MirrorEventLine = { at: number; event: ThreadEvent }
+
+export async function readMirrorEvents({ dataDir, threadId }: { dataDir: string; threadId: string }): Promise<ConfigError | MirrorEventLine[]> {
+  const file = sessionEventsFile({ dataDir, threadId })
+  const content = await fs.promises.readFile(file, 'utf8').catch((cause) => new ConfigError({ reason: `Cannot read the session-events mirror ${file}`, cause }))
+  if (content instanceof Error) return content
+  const events: MirrorEventLine[] = []
+  const lines = content.split('\n')
+  for (const [index, text] of lines.entries()) {
+    if (!text) continue
+    const parsed = (() => {
+      try {
+        return JSON.parse(text) as MirrorEventLine
+      } catch (cause) {
+        return new ConfigError({ reason: `Cannot parse line ${index + 1} of the session-events mirror ${file}`, cause })
+      }
+    })()
+    if (parsed instanceof Error) return parsed
+    events.push(parsed)
+  }
+  return events
+}
+
+type MirrorPart =
+  | { type: 'text'; text: string }
+  | { type: 'reasoning'; text: string }
+  | { type: 'tool'; id: string; name: string; executed?: boolean; state: Record<string, unknown>; time: { created: number; ran?: number; completed?: number } }
+
+type MirrorCompaction = { id: string; type: 'compaction'; time: { created: number }; status: 'running' | 'completed' | 'failed'; reason: 'auto' | 'manual'; summary: string; recent: string }
+
+type MirrorAssistant = { message: Extract<Message, { type: 'assistant' }>; parts: MirrorPart[] }
+
+// Rebuilds message.list records of one session from recorded events, oldest first
+// like allMessages. A session the mirror never saw yields no messages.
+function foldMirrorEvents({ events, sessionId }: { events: readonly MirrorEventLine[]; sessionId: string }): { title: string | null; directory: string | null; messages: Message[] } {
+  let title: string | null = null
+  let directory: string | null = null
+  const messages: Message[] = []
+  // An inbox item becomes a message when it is delivered: message.list shows it then, with the delivery time.
+  const queued = new Map<string, SessionInboxItem>()
+  const assistants = new Map<string, MirrorAssistant>()
+  const tools = new Map<string, Extract<MirrorPart, { type: 'tool' }>>()
+  const compactions = new Map<string, MirrorCompaction>()
+
+  const assistant = (id: string, created: number): MirrorAssistant => {
+    const existing = assistants.get(id)
+    if (existing) return existing
+    const message = { id, type: 'assistant', time: { created }, agent: '', model: { providerID: '', id: '' }, content: [] } as unknown as Extract<Message, { type: 'assistant' }>
+    const entry: MirrorAssistant = { message, parts: [] }
+    assistants.set(id, entry)
+    messages.push(message)
+    return entry
+  }
+
+  for (const { event } of events) {
+    if (isKimakiEvent(event)) continue
+    if (event.type === 'server.connected') continue
+    if (eventSessionId(event) !== sessionId) continue
+    if ('location' in event && event.location?.directory) directory = event.location.directory
+    switch (event.type) {
+      case 'session.created':
+        title = event.data.title ?? null
+        directory = event.data.location.directory
+        break
+      case 'session.renamed':
+        title = event.data.title
+        break
+      case 'session.moved':
+        directory = event.data.location.directory
+        break
+      case 'session.inbox.enqueued':
+        // A compaction item carries no reason or summary; the compaction.* events do.
+        if (event.data.item.type !== 'compaction') queued.set(event.data.inboxID, event.data.item)
+        break
+      case 'session.inbox.cancelled':
+        queued.delete(event.data.inboxID)
+        break
+      case 'session.inbox.delivered': {
+        const item = queued.get(event.data.inboxID)
+        if (!item) break
+        queued.delete(event.data.inboxID)
+        const time = { created: event.created }
+        if (item.type === 'user') {
+          const { payload } = item
+          messages.push({
+            id: event.data.inboxID,
+            type: 'user',
+            time,
+            text: payload.text,
+            ...(payload.files && { files: payload.files }),
+            ...(payload.agents && { agents: payload.agents }),
+            ...(payload.skills && { skills: payload.skills }),
+            ...(payload.metadata && { metadata: payload.metadata }),
+          })
+        } else if (item.type === 'synthetic') {
+          messages.push({ id: event.data.inboxID, type: 'synthetic', time, text: item.payload.text, ...(item.payload.description !== undefined && { description: item.payload.description }) })
+        }
+        break
+      }
+      case 'session.step.started': {
+        const entry = assistant(event.data.assistantMessageID, event.data.started)
+        entry.message.agent = event.data.agent
+        entry.message.model = event.data.model
+        if (event.data.snapshot) entry.message.snapshot = { start: event.data.snapshot }
+        break
+      }
+      case 'session.text.ended':
+        assistant(event.data.assistantMessageID, event.created).parts.push({ type: 'text', text: event.data.text })
+        break
+      case 'session.reasoning.ended':
+        assistant(event.data.assistantMessageID, event.created).parts.push({ type: 'reasoning', text: event.data.text })
+        break
+      case 'session.tool.input.started': {
+        const key = `${event.data.assistantMessageID}:${event.data.id}`
+        const part: Extract<MirrorPart, { type: 'tool' }> = { type: 'tool', id: event.data.id, name: event.data.name, state: { status: 'running', input: {} }, time: { created: event.created } }
+        tools.set(key, part)
+        assistant(event.data.assistantMessageID, event.created).parts.push(part)
+        break
+      }
+      case 'session.tool.called': {
+        const key = `${event.data.assistantMessageID}:${event.data.id}`
+        const existing = tools.get(key)
+        const part: Extract<MirrorPart, { type: 'tool' }> = existing ?? { type: 'tool', id: event.data.id, name: 'tool', state: { status: 'running', input: {} }, time: { created: event.created } }
+        if (!existing) {
+          tools.set(key, part)
+          assistant(event.data.assistantMessageID, event.created).parts.push(part)
+        }
+        ;(part.state as { input: unknown }).input = event.data.input
+        part.executed = event.data.executed
+        part.time.ran = event.created
+        break
+      }
+      case 'session.tool.success': {
+        const part = tools.get(`${event.data.assistantMessageID}:${event.data.id}`)
+        if (!part) break
+        part.state = { status: 'completed', input: (part.state as { input?: unknown }).input ?? {}, content: event.data.content, ...(event.data.metadata !== undefined && { metadata: event.data.metadata }) }
+        part.time.completed = event.created
+        break
+      }
+      case 'session.tool.failed': {
+        const part = tools.get(`${event.data.assistantMessageID}:${event.data.id}`)
+        if (!part) break
+        part.state = { status: 'error', input: (part.state as { input?: unknown }).input ?? {}, error: event.data.error, ...(event.data.content !== undefined && { content: event.data.content }) }
+        part.time.completed = event.created
+        break
+      }
+      case 'session.step.ended': {
+        const entry = assistant(event.data.assistantMessageID, event.created)
+        entry.message.finish = event.data.finish
+        if (event.data.rawFinish !== undefined) entry.message.rawFinish = event.data.rawFinish
+        entry.message.tokens = event.data.tokens
+        entry.message.cost = event.data.cost
+        entry.message.time = { ...entry.message.time, completed: event.created }
+        if (entry.message.snapshot || event.data.snapshot || event.data.files) {
+          entry.message.snapshot = { ...entry.message.snapshot, ...(event.data.snapshot && { end: event.data.snapshot }), ...(event.data.files && { files: event.data.files }) }
+        }
+        break
+      }
+      case 'session.step.failed': {
+        const entry = assistant(event.data.assistantMessageID, event.created)
+        entry.message.error = event.data.error
+        if (event.data.finish !== undefined) entry.message.finish = event.data.finish
+        if (event.data.rawFinish !== undefined) entry.message.rawFinish = event.data.rawFinish
+        if (event.data.tokens !== undefined) entry.message.tokens = event.data.tokens
+        entry.message.time = { ...entry.message.time, completed: event.created }
+        break
+      }
+      case 'session.compaction.started': {
+        // Without inputID message.list's compaction id is unknown, so no record is invented.
+        if (!event.data.inputID) break
+        const message: MirrorCompaction = { id: event.data.inputID, type: 'compaction', time: { created: event.created }, status: 'running', reason: event.data.reason, summary: '', recent: '' }
+        compactions.set(event.data.inputID, message)
+        messages.push(message as unknown as Message)
+        break
+      }
+      case 'session.compaction.ended': {
+        // compaction.ended names no inputID: it closes the compaction still running.
+        // Without a started event the id is unknown, so no record is invented.
+        const message = [...compactions.values()].findLast((candidate) => candidate.status === 'running')
+        if (!message) break
+        message.status = 'completed'
+        message.summary = event.data.text
+        message.recent = event.data.recent
+        break
+      }
+      case 'session.compaction.failed': {
+        if (!event.data.inputID) break
+        const existing = compactions.get(event.data.inputID)
+        const message: MirrorCompaction = existing ?? { id: event.data.inputID, type: 'compaction', time: { created: event.created }, status: 'failed', reason: event.data.reason, summary: '', recent: '' }
+        message.status = 'failed'
+        if (!existing) {
+          compactions.set(message.id, message)
+          messages.push(message as unknown as Message)
+        }
+        break
+      }
+      default:
+        break
+    }
+  }
+
+  for (const entry of assistants.values()) entry.message.content = entry.parts as unknown as Extract<Message, { type: 'assistant' }>['content']
+  return { title, directory, messages }
+}
+
+export type MirrorRead = { markdown: string; messages: Message[]; title: string | null; directory: string | null }
+
+// `kimaki session read --from-mirror`: the same markdown as readSessionMarkdown,
+// rendered from <dataDir>/session-events/<threadId>.jsonl instead of OpenCode.
+export async function readSessionMarkdownFromMirror({
+  dataDir,
+  threadId,
+  sessionId,
+  full,
+  thinking,
+  verbose,
+  now = Date.now(),
+}: {
+  dataDir: string
+  threadId: string
+  sessionId: string
+  full?: boolean
+  thinking?: boolean
+  verbose?: boolean
+  now?: number
+}): Promise<ConfigError | MirrorRead> {
+  const events = await readMirrorEvents({ dataDir, threadId })
+  if (events instanceof Error) return events
+  const folded = foldMirrorEvents({ events, sessionId })
+  if (folded.messages.length === 0) {
+    return new ConfigError({ reason: `The session-events mirror of thread ${threadId} has no messages for session ${sessionId} (${sessionEventsFile({ dataDir, threadId })}). Use live mode for a session that ran elsewhere.` })
+  }
+  const session = { id: sessionId, title: folded.title ?? MIRROR_UNKNOWN, location: { directory: folded.directory ?? MIRROR_UNKNOWN } }
+  const usage = usageLine(sessionUsage(folded.messages), now)
+  const markdown = !full && !thinking && !verbose ? renderAnswers({ session, messages: folded.messages, usage }) : renderSession({ session, messages: folded.messages, thinking, verbose, usage })
+  return { markdown, messages: folded.messages, title: folded.title, directory: folded.directory }
 }

@@ -11,7 +11,7 @@ import { wrapJsonSchema, type Goke } from 'goke'
 import { parseDuration } from '../duration.ts'
 import { OpenCodeError } from '../errors.ts'
 import { editorsForFile, loadFileEditEvents } from '../file-edit-log.ts'
-import { allMessages, allSessions, readSessionMarkdown, sessionEventsFile, syncTranscripts, transcriptsDir } from '../session-events.ts'
+import { allMessages, allSessions, readSessionMarkdown, readSessionMarkdownFromMirror, sessionEventsFile, syncTranscripts, transcriptsDir } from '../session-events.ts'
 import {
   action,
   DATA_DIR_HELP,
@@ -252,9 +252,27 @@ export function registerSessionHistoryCommands(cli: Goke) {
     .option('--thinking', 'Full output with reasoning')
     .option('--verbose', 'Full output with tool inputs and outputs')
     .option('--json', 'Print raw agent messages')
+    .option('--from-mirror', 'Read <data-dir>/session-events instead of the live OpenCode client; no --json, and a title or directory the mirror never recorded shows as such')
+    .example('kimaki session read ses_abc --from-mirror')
     .action(async (id, options) => {
       // Subagent sessions are not in SQLite: resolveTarget keeps their ID.
-      const { sessionId } = await resolveTarget(id, options.dataDir)
+      const { sessionId, threadId } = await resolveTarget(id, options.dataDir)
+      // Additive read path (docs/opencode-removal.md 0.4): the mirror is per thread.
+      if (options.fromMirror) {
+        if (!threadId) fail(new Error(`No Kimaki thread for ${id}, and the session-events mirror is stored per thread. Pass a root session id or thread id recorded in the local database.`))
+        if (options.json) fail(new Error('--json prints message.list records verbatim, and the mirror does not record the id of the idle marker message. Use live mode for --json.'))
+        const mirror = await readSessionMarkdownFromMirror({
+          dataDir: dataDirOrDefault(options.dataDir),
+          threadId,
+          sessionId,
+          full: options.full,
+          thinking: options.thinking,
+          verbose: options.verbose,
+        })
+        if (mirror instanceof Error) fail(mirror)
+        process.stdout.write(`${mirror.markdown}\n`)
+        return
+      }
       const client = await readClient()
       if (options.json) {
         const messages = await allMessages({ client, sessionId })
