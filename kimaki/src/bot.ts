@@ -16,7 +16,8 @@ import type { KimakiDb } from './db.ts'
 import type { EffectsRunner } from './effects.ts'
 import { ConfigError, DbError, DiscordError, OpenCodeError, OpenCodeUnavailableError } from './errors.ts'
 import type { EventLoop } from './event-loop.ts'
-import type { OpenCodeClient, OpencodeConnection } from './opencode-server.ts'
+import type { JcodeBotConnection } from './backend/jcode-bot-backend.ts'
+import type { Backend, OpenCodeClient, OpencodeConnection } from './opencode-server.ts'
 import type { Route } from './routes.ts'
 import type { Clock } from './scheduler.ts'
 import type { PluginWait } from './sessions.ts'
@@ -46,11 +47,13 @@ export type BotFeatures = {
   voiceCalls: VoiceCalls
 }
 
+export type BotBackend = OpencodeConnection | JcodeBotConnection
+
 export type Bot = {
   discord: Client
   db: KimakiDb
   store: BotStore
-  opencode: OpencodeConnection
+  opencode: BotBackend
   eventLoop: EventLoop
   effects: EffectsRunner
   analytics: Analytics

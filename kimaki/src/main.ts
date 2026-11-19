@@ -21,7 +21,7 @@ import { runLockRoute } from './lock-routes.ts'
 import { installShim, type LockServer } from './lock-server.ts'
 import { createLogger } from './logger.ts'
 import { createCoordinatorNotes } from './coordinator.ts'
-import { installPluginShim, watchOpencode, type OpencodeConnection, type OpencodeEndpoint } from './opencode-server.ts'
+import { installPluginShim, watchOpencode, type Backend, type OpencodeConnection, type OpencodeEndpoint } from './opencode-server.ts'
 import { countUserProjects } from './project.ts'
 import { createScheduler, systemClock, type Clock } from './scheduler.ts'
 import { createEventRecorder, syncSessionTranscript } from './session-events.ts'
@@ -89,7 +89,7 @@ export type StartBotOptions = {
 // without starting Discord or an OpenCode service.
 export type BotConnectionCallbacks = Parameters<typeof watchOpencode>[0]
 
-export type BotConnectionSelection = OpencodeConnection | Promise<Error | OpencodeConnection>
+export type BotConnectionSelection = OpencodeConnection | Promise<Error | OpencodeConnection | JcodeBotConnection>
 
 /**
  * The one place startBot chooses its backend.
@@ -227,7 +227,7 @@ export async function startBot(options: StartBotOptions): Promise<Error | BotHan
   // The default path returns synchronously; only the Jcode path awaits construction.
   const candidate = selected instanceof Promise ? await selected : selected
   if (candidate instanceof Error) return candidate
-  const opencode: OpencodeConnection = candidate
+  const opencode: Bot['opencode'] = candidate
   cleanup.defer(() => opencode.stop())
   const shim = await installShim({ dataDir: options.dataDir, argv: options.kimakiArgv })
   if (shim instanceof Error) return shim

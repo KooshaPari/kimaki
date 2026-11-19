@@ -34,7 +34,7 @@ import path from 'node:path'
 
 import type { OpenCodeClient, V2Event } from '@opencode/client'
 
-import type { OpencodeEndpoint } from '../opencode-server.ts'
+import type { Backend, OpencodeEndpoint } from '../opencode-server.ts'
 import { createAcpClient } from './acp/client.ts'
 import type { AcpClient, AcpServerAnswerInput, AcpServerRequest, AcpServerRequestHandler, CreateAcpClient } from './acp/contracts.ts'
 import { JcodeBotBackendError, type JcodeBotRefusal } from './jcode-bot-error.ts'
@@ -109,7 +109,7 @@ export type JcodeBotApprovals = {
  * through the bot. The OpenCode-only members are present but refuse: there is no
  * OpenCode endpoint behind a Jcode session.
  */
-export type JcodeBotConnection = {
+export type JcodeBotConnection = Backend & {
   readonly kind: 'jcode'
   readonly sessionId: string
   readonly connected: boolean
