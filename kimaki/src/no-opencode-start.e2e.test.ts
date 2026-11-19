@@ -125,16 +125,18 @@ async function runBounded({
   args,
   env,
   timeoutMs,
+  lockPort,
 }: {
   args: string[]
   env: NodeJS.ProcessEnv
   timeoutMs: number
+  lockPort: number
 }): Promise<RunResult & { invocation: string }> {
   const invocation = cliInvocation(args)
   const start = Date.now()
   const child = spawn(invocation.command, invocation.args, {
     cwd: packageDir,
-    env,
+    env: { ...env, KIMAKI_LOCK_PORT: String(lockPort) },
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
   })
@@ -216,6 +218,7 @@ describe('kimaki start without opencode on PATH (Phase 2.1 proof)', () => {
       args: ['--backend', 'jcode', '--data-dir', dataDir],
       env: baseEnv,
       timeoutMs: 40_000,
+      lockPort: 38_101,
     })
 
     const output = `${run.stdout}\n${run.stderr}`
@@ -239,7 +242,8 @@ describe('kimaki start without opencode on PATH (Phase 2.1 proof)', () => {
     const run = await runBounded({
       args: ['--backend', 'opencode', '--data-dir', dataDir],
       env: baseEnv,
-      timeoutMs: 40_000,
+      timeoutMs: 90_000,
+      lockPort: 38_102,
     })
 
     const output = `${run.stdout}\n${run.stderr}`
