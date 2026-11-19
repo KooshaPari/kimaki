@@ -37,6 +37,7 @@ import type { OpenCodeClient, V2Event } from '@opencode/client'
 import type { OpencodeEndpoint } from '../opencode-server.ts'
 import { createAcpClient } from './acp/client.ts'
 import type { AcpClient, AcpServerAnswerInput, AcpServerRequest, AcpServerRequestHandler, CreateAcpClient } from './acp/contracts.ts'
+import { cancelJcodeTurn, type JcodeCancelOutcome } from './jcode-bot-cancel.ts'
 import { JcodeBotBackendError, type JcodeBotRefusal } from './jcode-bot-error.ts'
 import { createJcodeBotWriter, type JcodeBotPromptInput, type JcodeBotPromptOutcome } from './jcode-bot-prompt.ts'
 import { createJcodeTurnObserver, type JcodeObservationLatency, type JcodeTurnEvent, type JcodeTurnHealth } from './jcode-observe.ts'
@@ -127,6 +128,11 @@ export type JcodeBotConnection = {
   prompt: (input: string | JcodeBotPromptInput) => Promise<JcodeBotPromptOutcome | Error>
   /** One deterministic observer read, so a caller can surface a just-finished turn. */
   flush: () => Promise<void>
+  /**
+   * Cancel the running turn over the seam's own ACP connection. Returns the
+   * primitive's outcome or a named refusal; never emits an event.
+   */
+  cancel: () => Promise<JcodeCancelOutcome | JcodeBotBackendError>
   /** Present only when an approval handler was supplied. Surfaced to the caller, never emitted as an event. */
   approvals?: JcodeBotApprovals
 }
@@ -383,6 +389,7 @@ export async function createJcodeBotBackend(input: JcodeBotBackendInput): Promis
   // an approval child exists it is already initialized and loaded, so the turn
   // runs over it and its permission requests reach the same handler.
   let stopped = false
+  let promptClient: AcpClient | null = approvalClient
   const writer = createJcodeBotWriter({
     home,
     sessionId,
@@ -393,7 +400,17 @@ export async function createJcodeBotBackend(input: JcodeBotBackendInput): Promis
     ...(input.provider === undefined ? {} : { provider: input.provider }),
     ...(input.model === undefined ? {} : { model: input.model }),
     ...(input.promptTimeoutMs === undefined ? {} : { timeoutMs: input.promptTimeoutMs }),
-    ...(input.createPromptClient === undefined ? {} : { createClient: input.createPromptClient }),
+    ...(approvalClient === null
+      ? {
+          createClient: (options) => {
+            const client = (input.createPromptClient ?? createAcpClient)(options)
+            promptClient = client
+            return client
+          },
+        }
+      : input.createPromptClient === undefined
+        ? {}
+        : { createClient: input.createPromptClient }),
     closed: () => stopped,
   })
 
@@ -430,6 +447,13 @@ export async function createJcodeBotBackend(input: JcodeBotBackendInput): Promis
     refusals: refusalsOf,
     prompt: (turn) => writer.prompt(typeof turn === 'string' ? { text: turn } : turn),
     flush: () => observer.poll(),
+    cancel: () =>
+      cancelJcodeTurn({
+        sessionId,
+        client: approvalClient ?? promptClient,
+        running: () => writer.busy(),
+        closed: () => stopped,
+      }),
     ...(approvals === undefined ? {} : { approvals }),
   }
 }

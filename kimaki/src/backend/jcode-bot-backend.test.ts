@@ -299,6 +299,7 @@ test('a jcode backend is constructed through the jcode factory, never OpenCode',
     refusals: () => [],
     prompt: () => Promise.resolve(new Error('sentinel')),
     flush: () => Promise.resolve(),
+    cancel: () => Promise.resolve(new JcodeBotBackendError({ stage: 'cancel-not-running', reason: 'sentinel' })),
   }
   let opencodeCalled = false
   const onEvent = (): void => {}
@@ -701,6 +702,11 @@ const readPrompts = (file: string): string[] =>
         .map((event) => event.text ?? '')
     : []
 
+const readRecords = (file: string): Array<Record<string, unknown>> =>
+  fs.existsSync(file)
+    ? fs.readFileSync(file, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>)
+    : []
+
 const primeRecord = (sessionId: string): string =>
   JSON.stringify({ id: sessionId, messages: [{ id: 'm1', role: 'assistant', content: [{ type: 'text', text: 'prime' }], timestamp: '2026-01-01T00:00:00.000Z' }] })
 
@@ -824,6 +830,134 @@ test('a prompt before the session is persisted and after stop is refused by name
     expect(stageOf(await closed.connection.prompt('too late'))).toBe('prompt-closed')
   } finally {
     expect(await removeTree(closed.dir)).toBe(true)
+  }
+})
+
+const CANCEL_WRITE_AGENT = String.raw`const fs = require('node:fs')
+const readline = require('node:readline')
+const recordFile = process.argv[2]
+const write = (frame) => process.stdout.write(JSON.stringify(frame) + '\n')
+const record = (event) => fs.appendFileSync(recordFile, JSON.stringify(event) + '\n')
+let pending = null
+readline.createInterface({ input: process.stdin }).on('line', (line) => {
+  const message = JSON.parse(line)
+  if (message.method === undefined) return
+  if (message.method === 'initialize') return write({ jsonrpc: '2.0', id: message.id, result: { protocolVersion: 1, agentInfo: { name: 'jcode' }, agentCapabilities: {} } })
+  if (message.method === 'session/load') {
+    write({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: message.params.sessionId, update: { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'earlier turn' } } } })
+    return write({ jsonrpc: '2.0', id: message.id, result: { sessionId: message.params.sessionId, configOptions: [] } })
+  }
+  if (message.method === 'session/prompt') {
+    pending = message.id
+    record({ kind: 'prompt', text: message.params.prompt[0].text })
+    return
+  }
+  if (message.method === 'session/cancel') {
+    record({ kind: 'cancel', sessionId: message.params.sessionId })
+    const id = pending
+    pending = null
+    if (id === null) return
+    write({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: message.params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'partial' } } } })
+    return write({ jsonrpc: '2.0', id, result: { stopReason: 'cancelled' } })
+  }
+})
+`
+
+test('cancel before any prompt is a named refusal without spawning a child and emits no events', async () => {
+  let approvalFactoryCalls = 0
+  let promptFactoryCalls = 0
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-seam-cancel-before-'))
+  const events: V2Event[] = []
+  const connection = await createJcodeBotBackend({
+    binary: process.execPath,
+    probe: async () => undefined,
+    home,
+    sessionId: 'session_cancel_before',
+    cwd: home,
+    intervalMs: 60_000,
+    readFile: async () => primeRecord('session_cancel_before'),
+    onEvent: (event) => events.push(event),
+    createApprovalClient: (options) => {
+      approvalFactoryCalls += 1
+      return createAcpClient(options)
+    },
+    createPromptClient: (options) => {
+      promptFactoryCalls += 1
+      return createAcpClient(options)
+    },
+  })
+  try {
+    if (connection instanceof Error) throw connection
+    const baseline = events.length
+    const refused = await connection.cancel()
+    expect(refused).toBeInstanceOf(JcodeBotBackendError)
+    expect(['cancel-no-connection', 'cancel-not-running']).toContain(stageOf(refused))
+    expect(approvalFactoryCalls).toBe(0)
+    expect(promptFactoryCalls).toBe(0)
+    expect(events.length).toBe(baseline)
+    connection.stop()
+  } finally {
+    if (!(await removeTree(home))) process.stderr.write(`jcode seam test: could not remove ${home}\n`)
+  }
+})
+
+test('cancel after the seam stopped is cancel-closed', async () => {
+  const run = await startWriteSeam({ mode: 'slow' })
+  try {
+    run.connection.stop()
+    const refused = await run.connection.cancel()
+    expect(refused).toBeInstanceOf(JcodeBotBackendError)
+    expect(stageOf(refused)).toBe('cancel-closed')
+  } finally {
+    expect(await removeTree(run.dir)).toBe(true)
+  }
+})
+
+test('cancel succeeds after a prompt and emits no events', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-seam-cancel-live-'))
+  const home = path.join(dir, 'home')
+  const script = path.join(dir, 'agent.cjs')
+  const recordFile = path.join(dir, 'record.jsonl')
+  fs.writeFileSync(script, CANCEL_WRITE_AGENT)
+  const sessionId = 'session_cancel_live'
+  fs.mkdirSync(path.join(home, 'sessions'), { recursive: true })
+  fs.writeFileSync(path.join(home, 'sessions', `${sessionId}.json`), '{}')
+  const events: V2Event[] = []
+  const connection = await createJcodeBotBackend({
+    binary: process.execPath,
+    probe: async () => undefined,
+    home,
+    sessionId,
+    cwd: dir,
+    intervalMs: 60_000,
+    readFile: async () => primeRecord(sessionId),
+    onEvent: (event) => events.push(event),
+    createPromptClient: (options) => createAcpClient({ ...options, command: process.execPath, args: [script, recordFile] }),
+  })
+  if (connection instanceof Error) {
+    await removeTree(dir)
+    throw connection
+  }
+  try {
+    const baseline = events.length
+    const running = connection.prompt('slow turn')
+    for (let attempt = 0; attempt < 100 && readPrompts(recordFile).length === 0; attempt += 1) await sleep(20)
+    expect(readPrompts(recordFile)).toEqual(['slow turn'])
+
+    const outcome = await connection.cancel()
+    expect(outcome).toEqual({ sessionId, cancelled: true })
+    expect(events.length).toBe(baseline)
+
+    const finished = await running
+    if (finished instanceof Error) throw finished
+    expect(finished.stopReason).toBe('cancelled')
+    expect(events.length).toBe(baseline)
+
+    const records = readRecords(recordFile)
+    expect(records.filter((event) => event['kind'] === 'cancel')).toEqual([{ kind: 'cancel', sessionId }])
+  } finally {
+    connection.stop()
+    expect(await removeTree(dir)).toBe(true)
   }
 })
 
