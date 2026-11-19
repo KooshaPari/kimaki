@@ -25,6 +25,10 @@ const logger = createLogger('CLI')
 // in backend/jcode-bot-backend.ts instead of discovering an OpenCode service.
 export type BotBackend = 'opencode' | 'jcode'
 export const BOT_BACKENDS = ['opencode', 'jcode'] as const
+// The environment half of the selection. A flag wins over it, and a refusal names
+// whichever surface the operator actually used, so a bad env var is not reported as
+// a bad flag.
+export const BOT_BACKEND_ENV = 'KIMAKI_BACKEND'
 
 // Root-command options that only the OpenCode path can honor: they configure
 // OpenCode sessions, their skills and prompts, coordinator threads, or voice
@@ -53,12 +57,19 @@ function explicitOption(argv: readonly string[], flag: string): { present: boole
 // Pure so the refusal can be tested without spawning a child or touching Discord.
 // Returns the resolved backend, or a ConfigError the caller fails with before any
 // supervisor child, lock port, database or Discord connection starts.
-export function resolveBotBackend({ backend, argv }: { backend: string | undefined; argv: readonly string[] }): ConfigError | { backend: BotBackend } {
-  const requested = backend ?? 'opencode'
+export function resolveBotBackend({ backend, argv, env = process.env }: {
+  backend: string | undefined
+  argv: readonly string[]
+  env?: Readonly<Record<string, string | undefined>>
+}): ConfigError | { backend: BotBackend; source: 'flag' | 'env' | 'default' } {
+  const fromEnv = env[BOT_BACKEND_ENV]?.trim()
+  const source: 'flag' | 'env' | 'default' = backend !== undefined ? 'flag' : fromEnv !== undefined && fromEnv !== '' ? 'env' : 'default'
+  const requested = backend ?? (source === 'env' ? fromEnv! : 'opencode')
   if (!(BOT_BACKENDS as readonly string[]).includes(requested)) {
-    return new ConfigError({ reason: `Unknown --backend ${JSON.stringify(requested)}. Use one of: ${BOT_BACKENDS.join(', ')}` })
+    const surface = source === 'env' ? BOT_BACKEND_ENV : '--backend'
+    return new ConfigError({ reason: `Unknown ${surface} ${JSON.stringify(requested)}. Use one of: ${BOT_BACKENDS.join(', ')}` })
   }
-  if (requested === 'opencode') return { backend: 'opencode' }
+  if (requested === 'opencode') return { backend: 'opencode', source }
   const conflicts = OPENCODE_ONLY_OPTIONS.filter((flag) => {
     const found = explicitOption(argv, flag)
     if (!found.present) return false
@@ -72,7 +83,7 @@ export function resolveBotBackend({ backend, argv }: { backend: string | undefin
       reason: `--backend jcode cannot use ${conflicts.join(', ')}: ${conflicts.length === 1 ? 'it is an OpenCode-only option' : 'they are OpenCode-only options'} with no jcode equivalent. Remove ${conflicts.length === 1 ? 'it' : 'them'}, or drop --backend jcode`,
     })
   }
-  return { backend: 'jcode' }
+  return { backend: 'jcode', source }
 }
 
 // null when the file vanished meanwhile (bot restart).
@@ -139,7 +150,7 @@ async function supervise(): Promise<never> {
 export function registerStartCommand(cli: Goke) {
   cli.command('', 'Start the bot. Runs onboarding on first start')
     .option('--data-dir <path>', DATA_DIR_HELP)
-    .option('--backend <name>', 'Bot backend: opencode (default) or jcode. jcode drives a native Jcode session and needs no OpenCode install')
+    .option('--backend <name>', 'Bot backend: opencode (default) or jcode. jcode drives a native Jcode session and needs no OpenCode install; KIMAKI_BACKEND sets the same choice when the flag is absent')
     .option('-g, --guild <guildId>', 'Server to onboard when the bot is in several')
     .option('--gateway', 'Use the shared Kimaki bot, no Discord app needed')
     .option('--gateway-callback-url <url>', 'Redirect here after the gateway install (appends ?guild_id=<id>)')
