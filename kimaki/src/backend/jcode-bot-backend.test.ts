@@ -35,7 +35,13 @@ import type { Effect } from '../thread-reducer.ts'
 import { AcpApprovalError } from './acp/approvals.ts'
 import { createAcpClient } from './acp/client.ts'
 import type { AcpClient, AcpClientOptions, AcpServerRequest } from './acp/contracts.ts'
-import { createJcodeBotBackend, JcodeBotBackendError, type JcodeBotConnection } from './jcode-bot-backend.ts'
+import {
+  createJcodeBotBackend,
+  JCODE_BOT_NOT_PROJECTED,
+  JCODE_BOT_PROJECTED_EVENTS,
+  JcodeBotBackendError,
+  type JcodeBotConnection,
+} from './jcode-bot-backend.ts'
 import { botSocketPath } from './jcode-bot-prompt.ts'
 
 function findJcode(): string | null {
@@ -455,9 +461,14 @@ describe.skipIf(jcodeBinary === null)(`jcode bot seam over a real session${skipR
       expect(connection.sessionId).toBe(settled.sessionId)
       expect(connection.health().state).toBe('consistent')
       expect(store.getState().roots[threadId]).toBe(settled.sessionId)
-      // Both projected envelopes, and only those, in the observer's order.
-      expect(events.map((event) => event.type)).toEqual(['session.text.ended', 'session.execution.succeeded'])
-      const text = events[0] as Extract<V2Event, { type: 'session.text.ended' }>
+      // Every projected envelope, and only those, in the observer's order.
+      expect(events.map((event) => event.type)).toEqual([
+        'session.execution.started',
+        'session.text.ended',
+        'session.step.ended',
+        'session.execution.succeeded',
+      ])
+      const text = events[1] as Extract<V2Event, { type: 'session.text.ended' }>
       expect(text.data.sessionID).toBe(settled.sessionId)
       expect(text.data.text).toBe('ok')
       // The bot's own view: one markdown block, and an idle marker attributed to
@@ -577,6 +588,68 @@ test('a handler that throws fails closed with one refusal, not a stalled agent',
     expect([late instanceof AcpApprovalError, (late as Error).name, (late as Error).message]).toEqual([true, 'AcpApprovalError', expect.stringMatching(/already answered/)])
   } finally {
     run.connection.stop(); expect(await removeTree(run.dir)).toBe(true)
+  }
+})
+
+test('a record proves the turn start and the reported step, and the projected list matches the switch', async () => {
+  // The persisted shape measured on jcode 0.99.1227: a user message, then the
+  // assistant message with its token_usage. The start is the user timestamp; the
+  // step is the usage that message reported.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-seam-projection-'))
+  const events: V2Event[] = []
+  const record = (): string => JSON.stringify({
+    id: 'session_projection',
+    messages: [
+      { id: 'u1', role: 'user', content: [{ type: 'text', text: 'hello' }], timestamp: '2026-01-01T00:00:01.000Z' },
+      {
+        id: 'a1',
+        role: 'assistant',
+        content: [{ type: 'text', text: 'hi' }],
+        timestamp: '2026-01-01T00:00:03.000Z',
+        token_usage: { input_tokens: 10, output_tokens: 2, reasoning_tokens: 1, cache_read_input_tokens: 3, cache_creation_input_tokens: 4 },
+      },
+    ],
+  })
+  const connection = await createJcodeBotBackend({
+    binary: process.execPath,
+    probe: async () => undefined,
+    home,
+    sessionId: 'session_projection',
+    intervalMs: 25,
+    readFile: async () => record(),
+    onEvent: (event) => events.push(event),
+  })
+  try {
+    if (connection instanceof Error) throw connection
+    expect(events.map((event) => event.type)).toEqual([
+      'session.execution.started',
+      'session.text.ended',
+      'session.step.ended',
+      'session.execution.succeeded',
+    ])
+    const started = events[0] as Extract<V2Event, { type: 'session.execution.started' }>
+    expect(started.created).toBe(Date.parse('2026-01-01T00:00:01.000Z'))
+    expect(started.data.sessionID).toBe('session_projection')
+    const step = events[2] as Extract<V2Event, { type: 'session.step.ended' }>
+    expect(step.data.assistantMessageID).toBe('a1')
+    expect(step.data.finish).toBe('unknown')
+    expect(step.data.tokens).toEqual({ input: 10, output: 2, reasoning: 1, cache: { read: 3, write: 4 } })
+    const ended = events[3] as Extract<V2Event, { type: 'session.execution.succeeded' }>
+    expect(ended.created).toBe(Date.parse('2026-01-01T00:00:03.000Z'))
+    // The projected-events constant is the switch's contract: these four, and
+    // none of them may also be listed as unprojected.
+    expect(JCODE_BOT_PROJECTED_EVENTS).toEqual([
+      'session.execution.started',
+      'session.text.ended',
+      'session.step.ended',
+      'session.execution.succeeded',
+    ])
+    for (const type of JCODE_BOT_PROJECTED_EVENTS) {
+      expect(JCODE_BOT_NOT_PROJECTED).not.toContain(type)
+    }
+    connection.stop()
+  } finally {
+    if (!(await removeTree(home))) process.stderr.write(`jcode seam test: could not remove ${home}\n`)
   }
 })
 
@@ -835,27 +908,33 @@ describe.skipIf(jcodeBinary === null)(`jcode bot seam write path over a real ses
     })
     if (connection instanceof Error) throw connection
     try {
-      // Construction emitted the pre-existing turn once (emitExisting default).
+      // Construction emitted the pre-existing turn once (emitExisting default):
+      // start, text, the reported step, and the successful execution.
       const baseline = events.length
-      expect(baseline).toBe(2)
+      expect(baseline).toBe(4)
       const outcome = await connection.prompt('Reply with only: ok')
       if (outcome instanceof Error) throw outcome
       expect(outcome.text).toBe('ok')
       expect(outcome.sessionId).toBe(settled.sessionId)
       // jcode persists the turn; the poller alone turns it into bot events.
-      for (let attempt = 0; attempt < 150 && events.length - baseline < 2; attempt += 1) {
+      for (let attempt = 0; attempt < 150 && events.length - baseline < 4; attempt += 1) {
         await connection.flush()
         await sleep(100)
       }
       const fresh = events.slice(baseline)
-      expect(fresh.map((event) => event.type)).toEqual(['session.text.ended', 'session.execution.succeeded'])
-      const text = fresh[0] as Extract<V2Event, { type: 'session.text.ended' }>
+      expect(fresh.map((event) => event.type)).toEqual([
+        'session.execution.started',
+        'session.text.ended',
+        'session.step.ended',
+        'session.execution.succeeded',
+      ])
+      const text = fresh[1] as Extract<V2Event, { type: 'session.text.ended' }>
       expect(text.data.sessionID).toBe(settled.sessionId)
       expect(text.data.text).toBe('ok')
       // Extra reads must not repeat it: the durable cursor is the dedupe.
       await connection.flush()
       await connection.flush()
-      expect(events.slice(baseline)).toHaveLength(2)
+      expect(events.slice(baseline)).toHaveLength(4)
     } finally {
       connection.stop()
     }

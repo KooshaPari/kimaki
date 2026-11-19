@@ -1,9 +1,19 @@
 // The projection boundary of the bot seam, kept as data so the seam file stays
-// readable. Two observer envelopes become bot events; every other client type is
-// named here instead of being dropped silently or synthesized.
+// readable. Four observer envelopes become bot events; every other client type
+// is named here instead of being dropped silently or synthesized.
 
-/** The only two envelopes this seam projects into the bot's V2 event stream. */
-export const JCODE_BOT_PROJECTED_EVENTS = ['session.text.ended', 'session.execution.succeeded'] as const
+/**
+ * The only envelopes this seam projects into the bot's V2 event stream. A
+ * persisted record carries: the user message that started a turn (started), the
+ * assistant text (text.ended), its `token_usage` (step.ended) and, because the
+ * record only holds a finished reply, the end of that execution (succeeded).
+ */
+export const JCODE_BOT_PROJECTED_EVENTS = [
+  'session.execution.started',
+  'session.text.ended',
+  'session.step.ended',
+  'session.execution.succeeded',
+] as const
 
 /**
  * Every V2 event type this seam does NOT project. The list is exhaustive for the
@@ -34,7 +44,6 @@ export const JCODE_BOT_NOT_PROJECTED = [
   'session.inbox.enqueued',
   'session.inbox.cancelled',
   'session.inbox.delivery.changed',
-  'session.execution.started',
   'session.execution.failed',
   'session.execution.interrupted',
   'session.instructions.updated',
@@ -44,7 +53,6 @@ export const JCODE_BOT_NOT_PROJECTED = [
   'session.shell.ended',
   'session.step.started',
   'session.step.streamed',
-  'session.step.ended',
   'session.step.failed',
   'session.text.started',
   'session.text.delta',
@@ -106,4 +114,4 @@ export const JCODE_BOT_NOT_PROJECTED = [
 
 /** Why exactly these types are absent, in one place for the report. */
 export const JCODE_BOT_NOT_PROJECTED_REASON =
-  'A persisted Jcode record holds messages only. It carries no execution-start marker, no tool/reasoning/step records, no permission or form requests and no catalog hints, so this seam emits nothing for those types rather than synthesizing them.'
+  'A persisted Jcode record holds messages only: a user message, assistant text and that message\'s token_usage. It carries no separate execution-start marker (the last user message is the start), no step lifecycle beyond the finished reply, no tool/reasoning records, no permission or form requests and no catalog hints, so this seam emits nothing for those types rather than synthesizing them.'

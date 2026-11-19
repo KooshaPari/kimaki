@@ -1,13 +1,14 @@
 // The bot seam onto a native Jcode session, deliberately narrow.
 //
 // What this is: the object startBot hands to the event loop in place of
-// `watchOpencode`. It projects exactly two observer envelopes - the end of an
-// assistant message and the end of the execution that produced it - into the
-// V2 event shape the reducer already consumes. Nothing else is invented: the
-// observer reads a persisted record, and a persisted record carries no
-// execution-start marker, no tool calls, no reasoning, no permissions and no
-// forms. Those are named refusals here (see JCODE_BOT_NOT_PROJECTED), never
-// plausible-looking filler events.
+// `watchOpencode`. It projects four observer envelopes into the V2 event shape
+// the reducer already consumes: the start of a turn (the user message before the
+// reply), the end of the assistant message, the token_usage that message
+// reported, and the end of the execution that produced it. Nothing else is
+// invented: the observer reads a persisted record, and a persisted record
+// carries no separate execution-start marker, no tool calls, no reasoning, no
+// permissions and no forms. Those are named refusals here (see
+// JCODE_BOT_NOT_PROJECTED), never plausible-looking filler events.
 //
 // What construction guarantees: the returned value is either a connection or a
 // named Error. A missing binary, a binary that cannot answer `--version`, a
@@ -307,6 +308,8 @@ export async function createJcodeBotBackend(input: JcodeBotBackendInput): Promis
   const project = (event: JcodeTurnEvent): void => {
     switch (event.type) {
       case 'session.text.ended':
+      case 'session.step.ended':
+      case 'session.execution.started':
       case 'session.execution.succeeded':
         emit(event)
         return

@@ -19,11 +19,13 @@
 //     turn. The consistency rule is imported, not reimplemented, from the
 //     runtime observer.
 //
-// The emitted payload mirrors the OpenCode V2 `session.text.ended` and
-// `session.execution.succeeded` envelopes (same field names the reducer reads)
-// without importing its branded id types, so the bot can hand them straight to
-// `reduce()`. Only assistant text is emitted: user prompts the bot did not send
-// are not replayed for it.
+// The emitted payload mirrors four OpenCode V2 envelopes (same field names the
+// reducer reads) without importing its branded id types, so the bot can hand
+// them straight to `reduce()`: `session.execution.started` (the last user
+// message before the assistant reply is the only visible turn start),
+// `session.text.ended`, `session.step.ended` (only when the record reports
+// `token_usage`) and `session.execution.succeeded`. User prompts the bot did not
+// send are never replayed as text; they are only the start marker.
 
 import fs from 'node:fs'
 import nodePath from 'node:path'
@@ -41,11 +43,31 @@ type JcodeEventDurable = { aggregateID: string; seq: number; version: 1 }
 
 export type JcodeTurnEvent =
   | {
+      type: 'session.execution.started'
+      id: string
+      durable: JcodeEventDurable
+      created: number
+      data: { sessionID: string }
+    }
+  | {
       type: 'session.text.ended'
       id: string
       durable: JcodeEventDurable
       created: number
       data: { sessionID: string; assistantMessageID: string; ordinal: number; text: string }
+    }
+  | {
+      type: 'session.step.ended'
+      id: string
+      durable: JcodeEventDurable
+      created: number
+      data: {
+        sessionID: string
+        assistantMessageID: string
+        finish: 'unknown'
+        cost: 0
+        tokens: { input: number; output: number; reasoning: number; cache: { read: number; write: number } }
+      }
     }
   | {
       type: 'session.execution.succeeded'
@@ -95,7 +117,32 @@ const MAX_INTERVAL_MS = 3_600_000
 
 const record = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value)
 
-type NativeMessage = { id: string; role: string; text: string; createdAt: number }
+// The usage the record reports for one assistant message. Zero for a key the
+// provider did not report: the V2 token shape has no "absent".
+type NativeUsage = { input: number; output: number; reasoning: number; cacheRead: number; cacheWrite: number }
+type NativeMessage = { id: string; role: string; text: string; createdAt: number; usage: NativeUsage | null }
+
+const firstNumber = (source: Record<string, unknown>, keys: readonly string[]): number => {
+  for (const key of keys) {
+    const value = source[key]
+    if (typeof value === 'number' && Number.isFinite(value)) return value
+  }
+  return 0
+}
+
+// `token_usage` is a per-message object written by jcode; the key names are the
+// ones measured on 0.99.1227 (`input_tokens`, `prompt_tokens`, ...). An absent
+// object is not zero usage: it is no report at all, so no step is emitted.
+const parseUsage = (entry: unknown): NativeUsage | null => {
+  if (!record(entry)) return null
+  return {
+    input: firstNumber(entry, ['input_tokens', 'prompt_tokens']),
+    output: firstNumber(entry, ['output_tokens']),
+    reasoning: firstNumber(entry, ['reasoning_tokens']),
+    cacheRead: firstNumber(entry, ['cache_read_input_tokens']),
+    cacheWrite: firstNumber(entry, ['cache_creation_input_tokens', 'cache_write_input_tokens']),
+  }
+}
 type NativeTurnRecord = { sessionId: string; messages: NativeMessage[] }
 
 const textOf = (content: unknown): string => {
@@ -125,6 +172,7 @@ const parseRecord = (raw: string): NativeTurnRecord | undefined => {
       role: typeof entry['role'] === 'string' ? entry['role'] : '',
       text: textOf(entry['content']),
       createdAt: Number.isFinite(timestamp) ? timestamp : 0,
+      usage: parseUsage(entry['token_usage']),
     })
   }
   return { sessionId: value['id'], messages }
@@ -249,11 +297,36 @@ export function createJcodeTurnObserver(options: {
 
   const plan = (recordValue: NativeTurnRecord): JcodeTurnEvent[] => {
     const events: JcodeTurnEvent[] = []
+    // Events this pass already planned. readOnce marks them delivered only after
+    // each one is emitted, so a duplicated record row needs its own guard.
+    const planned = new Set<string>()
     let ordinal = 0
+    // The turn start a record can prove: the last user message before the reply.
+    let lastUser: { id: string; ordinal: number; createdAt: number } | null = null
     for (const message of recordValue.messages) {
       ordinal += 1
+      if (message.role === 'user') {
+        lastUser = { id: message.id, ordinal, createdAt: message.createdAt }
+        continue
+      }
       const text = message.text.trim()
       if (message.role !== 'assistant' || !text) continue
+      // One start per user prompt, placed before the reply it produced. A record
+      // with no user message (a handcrafted or truncated one) proves no start,
+      // so no start is invented for it.
+      if (lastUser !== null) {
+        const startedKey = `${sessionId}/${lastUser.id}:started`
+        if (!delivered.has(startedKey) && !planned.has(startedKey)) {
+          planned.add(startedKey)
+          events.push({
+            type: 'session.execution.started',
+            id: `${lastUser.id}:started`,
+            durable: { aggregateID: sessionId, seq: lastUser.ordinal, version: 1 },
+            created: lastUser.createdAt,
+            data: { sessionID: sessionId },
+          })
+        }
+      }
       const textKey = `${sessionId}/${message.id}:text`
       if (!delivered.has(textKey)) {
         events.push({
@@ -263,6 +336,32 @@ export function createJcodeTurnObserver(options: {
           created: message.createdAt,
           data: { sessionID: sessionId, assistantMessageID: message.id, ordinal, text },
         })
+      }
+      // Only when the record reports usage. Its presence is the evidence that a
+      // step ran; an absent object is not a zero-token step.
+      if (message.usage !== null) {
+        const stepKey = `${sessionId}/${message.id}:step`
+        if (!delivered.has(stepKey) && !planned.has(stepKey)) {
+          planned.add(stepKey)
+          events.push({
+            type: 'session.step.ended',
+            id: `${message.id}:step`,
+            durable: { aggregateID: sessionId, seq: ordinal, version: 1 },
+            created: message.createdAt,
+            data: {
+              sessionID: sessionId,
+              assistantMessageID: message.id,
+              finish: 'unknown',
+              cost: 0,
+              tokens: {
+                input: message.usage.input,
+                output: message.usage.output,
+                reasoning: message.usage.reasoning,
+                cache: { read: message.usage.cacheRead, write: message.usage.cacheWrite },
+              },
+            },
+          })
+        }
       }
       const doneKey = `${sessionId}/${message.id}:done`
       if (!delivered.has(doneKey)) {
