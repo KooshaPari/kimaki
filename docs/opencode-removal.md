@@ -507,3 +507,13 @@ concern that needs the user's explicit action; kimaki must never do it on their 
 3. Anthropic subscription login (`src/plugin/anthropic/index.ts`) is a *provider*
    capability, not an OpenCode one, but it is implemented as an OpenCode plugin. It needs a
    jcode-side home before Phase 2.4 can ship.
+
+### Worktree toolchain limit (measured 2026-11-19)
+
+Junctioned worktrees on this host cannot run `tsc`: even `tsc --listFilesOnly`, which does no
+type checking, hung past 300s with 0 bytes. `tsc --version` answered in 8s and a trivial scratch
+file resolved in 13s, while a single project file importing discord.js hung past 60s. The cause
+is `kimaki/node_modules` being a junction into the pnpm virtual store whose entries are
+themselves junctions, over which NodeNext resolution explodes. Type checks must therefore run
+in a tree with a real `node_modules`. Any commit landed from such a worktree carries an explicit
+"type check unverified" label.
