@@ -244,6 +244,7 @@ async function settleStore(sessionsDir: string, timeoutMs = 60_000): Promise<Set
 test('without a backend the seam calls the OpenCode path exactly as before', () => {
   const stop = (): void => {}
   const sentinel = {
+    kind: 'opencode' as const,
     connected: false,
     endpoint: null,
     ready: Promise.resolve(new Error('not connected')),
@@ -300,7 +301,7 @@ test('a jcode backend is constructed through the jcode factory, never OpenCode',
     { backend: { kind: 'jcode', sessionId: 'session_x' }, callbacks: { ensure: false, onConnect: async () => {}, onEvent, onDisconnect: () => {} } },
     () => {
       opencodeCalled = true
-      return { ...sentinel, connected: false }
+      return { kind: 'opencode' as const, connected: false, endpoint: null, ready: Promise.resolve(new Error('none')), subscribe: () => () => {}, stop: () => {} }
     },
     async (input) => {
       expect(input.sessionId).toBe('session_x')

@@ -324,7 +324,10 @@ export type ConnectContext = {
   signal: AbortSignal
 }
 
-export type OpencodeConnection = {
+// The connection contract every bot backend satisfies. watchOpencode returns this
+// shape for OpenCode; a Jcode backend satisfies the same members with kind 'jcode'.
+export interface Backend {
+  readonly kind: 'opencode' | 'jcode'
   readonly connected: boolean
   readonly endpoint: OpencodeEndpoint | null
   // Resolves on the first successful connect, or with the fatal error.
@@ -333,6 +336,10 @@ export type OpencodeConnection = {
   // (re)connect starts with server.connected. Returns the unsubscribe.
   subscribe: (listener: (event: V2Event) => void) => () => void
   stop: () => void
+}
+
+export type OpencodeConnection = Backend & {
+  readonly kind: 'opencode'
 }
 
 class StreamClosedError extends errore.createTaggedError({
@@ -462,6 +469,7 @@ export function watchOpencode({
   })()
 
   return {
+    kind: 'opencode',
     get connected() {
       return state.connected
     },
