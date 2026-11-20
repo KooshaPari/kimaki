@@ -10,6 +10,8 @@ import { setTimeout as sleep } from 'node:timers/promises'
 import dedent from 'string-dedent'
 import { wrapJsonSchema, type Goke } from 'goke'
 
+import { BOT_BACKENDS, shouldCheckOpencode, type BotBackend } from '../backend-selection.ts'
+export { BOT_BACKENDS, shouldCheckOpencode, type BotBackend } from '../backend-selection.ts'
 import { distCliEntry, removeAutostartScript, stableNodePath, writeAutostartScript } from '../autostart.ts'
 import { parseDisabledPromptSections, parseDisabledSkills, PROMPT_SECTIONS } from '../builtin-skills.ts'
 import { callBot, DEFAULT_LOCK_PORT, RESTART_EXIT_CODE, startLockServer } from '../lock-server.ts'
@@ -20,11 +22,8 @@ import { action, DATA_DIR_HELP, dataDirOrDefault, discordApi, fail, openCliDb, p
 
 const logger = createLogger('CLI')
 
-// The two bot backends the root command can start. `opencode` is the default and
-// keeps the existing path byte-identical; `jcode` drives the native Jcode observer
-// in backend/jcode-bot-backend.ts instead of discovering an OpenCode service.
-export type BotBackend = 'opencode' | 'jcode'
-export const BOT_BACKENDS = ['opencode', 'jcode'] as const
+// Bot backend types and the OpenCode preflight policy come from
+// backend-selection.ts so tests can import them without this module's heavy graph.
 // The environment half of the selection. A flag wins over it, and a refusal names
 // whichever surface the operator actually used, so a bad env var is not reported as
 // a bad flag.
@@ -253,12 +252,14 @@ export function registerStartCommand(cli: Goke) {
       if (opened instanceof Error) failStartup(opened)
 
       // Before onboarding: without OpenCode the OpenCode backend cannot start, so fail
-      // (or install it) before the Discord install. The jcode backend needs no OpenCode.
-      if (backend === 'opencode') {
+      // (or install it) before the Discord install. The jcode backend needs no OpenCode,
+      // except when persisted threads still belong to OpenCode (Phase 1.5).
+      const legacyThreadCount = await opened.db.query.thread_sessions.findMany({ columns: { thread_id: true } }).then((rows) => rows.length)
+      if (shouldCheckOpencode({ backend, legacyThreadCount })) {
         const opencodeCheck = await ensureOpencode({ serviceFile: process.env['KIMAKI_OPENCODE_SERVICE_FILE'] })
         if (opencodeCheck instanceof Error) {
           opened.close()
-          failStartup(opencodeCheck)
+          failStartup(legacyOpencodeCheckFailure({ backend, source: backendChoice.source, legacyThreadCount, error: opencodeCheck }))
         }
       }
 
