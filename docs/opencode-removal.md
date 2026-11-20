@@ -508,12 +508,20 @@ concern that needs the user's explicit action; kimaki must never do it on their 
    capability, not an OpenCode one, but it is implemented as an OpenCode plugin. It needs a
    jcode-side home before Phase 2.4 can ship.
 
-### Worktree toolchain limit (measured 2026-11-19)
+### Type-check failure in fresh worktrees (corrected 2026-11-20)
 
-Junctioned worktrees on this host cannot run `tsc`: even `tsc --listFilesOnly`, which does no
-type checking, hung past 300s with 0 bytes. `tsc --version` answered in 8s and a trivial scratch
-file resolved in 13s, while a single project file importing discord.js hung past 60s. The cause
-is `kimaki/node_modules` being a junction into the pnpm virtual store whose entries are
-themselves junctions, over which NodeNext resolution explodes. Type checks must therefore run
-in a tree with a real `node_modules`. Any commit landed from such a worktree carries an explicit
-"type check unverified" label.
+The earlier junction/NodeNext explanation was wrong. A full unfiltered
+`pnpm install --frozen-lockfile --prefer-offline` (no junction) still produced 3,234 diagnostics.
+The real cause: `errore` is a git submodule (`.gitmodules` ->
+https://github.com/remorses/errore.git, pinned cbe571937d2c188d5a79ae52ee3b7a6ec5ed3c6e) left
+uninitialized in the fresh worktree, so it resolved to an empty directory.
+`kimaki/src/errors.ts(3,25) TS2307 Cannot find module 'errore'` cascaded through every
+`ConfigError`-derived error (TS2322/TS2554/TS2739/TS2345) into all 3,234 diagnostics. After
+`git submodule update --init -- errore` and building its `dist/` with the workspace TypeScript
+(36 files emitted), the same check dropped to 3 errors: pre-existing `TS2307 Cannot find module
+'./generated/client.js'` in `discord-digital-twin/src/{db,serializers,server}.ts` (an ungenerated
+Prisma client in a sibling workspace package, not our code). `--listFilesOnly` confirmed all six
+files under review compile and none appear in the final log. Rules: initialize submodules and
+build their `dist/` before type checking; run `tsc -p kimaki --noEmit` detached with ~25 minute
+patience (~22 minutes on this loaded host), since a blocking 10-minute call gets killed and
+misread as a hang.
