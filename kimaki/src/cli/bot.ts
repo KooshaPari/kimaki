@@ -10,7 +10,7 @@ import { setTimeout as sleep } from 'node:timers/promises'
 import dedent from 'string-dedent'
 import { wrapJsonSchema, type Goke } from 'goke'
 
-import { BOT_BACKENDS, shouldCheckOpencode, type BotBackend } from '../backend-selection.ts'
+import { BOT_BACKENDS, legacyOpencodeCheckFailure, shouldCheckOpencode, type BotBackend } from '../backend-selection.ts'
 export { BOT_BACKENDS, shouldCheckOpencode, type BotBackend } from '../backend-selection.ts'
 import { distCliEntry, removeAutostartScript, stableNodePath, writeAutostartScript } from '../autostart.ts'
 import { parseDisabledPromptSections, parseDisabledSkills, PROMPT_SECTIONS } from '../builtin-skills.ts'
