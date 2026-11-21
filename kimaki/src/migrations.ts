@@ -207,6 +207,16 @@ function applySchema({ db }: { db: Db }): void {
   db.exec(SCHEMA_SQL)
 }
 
+// Columns added after the first release. schema.sql only creates missing
+// tables, so an existing thread_sessions needs its own ALTER. Guarded on
+// table_info: a database that already has the column (or a second start)
+// is left unchanged.
+function addThreadSessionsBackend({ db }: { db: Db }): void {
+  const columns = columnsOf({ db, schema: 'main', table: 'thread_sessions' })
+  if (columns.some((column) => column.name === 'backend')) return
+  db.run(`ALTER TABLE thread_sessions ADD COLUMN "backend" text DEFAULT 'opencode' NOT NULL`)
+}
+
 function markMigrated({ db }: { db: Db }): void {
   db.exec(`PRAGMA user_version = ${DB_VERSION}`)
 }
@@ -320,6 +330,7 @@ async function prepareDbFile({ dataDir }: { dataDir: string }): Promise<DbError 
 // ALTER TABLE migrations here, before schema.sql when a new index needs them.
 function migrateSchema({ db }: { db: Db }): void {
   applySchema({ db })
+  addThreadSessionsBackend({ db })
   markMigrated({ db })
 }
 

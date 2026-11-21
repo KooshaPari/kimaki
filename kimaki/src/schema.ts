@@ -96,6 +96,7 @@ export const thread_sessions = s.sqliteTable('thread_sessions', {
   thread_id: s.text('thread_id').primaryKey().notNull(),
   session_id: s.text('session_id').notNull(),
   source: s.text('source', { enum: ['kimaki', 'external_poll'] }).notNull().default('kimaki'),
+  backend: s.text('backend').notNull().default('opencode'),
   last_synced_name: s.text('last_synced_name'),
   parent_session_id: s.text('parent_session_id'),
   created_at: datetime('created_at').default(orm.sql`CURRENT_TIMESTAMP`),

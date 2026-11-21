@@ -106,6 +106,55 @@ test('ops table upgrade is additive and only startup migrates an old-shaped data
   upgraded.close()
 })
 
+test('a fresh database gives thread_sessions a backend column defaulting to opencode', async () => {
+  const dataDir = tempDataDir()
+  const opened = await openDb({ dataDir, migrate: true })
+  if (opened instanceof Error) throw opened
+
+  const columns = await opened.client.execute('PRAGMA table_info(thread_sessions)')
+  expect(columns.rows.filter((row) => row.name === 'backend')).toMatchObject([{ dflt_value: "'opencode'", notnull: 1 }])
+
+  // An insert that does not name backend gets the default.
+  await opened.client.execute("INSERT INTO thread_sessions (thread_id, session_id) VALUES ('fresh-thread', 'fresh-session')")
+  const row = await opened.db.query.thread_sessions.findFirst({ where: { thread_id: 'fresh-thread' } })
+  expect(row?.backend).toBe('opencode')
+  opened.close()
+})
+
+test('an existing database gets the thread_sessions backend column and keeps its rows', async () => {
+  const dataDir = tempDataDir()
+  // A kimaki.db written before the column existed, without the version marker.
+  const file = path.join(dataDir, 'kimaki.db')
+  const before = createClient({ url: `file:${file}` })
+  // The shape before the backend column, exactly as schema.sql wrote it.
+  await before.execute(`CREATE TABLE thread_sessions (
+    thread_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    source TEXT DEFAULT 'kimaki' NOT NULL,
+    last_synced_name TEXT,
+    parent_session_id TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`)
+  await before.execute("INSERT INTO thread_sessions (thread_id, session_id) VALUES ('legacy-thread', 'legacy-session')")
+  before.close()
+  await releaseLibsqlHandles()
+
+  const opened = await openDb({ dataDir, migrate: true })
+  if (opened instanceof Error) throw opened
+  const columns = await opened.client.execute('PRAGMA table_info(thread_sessions)')
+  expect(columns.rows.filter((row) => row.name === 'backend')).toMatchObject([{ dflt_value: "'opencode'", notnull: 1 }])
+  expect((await opened.db.query.thread_sessions.findFirst({ where: { thread_id: 'legacy-thread' } }))?.backend).toBe('opencode')
+  opened.close()
+
+  // A second start runs the migration path again: still one column, same row.
+  const reopened = await openDb({ dataDir, migrate: true })
+  if (reopened instanceof Error) throw reopened
+  expect((await reopened.client.execute('PRAGMA table_info(thread_sessions)')).rows.filter((row) => row.name === 'backend')).toHaveLength(1)
+  expect((await reopened.db.query.thread_sessions.findFirst({ where: { thread_id: 'legacy-thread' } }))?.backend).toBe('opencode')
+  reopened.close()
+})
+
 test('fresh install gets kimaki.db with the kimaki tables; subcommands never create it', async () => {
   const dataDir = tempDataDir()
 
