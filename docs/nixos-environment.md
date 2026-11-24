@@ -122,9 +122,16 @@ because `nodenext` maps a `.js` specifier onto the `.ts` source; this was confir
 
 ## Suite runtime
 
-About 288 s for the full suite once Prisma generates, against about 108 s when 47 opencode-dependent
-files fail early at their `beforeAll`. Measured state at commit 948933cd: 633 passed, 5 failed, 198
-skipped, 123 files.
+About 266 s for the full suite once Prisma generates. Measured at commit 8ffbfdb0: 669 passed,
+3 failed, 178 skipped across 124 files, compared with 563 passed and 6 failed on the Windows desk
+host. All three remaining failures belong to the legacy OpenCode backend and not to jcode:
+`observe-restart-witness > AC35` and `opencode-server > supported binary wins over OpenCode 1` both
+need a runnable opencode binary, and `no-opencode-start > control` needs `/bin/bash`.
+
+Setting `JCODE_BIN` changes what runs: with it set the totals are 669 passed / 3 failed / 178
+skipped, and with it unset 650 passed / 2 failed / 198 skipped, because eighteen jcode session tests
+skip themselves rather than fail. An unset variable therefore reads as a better result than a set
+one, which is why the reproduce block below sets it.
 
 ## Reproduce
 
