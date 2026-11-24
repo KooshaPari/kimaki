@@ -102,10 +102,29 @@ kimaki's installer path spawns `/bin/bash`, which does not exist on NixOS, so `n
 fails on that alone. It is a Phase 2.1 deletion target and is not to be worked around. The failure is
 expected on this host and is not a regression in the host environment.
 
+## OpenCode e2e suites cannot start here
+
+The pinned `@opencode/cli` ships a glibc ELF. On this host `/lib64/ld-linux-x86-64.so.2` is a musl
+stub loader, so `spawn` returns ENOENT and 44 e2e files die in their `beforeAll` with "OpenCode test
+server failed to start". Their cases are skipped, not failed. This is an environment limitation of the
+legacy backend, not a defect introduced here, and the same suites pass on the Windows desk host. A
+host that provides a runnable Linux opencode binary can run them; nothing in the jcode backend depends
+on them.
+
+## Type check
+
+`npx tsc --noEmit` returns 0 errors in about 12 s once the `errore` build and the Prisma
+generation step have both run. Both are required: without the workspace build the errors are
+unresolved workspace types, and without generation the `discord-digital-twin` files cannot resolve
+`./generated/client.js`. That specifier is correct even though the generator writes `client.ts`,
+because `nodenext` maps a `.js` specifier onto the `.ts` source; this was confirmed with
+`tsc --explainFiles`, not assumed.
+
 ## Suite runtime
 
-About 108 seconds for the full run on this host, against minutes on the Windows desk host. The wall
-time is dominated by nothing in particular, so there is no single slow test to optimise.
+About 288 s for the full suite once Prisma generates, against about 108 s when 47 opencode-dependent
+files fail early at their `beforeAll`. Measured state at commit 948933cd: 633 passed, 5 failed, 198
+skipped, 123 files.
 
 ## Reproduce
 
@@ -128,8 +147,14 @@ nix shell nixpkgs#prisma-engines_7-7.10.1 --command bash -lc '
   export PRISMA_ENGINES_CHECKSUM_IGNORE_MISSING=1
   cd discord-digital-twin && pnpm exec prisma generate'
 
-nix shell nixpkgs#openssl --command bash -lc 'pnpm vitest run'
+nix shell nixpkgs#openssl --command bash -lc '
+  export PRISMA_SCHEMA_ENGINE_BINARY=<the engine path from the step above>
+  export JCODE_BIN=$(command -v jcode)
+  cd kimaki && node_modules/.bin/vitest run'
 ```
 
 Do not fold the prisma step into the install step: install runs with `--ignore-scripts`, and
 generation needs the engines that `nix shell` provides. Do not expect `gateway-proxy` to build.
+
+`JCODE_BIN` matters as much as the engine path: the jcode observe and bot-backend suites skip
+themselves when it is unset, so an unset variable reads as a pass while nothing ran.
