@@ -266,7 +266,7 @@ export function registerStartCommand(cli: Goke) {
       const persistedRows = await opened.db.query.thread_sessions.findMany({ columns: { thread_id: true, backend: true } })
       const legacyThreadCount = backendPlan(persistedRows).opencodeThreads
       if (shouldCheckOpencode({ backend, legacyThreadCount })) {
-        const opencodeCheck = await ensureOpencode({ serviceFile: process.env['KIMAKI_OPENCODE_SERVICE_FILE'] })
+        const opencodeCheck = await ensureOpencode({ serviceFile: process.env['KIMAKI_OPENCODE_SERVICE_FILE'], legacyThreadCount })
         if (opencodeCheck instanceof Error) {
           opened.close()
           failStartup(legacyOpencodeCheckFailure({ backend, source: backendChoice.source, legacyThreadCount, error: opencodeCheck }))

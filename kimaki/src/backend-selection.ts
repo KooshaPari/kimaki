@@ -63,8 +63,9 @@ export function legacyOpencodeCheckFailure({
   if (backend === 'opencode') return error
   const surface = backendSelectionSurface({ backend, source })
   const threads = `${legacyThreadCount} legacy OpenCode thread${legacyThreadCount === 1 ? '' : 's'}`
+  const verb = legacyThreadCount === 1 ? 'still requires' : 'still require'
   return new ConfigError({
-    reason: `jcode backend (${surface}): ${threads} still require OpenCode 2 for legacy compatibility; run the OpenCode check/install or remove those threads before starting jcode. ${error.message}`,
+    reason: `jcode backend (${surface}): ${threads} ${verb} OpenCode 2 for legacy compatibility; run the OpenCode check/install or remove those threads before starting jcode. ${error.message}`,
     cause: error,
   })
 }

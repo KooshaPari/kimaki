@@ -9,6 +9,7 @@ import { ConfigError, OpenCodeMissingError } from './errors.ts'
 import { legacyOpencodeCheckFailure, shouldCheckOpencode } from './backend-selection.ts'
 
 const checkOpencode = vi.hoisted(() => vi.fn())
+const clackConfirm = vi.hoisted(() => vi.fn())
 
 vi.mock('./opencode-server.ts', () => ({
   checkOpencode,
@@ -17,10 +18,29 @@ vi.mock('./opencode-server.ts', () => ({
   OPENCODE_INSTALL_COMMAND: 'curl -fsSL https://opencode.ai/v2/install | bash',
 }))
 
-import { ensureOpencode } from './onboarding.ts'
+// The install question is the one place a legacy run talks to the user about
+// OpenCode, so it is captured rather than typed at a terminal. Everything else
+// (the logger's symbols) must stay real.
+vi.mock('@clack/prompts', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@clack/prompts')>()),
+  confirm: clackConfirm,
+}))
+
+// The prompt only exists on a host where the installer could run. This test host has
+// no /bin/bash, so report it present; every other path is the real filesystem.
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>()
+  const existsSync = ((target: Parameters<typeof actual.existsSync>[0]) =>
+    target === '/bin/bash' ? true : actual.existsSync(target)) as typeof actual.existsSync
+  const withDefault = actual as unknown as typeof actual & { default: Record<string, unknown> }
+  return { ...actual, existsSync, default: { ...withDefault.default, existsSync } }
+})
+
+import { ensureOpencode, opencodeInstallReason } from './onboarding.ts'
 
 beforeEach(() => {
   checkOpencode.mockReset()
+  clackConfirm.mockReset()
 })
 
 describe('shouldCheckOpencode', () => {
@@ -52,6 +72,7 @@ describe('legacy check', () => {
         await ensureOpencode({})
       }
       expect(checkOpencode).not.toHaveBeenCalled()
+      expect(clackConfirm).not.toHaveBeenCalled()
       expect(writes.join('')).not.toContain('opencode.ai')
       expect(writes.join('')).not.toContain('Install it with')
     } finally {
@@ -90,11 +111,69 @@ describe('legacy check', () => {
     expect(surfaced.message).toContain('jcode backend')
     expect(surfaced.message).toContain('--backend jcode')
     expect(surfaced.message).toContain('1 legacy OpenCode thread')
+    expect(surfaced.message).toContain('1 legacy OpenCode thread still requires OpenCode 2')
     expect(surfaced.message).toContain((result as Error).message)
 
     const surfacedEnv = legacyOpencodeCheckFailure({ backend: 'jcode', source: 'env', legacyThreadCount: 2, error: result as Error })
     expect(surfacedEnv.message).toContain('jcode backend')
     expect(surfacedEnv.message).toContain('KIMAKI_BACKEND=jcode')
     expect(surfacedEnv.message).toContain('2 legacy OpenCode threads')
+  })
+})
+
+// Step 1.5 wording: a legacy run must say WHY OpenCode is wanted. A user mid-migration
+// should read "a thread needs it", never a bare "installing OpenCode".
+describe('opencodeInstallReason', () => {
+  test('the opencode backend keeps the original wording', () => {
+    expect(opencodeInstallReason({ legacyThreadCount: 0 })).toBe('Kimaki requires OpenCode 2')
+  })
+
+  test('a legacy jcode start names the thread that still needs OpenCode', () => {
+    const one = opencodeInstallReason({ legacyThreadCount: 1 })
+    expect(one).toContain('1 existing Discord thread was created with OpenCode and still needs it')
+    expect(one).toContain('new threads do not')
+    expect(one).not.toBe('Kimaki requires OpenCode 2')
+
+    const many = opencodeInstallReason({ legacyThreadCount: 3 })
+    expect(many).toContain('3 existing Discord threads were created with OpenCode and still need it')
+  })
+})
+
+describe('install question', () => {
+  // The question is only shown on a TTY. Force it, and hide OPENCODE_PATH (which
+  // short-circuits the prompt) so the exact string the user sees is captured.
+  async function askOnTTY<T>(run: () => Promise<T>): Promise<T> {
+    const descriptor = Object.getOwnPropertyDescriptor(process.stdin, 'isTTY')
+    const savedPath = process.env['OPENCODE_PATH']
+    Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true })
+    delete process.env['OPENCODE_PATH']
+    try {
+      return await run()
+    } finally {
+      if (descriptor) Object.defineProperty(process.stdin, 'isTTY', descriptor)
+      else Reflect.deleteProperty(process.stdin as unknown as Record<string, unknown>, 'isTTY')
+      if (savedPath !== undefined) process.env['OPENCODE_PATH'] = savedPath
+    }
+  }
+
+  test('a legacy run asks to install and names the thread that needs it', async () => {
+    checkOpencode.mockResolvedValueOnce('missing')
+    clackConfirm.mockResolvedValueOnce(false)
+    const result = await askOnTTY(() => ensureOpencode({ legacyThreadCount: 1 }))
+    expect(clackConfirm).toHaveBeenCalledTimes(1)
+    const message = String((clackConfirm.mock.calls[0]?.[0] as { message?: unknown } | undefined)?.message)
+    expect(message).toContain('1 existing Discord thread was created with OpenCode and still needs it')
+    expect(message).toContain('Install it now with')
+    // Declining leaves the caller with the documented missing error, nothing installed.
+    expect(result).toBeInstanceOf(OpenCodeMissingError)
+  })
+
+  test('the opencode backend question keeps the original wording', async () => {
+    checkOpencode.mockResolvedValueOnce('missing')
+    clackConfirm.mockResolvedValueOnce(false)
+    await askOnTTY(() => ensureOpencode({}))
+    const message = String((clackConfirm.mock.calls[0]?.[0] as { message?: unknown } | undefined)?.message)
+    expect(message.startsWith('Kimaki requires OpenCode 2. Install it now with')).toBe(true)
+    expect(message).not.toContain('existing Discord thread')
   })
 })
