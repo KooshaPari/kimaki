@@ -514,6 +514,31 @@ Two items this step does **not** settle, left to a product decision rather than 
    follow a seeded session but cannot create the "new thread" this step assumes. That gap is a
    jcode session-creation path (Phase 0.3 scope), not a routing rule.
 
+   **Narrowed 2026-11-24 (creation on bind).** The creation half now exists:
+   `src/jcode-thread.ts` `bindJcodeSession` mints a session with the seam's `follow: 'create'`
+   (the thread's working directory as cwd, the user's first message as `createPrompt`) and
+   writes the row through `src/bind-thread.ts` `bindThread`, the same writer the OpenCode path
+   uses. `startSession` and `startCoordinator` take the jcode branch only when
+   `bot.backendKind === 'jcode'`; the OpenCode path is untouched. A row that already names a
+   session is returned unchanged (`reused: true`) and never re-created; a refusal writes no
+   row and is posted on the thread it was for. Proof: `src/jcode-thread.e2e.test.ts` (3 cases,
+   empty database + real binary: record on disk, row records id and `jcode`, second bind
+   reuses with no second record, coordinator binds the channel id, empty primer writes
+   nothing).
+
+   What this still does **not** settle, and is the next step:
+   - **Serving turns.** The created connection is stopped once its record settles: the bot has
+     one jcode connection chosen at start (`thread-backend.ts`), and `prompt.ts` reaches
+     backends only through `oc(...)`, whose jcode endpoint is null. A created thread therefore
+     has a real session and no replies yet (`startJcodeThread` says so in the thread).
+   - **A bot start still needs one persisted session.** `resolveSession` refuses an empty store,
+     so on a cold home `startBotConnections` fails before any thread can be created. Creation
+     on bind is reachable today only once the bot has started; a per-thread connection registry
+     (or an "observe nothing yet" start) is the prerequisite for a truly fresh install.
+   - **No worktree of its own for the coordinator**, and **no instructions entry** for either
+     path: `putInstructions` is an OpenCode call, so a jcode session currently has no kimaki
+     instructions/system-prompt entry.
+
 ### Phase 2 — Remove the OpenCode runtime from shipped paths
 
 Only after every existing thread is either migrated or explicitly abandoned.

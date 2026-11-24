@@ -63,6 +63,11 @@ export type Bot = {
   // The configured backend (`--backend` / KIMAKI_BACKEND). Recorded on every row
   // bindThread writes, so a new thread is served by the default.
   backendKind: 'opencode' | 'jcode'
+  // The binary and home this bot's jcode connections were started with. A new thread's
+  // session must be minted in the same store the bot observes (jcode-thread.ts), so a
+  // bot started with an explicit binary/home never creates a session elsewhere. null:
+  // the seam's own default (JCODE_BIN, JCODE_HOME or ~/.jcode).
+  jcodeStore: { readonly binary: string | null; readonly home: string | null }
   eventLoop: EventLoop
   effects: EffectsRunner
   analytics: Analytics

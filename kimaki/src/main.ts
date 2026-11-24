@@ -303,6 +303,12 @@ export async function startBot(options: StartBotOptions): Promise<Error | BotHan
     opencode,
     backends,
     backendKind: connections.backendKind,
+    // A created thread's session must land in the store this bot observes, so the same
+    // explicit binary/home that started the connection is what creation uses.
+    jcodeStore: {
+      binary: options.backend?.binary ?? null,
+      home: options.backend?.home ?? null,
+    },
     eventLoop,
     effects,
     analytics: options.analytics,

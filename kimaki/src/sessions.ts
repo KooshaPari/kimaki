@@ -27,6 +27,8 @@ import {
   type ModelChoice,
   type PromptFile,
 } from './bot.ts'
+import { bindThread } from './bind-thread.ts'
+import { startJcodeCoordinator, startJcodeThread } from './jcode-thread.ts'
 import { ConfigError, DbError, DiscordError, OpenCodeError, OpenCodeUnavailableError } from './errors.ts'
 import { SILENT_MESSAGE_FLAGS } from './format-parts.ts'
 import { createLogger } from './logger.ts'
@@ -107,22 +109,6 @@ export async function sessionCwd(bot: Bot, { conversation, directory }: { conver
   const moved = await oc(bot, 'session.move', (client) => client.session.move({ sessionID: sessionId, directory: destination, delivery: 'steer' }))
   if (moved instanceof Error) return moved
   return { requestedDirectory: destination }
-}
-
-async function bindThread(
-  bot: Bot,
-  { threadId, sessionId, channelId, directory, isNew }: { threadId: string; sessionId: string; channelId: string; directory: string; isNew: boolean },
-): Promise<DbError | void> {
-  // The backend is recorded with the binding (docs/opencode-removal.md step 1.1):
-  // without it the column's default would make every new thread an OpenCode
-  // thread, and a jcode bot would refuse to serve the thread it just created.
-  const inserted = await bot.db
-    .insert(schema.thread_sessions)
-    .values({ thread_id: threadId, session_id: sessionId, source: 'kimaki', backend: bot.backendKind })
-    .catch((cause) => new DbError({ operation: 'insert thread_sessions', cause }))
-  if (inserted instanceof Error) return inserted
-  await bot.eventLoop.bind({ threadId, sessionId, channelId, directory, isNew, backend: bot.backendKind })
-  logger.log(`session ${sessionId} bound to thread ${threadId}`)
 }
 
 // A cold (or evicted) location loads plugin and markdown agents a moment after
@@ -440,6 +426,26 @@ export async function startSession(
     run?: boolean
   },
 ): Promise<Error | { threadId: string; sessionId: string }> {
+  // A jcode thread's session is minted on bind, never at bot start (docs/opencode-removal.md
+  // Phase 1): creation is this path's job and it owns its own failures by name. The OpenCode
+  // path below is unchanged and still serves `--backend opencode`.
+  if (bot.backendKind === 'jcode') {
+    return startJcodeThread(bot, {
+      channelId,
+      directory: requestedDirectory,
+      route,
+      author,
+      messageId,
+      startMessageId,
+      showInput,
+      threadName: explicitName,
+      members,
+      files,
+      worktree,
+      baseBranch,
+      run,
+    })
+  }
   const defaults = await bot.db.query.channel_directories
     .findFirst({ where: { channel_id: channelId }, with: { channel_model: true, channel_agent: true, channel_worktree: true } })
     .catch((cause) => new DbError({ operation: 'read channel defaults', cause }))
@@ -569,6 +575,12 @@ export async function startCoordinator(
     files?: readonly PromptFile[]
   },
 ): Promise<Error | { threadId: string; sessionId: string }> {
+  // Same rule as a thread: a coordinator channel is bound with the channel id and its
+  // session is created on bind, never at bot start. Coordinator mode is the default, so
+  // without this branch a plain channel message on a jcode bot creates nothing.
+  if (bot.backendKind === 'jcode') {
+    return startJcodeCoordinator(bot, { channel, route, author })
+  }
   const defaults = await bot.db.query.channel_directories
     .findFirst({ where: { channel_id: channel.id }, with: { channel_model: true, channel_agent: true } })
     .catch((cause) => new DbError({ operation: 'read channel defaults', cause }))
