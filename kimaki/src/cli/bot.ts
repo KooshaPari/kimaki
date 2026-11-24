@@ -10,8 +10,8 @@ import { setTimeout as sleep } from 'node:timers/promises'
 import dedent from 'string-dedent'
 import { wrapJsonSchema, type Goke } from 'goke'
 
-import { BOT_BACKENDS, legacyOpencodeCheckFailure, shouldCheckOpencode, type BotBackend } from '../backend-selection.ts'
-export { BOT_BACKENDS, shouldCheckOpencode, type BotBackend } from '../backend-selection.ts'
+import { BOT_BACKENDS, BOT_BACKEND_CHOICES, DEFAULT_BOT_BACKEND, legacyOpencodeCheckFailure, shouldCheckOpencode, type BotBackend } from '../backend-selection.ts'
+export { BOT_BACKENDS, BOT_BACKEND_CHOICES, DEFAULT_BOT_BACKEND, shouldCheckOpencode, type BotBackend } from '../backend-selection.ts'
 import { distCliEntry, removeAutostartScript, stableNodePath, writeAutostartScript } from '../autostart.ts'
 import { parseDisabledPromptSections, parseDisabledSkills, PROMPT_SECTIONS } from '../builtin-skills.ts'
 import { callBot, DEFAULT_LOCK_PORT, RESTART_EXIT_CODE, startLockServer } from '../lock-server.ts'
@@ -63,10 +63,10 @@ export function resolveBotBackend({ backend, argv, env = process.env }: {
 }): ConfigError | { backend: BotBackend; source: 'flag' | 'env' | 'default' } {
   const fromEnv = env[BOT_BACKEND_ENV]?.trim()
   const source: 'flag' | 'env' | 'default' = backend !== undefined ? 'flag' : fromEnv !== undefined && fromEnv !== '' ? 'env' : 'default'
-  const requested = backend ?? (source === 'env' ? fromEnv! : 'opencode')
+  const requested = backend ?? (source === 'env' ? fromEnv! : DEFAULT_BOT_BACKEND)
   if (!(BOT_BACKENDS as readonly string[]).includes(requested)) {
     const surface = source === 'env' ? BOT_BACKEND_ENV : '--backend'
-    return new ConfigError({ reason: `Unknown ${surface} ${JSON.stringify(requested)}. Use one of: ${BOT_BACKENDS.join(', ')}` })
+    return new ConfigError({ reason: `Unknown ${surface} ${JSON.stringify(requested)}. Use one of: ${BOT_BACKEND_CHOICES}` })
   }
   if (requested === 'opencode') return { backend: 'opencode', source }
   const conflicts = OPENCODE_ONLY_OPTIONS.filter((flag) => {
@@ -78,8 +78,14 @@ export function resolveBotBackend({ backend, argv, env = process.env }: {
     return true
   })
   if (conflicts.length > 0) {
+    // Name the surface that actually selected jcode, so a bare start is not told
+    // to "drop --backend jcode" it never passed. The refusal stays loud: a flag
+    // with no jcode equivalent is not silently ignored.
+    const subject = source === 'flag' ? '--backend jcode' : source === 'env' ? `${BOT_BACKEND_ENV}=jcode` : 'The default backend (jcode)'
+    const remove = `Remove ${conflicts.length === 1 ? 'it' : 'them'}`
+    const advice = source === 'flag' ? `${remove}, or drop --backend jcode` : source === 'env' ? `${remove}, or unset ${BOT_BACKEND_ENV} to keep it.` : `${remove}, or pass --backend opencode.`
     return new ConfigError({
-      reason: `--backend jcode cannot use ${conflicts.join(', ')}: ${conflicts.length === 1 ? 'it is an OpenCode-only option' : 'they are OpenCode-only options'} with no jcode equivalent. Remove ${conflicts.length === 1 ? 'it' : 'them'}, or drop --backend jcode`,
+      reason: `${subject} cannot use ${conflicts.join(', ')}: ${conflicts.length === 1 ? 'it is an OpenCode-only option' : 'they are OpenCode-only options'} with no jcode equivalent. ${advice}`,
     })
   }
   return { backend: 'jcode', source }
@@ -149,7 +155,7 @@ async function supervise(): Promise<never> {
 export function registerStartCommand(cli: Goke) {
   cli.command('', 'Start the bot. Runs onboarding on first start')
     .option('--data-dir <path>', DATA_DIR_HELP)
-    .option('--backend <name>', 'Bot backend: opencode (default) or jcode. jcode drives a native Jcode session and needs no OpenCode install; KIMAKI_BACKEND sets the same choice when the flag is absent')
+    .option('--backend <name>', 'Bot backend: jcode (default) or opencode. jcode drives a native Jcode session and needs no OpenCode install; opencode keeps the existing OpenCode path. KIMAKI_BACKEND sets the same choice when the flag is absent')
     .option('-g, --guild <guildId>', 'Server to onboard when the bot is in several')
     .option('--gateway', 'Use the shared Kimaki bot, no Discord app needed')
     .option('--gateway-callback-url <url>', 'Redirect here after the gateway install (appends ?guild_id=<id>)')
@@ -345,7 +351,10 @@ export function registerStartCommand(cli: Goke) {
         if (removed instanceof Error) logger.warn('cannot remove the autostart script', removed)
       } else if (lock.port === DEFAULT_LOCK_PORT) {
         const autostart = await writeAutostartScript({ dataDir, args: [
-          ...(backend === 'jcode' ? ['--backend', 'jcode'] : []),
+          // Always explicit: the script outlives the start that wrote it, so an
+          // opencode bot must not be restarted as the default backend after the
+          // Phase 1 default becomes jcode.
+          '--backend', backend,
           ...(options.worktrees ? ['--worktrees'] : []),
           ...(options.allowAllUsers ? ['--allow-all-users'] : []),
           ...(options.disableSkills ? ['--disable-skills', options.disableSkills] : []),

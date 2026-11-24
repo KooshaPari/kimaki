@@ -18,8 +18,8 @@ path actually stands on its own:
 
 | Check | Observed |
 | --- | --- |
-| Unknown backend is refused, not defaulted | `kimaki --backend nonexistent` prints `Unknown --backend "nonexistent". Use one of: opencode, jcode` |
-| The flag's own help states the direction | `--backend <name>` is documented as `Bot backend: opencode (default) or jcode. jcode drives a native Jcode session and needs no OpenCode install` |
+| Unknown backend is refused, not defaulted | `kimaki --backend nonexistent` prints `Unknown --backend "nonexistent". Use one of: jcode (default), opencode` |
+| The flag's own help states the direction | `--backend <name>` is documented as `Bot backend: jcode (default) or opencode. jcode drives a native Jcode session and needs no OpenCode install; opencode keeps the existing OpenCode path` |
 | A jcode-backed start does not need the binary | `kimaki --backend jcode --data-dir <temp>` prints no OpenCode version error; it proceeds into startup and its log stays empty while it waits on onboarding/gateway, whereas the opencode-backed start dies immediately at the version gate |
 | jcode already holds credentials | `jcode auth status` reports `openai available` (OAuth, account `openai-otter`, automatic refresh) and `opencode-go available`; `jcode login`, `auth status`, `auth doctor`, `auth-test` and `provider` all exist, so Phase 2.4 is a kimaki wiring task, not a capability gap |
 | Packaging: the shipped build carries the export | `npx tsc` builds clean and `node dist/cli.js export verify --help` resolves the command from `dist`, not only from `src` |
@@ -27,6 +27,13 @@ path actually stands on its own:
 One gap the checks found: step 0.1 asked for `KIMAKI_BACKEND` as well as the flag. Correction
 (2026-11-23): the env half does exist, `KIMAKI_BACKEND` is defined at `kimaki/src/cli/bot.ts:30`, so
 the earlier statement that `rg KIMAKI_BACKEND src` was empty is stale.
+
+Phase 1 default landed 2026-11-24: a start with neither `--backend` nor `KIMAKI_BACKEND` resolves to
+`jcode` (`DEFAULT_BOT_BACKEND` in `src/backend-selection.ts`), the help and refusal text name it as
+the default, and the autostart script now always pins `--backend <resolved>` so an opencode bot is
+not restarted as jcode. `--backend opencode` and `KIMAKI_BACKEND=opencode` still select OpenCode,
+legacy `thread_sessions` rows keep their per-row `backend` default of `opencode`, and any stored
+legacy thread still forces the OpenCode preflight under a jcode start.
 
 ## 0. Method and measured facts
 

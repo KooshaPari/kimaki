@@ -657,6 +657,7 @@ test('CLI help documents the supported P7 commands', async () => {
 
     Options:
       --data-dir <path>             Data directory (default: ~/.kimaki)
+      --backend <name>              Bot backend: jcode (default) or opencode. jcode drives a native Jcode session and needs no OpenCode install; opencode keeps the existing OpenCode path. KIMAKI_BACKEND sets the same choice when the flag is absent
       -g, --guild <guildId>         Server to onboard when the bot is in several
       --gateway                     Use the shared Kimaki bot, no Discord app needed
       --gateway-callback-url <url>  Redirect here after the gateway install (appends ?guild_id=<id>)

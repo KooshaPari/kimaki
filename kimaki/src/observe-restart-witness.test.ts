@@ -339,7 +339,9 @@ async function witnessSupervisedRestart(): Promise<void> {
   const lockPort = await freePort()
   supervisor = spawn(
     process.execPath,
-    ['--import', tsx, path.resolve('src/cli.ts'), '--data-dir', dataDir, '--gateway', '--machine-name', 'witness-machine'],
+    // Explicit: this witness restarts the OpenCode-backed bot, and a bare start now
+    // defaults to jcode (Phase 1 of docs/opencode-removal.md).
+    ['--import', tsx, path.resolve('src/cli.ts'), '--backend', 'opencode', '--data-dir', dataDir, '--gateway', '--machine-name', 'witness-machine'],
     {
       env: {
         ...process.env,

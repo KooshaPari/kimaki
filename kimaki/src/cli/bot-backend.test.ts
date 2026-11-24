@@ -1,15 +1,15 @@
 import { describe, expect, test } from 'vitest'
 
 import { ConfigError } from '../errors.ts'
-import { BOT_BACKEND_ENV, BOT_BACKENDS, OPENCODE_ONLY_OPTIONS, resolveBotBackend } from './bot.ts'
+import { BOT_BACKEND_CHOICES, BOT_BACKEND_ENV, OPENCODE_ONLY_OPTIONS, resolveBotBackend, shouldCheckOpencode } from './bot.ts'
 
 // `resolveBotBackend` is the pure gate the start action runs before it spawns the
 // supervisor child, binds the lock port, opens SQLite or logs into Discord. Testing
 // it proves the refusals; wiring it into the action is covered by inspection.
 
 describe('resolveBotBackend', () => {
-  test('absence of --backend yields opencode', () => {
-    expect(resolveBotBackend({ backend: undefined, argv: ['kimaki'], env: {} })).toEqual({ backend: 'opencode', source: 'default' })
+  test('absence of --backend yields jcode', () => {
+    expect(resolveBotBackend({ backend: undefined, argv: ['kimaki'], env: {} })).toEqual({ backend: 'jcode', source: 'default' })
   })
 
   test('an explicit opencode value yields opencode', () => {
@@ -22,7 +22,10 @@ describe('resolveBotBackend', () => {
     expect(result).toBeInstanceOf(Error)
     if (!(result instanceof Error)) throw new Error('expected a refusal')
     expect(result.name).toBe('ConfigError')
-    expect(result.message).toBe(`Unknown --backend "jcode2". Use one of: ${BOT_BACKENDS.join(', ')}`)
+    expect(result.message).toBe(`Unknown --backend "jcode2". Use one of: ${BOT_BACKEND_CHOICES}`)
+    // The refusal names the default so a mistyped value does not read as a hint
+    // that opencode is still what a bare start gets.
+    expect(result.message).toContain('jcode (default)')
   })
 
   test('jcode alone is accepted', () => {
@@ -35,6 +38,8 @@ describe('resolveBotBackend', () => {
     if (!(result instanceof Error)) throw new Error('expected a refusal')
     expect(result.message).toContain(`--backend jcode cannot use ${flag}`)
     expect(result.message).toContain('OpenCode-only option')
+    // The flag surface keeps its original advice, byte-identical.
+    expect(result.message).toContain('or drop --backend jcode')
   })
 
   test('jcode plus an = form of an OpenCode-only option is refused', () => {
@@ -73,8 +78,12 @@ describe('resolveBotBackend', () => {
       expect(resolveBotBackend({ backend: 'opencode', argv: ['kimaki', '--backend', 'opencode'], env: { [BOT_BACKEND_ENV]: 'jcode' } })).toEqual({ backend: 'opencode', source: 'flag' })
     })
 
-    test('a blank value counts as unset', () => {
-      expect(resolveBotBackend({ backend: undefined, argv: ['kimaki'], env: { [BOT_BACKEND_ENV]: '   ' } })).toEqual({ backend: 'opencode', source: 'default' })
+    test('a blank value counts as unset, so the default applies', () => {
+      expect(resolveBotBackend({ backend: undefined, argv: ['kimaki'], env: { [BOT_BACKEND_ENV]: '   ' } })).toEqual({ backend: 'jcode', source: 'default' })
+    })
+
+    test('selects opencode when no flag is given', () => {
+      expect(resolveBotBackend({ backend: undefined, argv: ['kimaki'], env: { [BOT_BACKEND_ENV]: 'opencode' } })).toEqual({ backend: 'opencode', source: 'env' })
     })
 
     test('an unknown value is refused by the name of the variable, not the flag', () => {
@@ -85,11 +94,31 @@ describe('resolveBotBackend', () => {
       expect(result.message).not.toContain('Unknown --backend')
     })
 
-    test('an OpenCode-only option is refused when the environment selects jcode', () => {
+    test('an OpenCode-only option is refused when the environment selects jcode, naming the variable', () => {
       const result = resolveBotBackend({ backend: undefined, argv: ['kimaki', '--voice', 'cove'], env: { [BOT_BACKEND_ENV]: 'jcode' } })
       expect(result).toBeInstanceOf(Error)
       if (!(result instanceof Error)) throw new Error('expected a refusal')
-      expect(result.message).toContain('--backend jcode cannot use --voice')
+      expect(result.message).toBe(`KIMAKI_BACKEND=jcode cannot use --voice: it is an OpenCode-only option with no jcode equivalent. Remove it, or unset KIMAKI_BACKEND to keep it.`)
     })
+  })
+
+  // A bare start resolves to jcode (Phase 1). Its refusal must not tell the operator
+  // to drop a flag they never passed.
+  test('an OpenCode-only option in a bare start names the default and offers --backend opencode', () => {
+    const result = resolveBotBackend({ backend: undefined, argv: ['kimaki', '--voice', 'cove'], env: {} })
+    expect(result).toBeInstanceOf(Error)
+    if (!(result instanceof Error)) throw new Error('expected a refusal')
+    expect(result.message).toBe(`The default backend (jcode) cannot use --voice: it is an OpenCode-only option with no jcode equivalent. Remove it, or pass --backend opencode.`)
+  })
+
+  // Phase 1.5: a stored OpenCode thread still needs OpenCode even when this start
+  // resolved to jcode by default. The rule lives in shouldCheckOpencode, so both
+  // halves are asserted together here.
+  test('a legacy thread forces the OpenCode preflight when the backend resolved to jcode by default', () => {
+    const choice = resolveBotBackend({ backend: undefined, argv: ['kimaki'], env: {} })
+    if (choice instanceof Error) throw choice
+    expect(choice).toEqual({ backend: 'jcode', source: 'default' })
+    expect(shouldCheckOpencode({ backend: choice.backend, legacyThreadCount: 0 })).toBe(false)
+    expect(shouldCheckOpencode({ backend: choice.backend, legacyThreadCount: 1 })).toBe(true)
   })
 })

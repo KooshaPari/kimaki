@@ -153,7 +153,9 @@ test('kimaki --gateway without a TTY installs, onboards and reports ready on std
   const lockPort = await freePort()
   child = spawn(
     process.execPath,
-    ['--import', pathToFileURL(require.resolve('tsx')).href, path.resolve('src/cli.ts'), '--data-dir', dataDir, '--gateway', '--machine-name', 'test-machine'],
+    // Explicit: this test drives the OpenCode twin, and a bare start now defaults
+    // to the jcode backend (Phase 1 of docs/opencode-removal.md).
+    ['--import', pathToFileURL(require.resolve('tsx')).href, path.resolve('src/cli.ts'), '--backend', 'opencode', '--data-dir', dataDir, '--gateway', '--machine-name', 'test-machine'],
     {
       env: {
         ...process.env,

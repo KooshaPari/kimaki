@@ -4,10 +4,18 @@
 
 import { ConfigError } from './errors.ts'
 
-// The two bot backends the root command can start. `opencode` is the default and
-// keeps the existing path byte-identical; `jcode` drives the native Jcode observer.
+// The two bot backends the root command can start. `jcode` is the default (Phase 1
+// of docs/opencode-removal.md) and drives the native Jcode observer; `opencode`
+// keeps the original path byte-identical and stays reachable by flag or env.
 export type BotBackend = 'opencode' | 'jcode'
-export const BOT_BACKENDS = ['opencode', 'jcode'] as const
+export const BOT_BACKENDS = ['jcode', 'opencode'] as const
+
+// A new bot with neither the flag nor KIMAKI_BACKEND resolves here. Kept in one
+// place: the CLI default and the refusal list both describe it.
+export const DEFAULT_BOT_BACKEND: BotBackend = 'jcode'
+
+// The choice list printed by a refusal, with the default named.
+export const BOT_BACKEND_CHOICES = BOT_BACKENDS.map((name) => (name === DEFAULT_BOT_BACKEND ? `${name} (default)` : name)).join(', ')
 
 export type BotBackendSource = 'flag' | 'env' | 'default'
 
