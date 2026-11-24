@@ -26,6 +26,15 @@
 // client driving the turn and waits. This seam owns an ACP connection only when
 // the caller supplies a handler; without one it starts no child and keeps the
 // historical drop. An approval is not a turn, so it is never a V2 event.
+//
+// Creation (`follow: 'create'`) is the one way in that does not start from an
+// existing record. It mints a session over ACP on a home-pinned socket, then
+// primes the record with one first turn (`createPrompt`), because the binary
+// writes no session record until a turn runs. Only after that record settles
+// does construction continue down the same path a follower takes: approvals
+// attach, one settled read, the durable cursor. The priming turn is suppressed
+// from the event stream, and a failed creation is a named error rather than a
+// fallback to following some other session.
 
 import { spawn } from 'node:child_process'
 import fs from 'node:fs'
@@ -39,7 +48,8 @@ import { createAcpClient } from './acp/client.ts'
 import type { AcpClient, AcpServerAnswerInput, AcpServerRequest, AcpServerRequestHandler, CreateAcpClient } from './acp/contracts.ts'
 import { cancelJcodeTurn, type JcodeCancelOutcome } from './jcode-bot-cancel.ts'
 import { JcodeBotBackendError, type JcodeBotRefusal } from './jcode-bot-error.ts'
-import { createJcodeBotWriter, type JcodeBotPromptInput, type JcodeBotPromptOutcome } from './jcode-bot-prompt.ts'
+import { botSocketPath, createJcodeBotWriter, type JcodeBotPromptInput, type JcodeBotPromptOutcome } from './jcode-bot-prompt.ts'
+import { readConsistentRecord } from '../ops/runtime/jcode.ts'
 import { createJcodeTurnObserver, type JcodeObservationLatency, type JcodeTurnEvent, type JcodeTurnHealth } from './jcode-observe.ts'
 
 // The named failure and the refusal record live in their own module so the write
@@ -50,6 +60,9 @@ export type { JcodeBotPromptInput, JcodeBotPromptOutcome } from './jcode-bot-pro
 
 /** How long a `--version` probe may take before the binary counts as unstartable. */
 const PROBE_TIMEOUT_MS = 20_000
+
+/** How long a created session's record may take to appear before creation fails. */
+const CREATE_PERSIST_TIMEOUT_MS = 60_000
 
 /**
  * The backend part of StartBotOptions. One bot follows one persisted session.
@@ -67,8 +80,24 @@ export type JcodeBotBackendInput = {
   binary?: string
   /** Jcode home (`$JCODE_HOME`) or the parent of its `sessions` store. */
   home?: string
-  /** Explicit native session id. Omitted: the store must hold exactly one. */
+  /** Explicit native session id. Omitted: the store must hold exactly one. Refused with `follow: 'create'`. */
   sessionId?: string
+  /**
+   * How the seam obtains its session. `existing` (the default) follows a
+   * persisted record exactly as before. `create` mints a new session over ACP
+   * and primes its record with one first turn, because jcode writes no session
+   * record until a turn runs (measured; see `createPrompt`).
+   */
+  follow?: 'existing' | 'create'
+  /**
+   * Text of the first turn a `follow: 'create'` construction runs. Required for
+   * creation: ACP `session/new` mints an id but persists no record, and this
+   * seam refuses to start a bot that follows nothing, so creation must prime
+   * the record with a real turn. This turn is never emitted as an event.
+   */
+  createPrompt?: string
+  /** Bound for a created session's record to settle. Default 60s. */
+  createTimeoutMs?: number
   /** Durable cursor directory, outside the Jcode store. One file per session. */
   cursorDir?: string
   intervalMs?: number
@@ -91,6 +120,8 @@ export type JcodeBotBackendInput = {
   createApprovalClient?: CreateAcpClient
   /** Test seam: replace the ACP client factory used for the write path. */
   createPromptClient?: CreateAcpClient
+  /** Test seam: replace the ACP client factory used by the creation path. */
+  createCreateClient?: CreateAcpClient
   /** Test seams; production uses the real filesystem, clock and child process. */
   readFile?: (file: string) => Promise<string>
   now?: () => number
@@ -226,6 +257,136 @@ const resolveSession = ({
   })
 }
 
+const createdRecordSettled = async (home: string, sessionId: string): Promise<boolean> => {
+  const file = path.join(home, 'sessions', `${sessionId}.json`)
+  const read = await readConsistentRecord<{ id: string }>({
+    file,
+    readFile: (target) => fs.promises.readFile(target, 'utf8'),
+    parse: (raw) => {
+      try {
+        const value = JSON.parse(raw) as { id?: unknown }
+        return typeof value.id === 'string' ? { id: value.id } : undefined
+      } catch {
+        return undefined
+      }
+    },
+    accept: (value) => value.id === sessionId,
+  })
+  return read.health === 'consistent'
+}
+
+/**
+ * Mint a new native session and prime its record with one first turn.
+ *
+ * Two measured facts shape this, both against the real binary:
+ * * ACP `session/new` mints an id but writes nothing under `home/sessions`; the
+ *   record appears only once a turn runs. So creation cannot perform the
+ *   existing path's first settled read without that turn, and `createPrompt`
+ *   is required rather than defaulted (a hidden model call is not a default).
+ * * The daemon's store is the one its socket belongs to. Without `--socket` the
+ *   session lands in the host's shared `~/.jcode` store, which this seam's
+ *   observer (pointed at `home`) can never see. The socket is pinned outside
+ *   `home` for the same reason the write path pins it: a socket inside the
+ *   store was measured to keep turns from reaching `home/sessions/<id>.json`.
+ */
+const createSession = async (
+  input: JcodeBotBackendInput,
+  binary: string,
+  home: string,
+): Promise<string | JcodeBotBackendError> => {
+  const cwd = (input.cwd ?? '').trim()
+  if (cwd === '') {
+    return new JcodeBotBackendError({
+      stage: 'create-cwd',
+      reason: 'follow: create needs a cwd; ACP session/new is created in a working directory',
+    })
+  }
+  if (input.sessionId !== undefined && input.sessionId.trim() !== '') {
+    return new JcodeBotBackendError({
+      stage: 'create-with-session',
+      reason: `follow: create mints its own session, but an explicit sessionId (${input.sessionId}) was supplied; pass sessionId only with follow: existing`,
+    })
+  }
+  const primer = (input.createPrompt ?? '').trim()
+  if (primer === '') {
+    return new JcodeBotBackendError({
+      stage: 'create-primer',
+      reason: `follow: create needs createPrompt: the binary mints a session id on ACP session/new but persists no record until a turn runs, and this seam refuses to start a bot that follows nothing`,
+    })
+  }
+
+  let client: AcpClient
+  try {
+    client = (input.createCreateClient ?? createAcpClient)({
+      command: binary,
+      args: [
+        'acp',
+        '--tool-profile', 'none',
+        '--socket', botSocketPath(home),
+        ...(input.provider === undefined || input.provider.trim() === '' ? [] : ['-p', input.provider]),
+        ...(input.model === undefined || input.model.trim() === '' ? [] : ['-m', input.model]),
+      ],
+      cwd,
+    })
+  } catch (cause) {
+    return new JcodeBotBackendError({
+      stage: 'create',
+      reason: `could not create the ACP connection that mints a session in ${home}`,
+      cause,
+    })
+  }
+
+  let created: string
+  try {
+    const initialized = await client.initialize()
+    if (initialized instanceof Error) {
+      return new JcodeBotBackendError({
+        stage: 'create-initialize',
+        reason: `the ACP connection to ${binary} failed its initialize while minting a session`,
+        cause: initialized,
+      })
+    }
+    const session = await client.newSession({ cwd })
+    if (session instanceof Error) {
+      return new JcodeBotBackendError({
+        stage: 'create-session',
+        reason: `ACP session/new failed for ${cwd}`,
+        cause: session,
+      })
+    }
+    if (!session.sessionId?.trim()) {
+      return new JcodeBotBackendError({ stage: 'create-session', reason: `ACP session/new returned an empty session id for ${cwd}` })
+    }
+    created = session.sessionId
+    const turn = await client.prompt({
+      sessionId: created,
+      text: primer,
+      ...(input.promptTimeoutMs === undefined ? {} : { timeoutMs: input.promptTimeoutMs }),
+    })
+    if (turn instanceof Error) {
+      return new JcodeBotBackendError({
+        stage: 'create-prompt',
+        reason: `the first turn on created session ${created} did not complete, so it has no persisted record`,
+        cause: turn,
+      })
+    }
+  } finally {
+    // The turn reaches `home/sessions/<id>.json` when the connection ends, not
+    // when `session/prompt` answers (measured on the write path as well).
+    await client.close()
+  }
+
+  const deadline = Date.now() + (input.createTimeoutMs ?? CREATE_PERSIST_TIMEOUT_MS)
+  while (Date.now() < deadline) {
+    if (await createdRecordSettled(home, created)) return created
+    await new Promise<void>((resolve) => setTimeout(resolve, 100))
+  }
+  return new JcodeBotBackendError({
+    stage: 'create-persist',
+    reason: `created session ${created} never settled a record at ${path.join(home, 'sessions', `${created}.json`)}; the daemon's store is not the one this home names`,
+  })
+}
+
 // The marker's client refuses every call. It is reachable only if a caller
 // ignores `endpoint === null`; the refusal names the seam instead of reaching a
 // real OpenCode service.
@@ -293,8 +454,22 @@ export async function createJcodeBotBackend(input: JcodeBotBackendInput): Promis
   const started = await probe(binary)
   if (started instanceof Error) return started
 
-  const sessionId = resolveSession({ home, explicit: input.sessionId })
-  if (sessionId instanceof Error) return sessionId
+  const mode = input.follow ?? 'existing'
+  if (mode !== 'existing' && mode !== 'create') {
+    return new JcodeBotBackendError({ stage: 'follow', reason: `unknown follow mode '${String(mode)}'; expected 'existing' or 'create'` })
+  }
+  // Creation mints its own session; following resolves or refuses one. The two
+  // never mix: a create that failed must not quietly adopt an existing session.
+  let sessionId: string
+  if (mode === 'create') {
+    const created = await createSession(input, binary, home)
+    if (created instanceof Error) return created
+    sessionId = created
+  } else {
+    const resolved = resolveSession({ home, explicit: input.sessionId })
+    if (resolved instanceof Error) return resolved
+    sessionId = resolved
+  }
 
   const refusals: JcodeBotRefusal[] = []
   if (input.cursorDir === undefined) {
@@ -334,6 +509,11 @@ export async function createJcodeBotBackend(input: JcodeBotBackendInput): Promis
     sessionId,
     intervalMs: input.intervalMs ?? 1_000,
     ...(cursorFile === undefined ? {} : { cursorFile }),
+    // A created session's first turn was written by this construction, so it is
+    // not news: the observer starts with existing history suppressed and the
+    // durable cursor primed, exactly so a created bot does not re-post its own
+    // priming turn.
+    ...(mode === 'create' ? { emitExisting: false } : {}),
     autoStart: false,
     ...(input.readFile === undefined ? {} : { readFile: input.readFile }),
     ...(input.now === undefined ? {} : { now: input.now }),
