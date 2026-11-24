@@ -50,7 +50,7 @@ import { cancelJcodeTurn, type JcodeCancelOutcome } from './jcode-bot-cancel.ts'
 import { JcodeBotBackendError, type JcodeBotRefusal } from './jcode-bot-error.ts'
 import { botSocketPath, createJcodeBotWriter, type JcodeBotPromptInput, type JcodeBotPromptOutcome } from './jcode-bot-prompt.ts'
 import { readConsistentRecord } from '../ops/runtime/jcode.ts'
-import { createJcodeTurnObserver, type JcodeObservationLatency, type JcodeTurnEvent, type JcodeTurnHealth } from './jcode-observe.ts'
+import { createJcodeTurnObserver, recordAssistantTexts, type JcodeObservationLatency, type JcodeTurnEvent, type JcodeTurnHealth } from './jcode-observe.ts'
 
 // The named failure and the refusal record live in their own module so the write
 // path can construct the same error; they stay exported from here unchanged.
@@ -144,6 +144,12 @@ export type JcodeBotApprovals = {
 export type JcodeBotConnection = Backend & {
   readonly kind: 'jcode'
   readonly sessionId: string
+  /**
+   * The assistant text a `follow: 'create'` primer turn produced; null when
+   * following, and null when the turn produced no text. The primer is suppressed
+   * from the event stream, so this is the only way that reply reaches a caller.
+   */
+  readonly primerReply: string | null
   readonly connected: boolean
   readonly endpoint: OpencodeEndpoint | null
   readonly ready: Promise<Error | OpencodeEndpoint>
@@ -257,22 +263,23 @@ const resolveSession = ({
   })
 }
 
-const createdRecordSettled = async (home: string, sessionId: string): Promise<boolean> => {
+// One consistency-checked read of a just-created record. `settled: true` also
+// carries the assistant text the primer turn produced (the last assistant
+// message, which for a freshly created session is the only one), or null when
+// the turn produced none: the caller relays an answer only when there is text.
+type SettledCreatedRecord = { settled: false } | { settled: true; primerReply: string | null }
+
+const createdRecord = async (home: string, sessionId: string): Promise<SettledCreatedRecord> => {
   const file = path.join(home, 'sessions', `${sessionId}.json`)
-  const read = await readConsistentRecord<{ id: string }>({
+  const read = await readConsistentRecord<{ sessionId: string; texts: { id: string; text: string }[] }>({
     file,
     readFile: (target) => fs.promises.readFile(target, 'utf8'),
-    parse: (raw) => {
-      try {
-        const value = JSON.parse(raw) as { id?: unknown }
-        return typeof value.id === 'string' ? { id: value.id } : undefined
-      } catch {
-        return undefined
-      }
-    },
-    accept: (value) => value.id === sessionId,
+    parse: (raw) => recordAssistantTexts(raw),
+    accept: (value) => value.sessionId === sessionId,
   })
-  return read.health === 'consistent'
+  if (read.health !== 'consistent') return { settled: false }
+  const last = read.value.texts.at(-1)
+  return { settled: true, primerReply: last === undefined ? null : last.text }
 }
 
 /**
@@ -288,12 +295,17 @@ const createdRecordSettled = async (home: string, sessionId: string): Promise<bo
  *   observer (pointed at `home`) can never see. The socket is pinned outside
  *   `home` for the same reason the write path pins it: a socket inside the
  *   store was measured to keep turns from reaching `home/sessions/<id>.json`.
+ *
+ * The settled read also returns the primer turn's assistant text. The turn is
+ * suppressed from the event stream, so without carrying its text out of this
+ * function it would be lost: the caller has nothing else to relay to the user
+ * who asked the question the primer is.
  */
 const createSession = async (
   input: JcodeBotBackendInput,
   binary: string,
   home: string,
-): Promise<string | JcodeBotBackendError> => {
+): Promise<{ sessionId: string; primerReply: string | null } | JcodeBotBackendError> => {
   const cwd = (input.cwd ?? '').trim()
   if (cwd === '') {
     return new JcodeBotBackendError({
@@ -378,7 +390,8 @@ const createSession = async (
 
   const deadline = Date.now() + (input.createTimeoutMs ?? CREATE_PERSIST_TIMEOUT_MS)
   while (Date.now() < deadline) {
-    if (await createdRecordSettled(home, created)) return created
+    const read = await createdRecord(home, created)
+    if (read.settled) return { sessionId: created, primerReply: read.primerReply }
     await new Promise<void>((resolve) => setTimeout(resolve, 100))
   }
   return new JcodeBotBackendError({
@@ -461,10 +474,13 @@ export async function createJcodeBotBackend(input: JcodeBotBackendInput): Promis
   // Creation mints its own session; following resolves or refuses one. The two
   // never mix: a create that failed must not quietly adopt an existing session.
   let sessionId: string
+  // Only creation has one: a followed session's history belongs to whoever ran it.
+  let primerReply: string | null = null
   if (mode === 'create') {
     const created = await createSession(input, binary, home)
     if (created instanceof Error) return created
-    sessionId = created
+    sessionId = created.sessionId
+    primerReply = created.primerReply
   } else {
     const resolved = resolveSession({ home, explicit: input.sessionId })
     if (resolved instanceof Error) return resolved
@@ -600,6 +616,7 @@ export async function createJcodeBotBackend(input: JcodeBotBackendInput): Promis
   return {
     kind: 'jcode',
     sessionId,
+    primerReply,
     get connected() {
       return observer.health().state !== 'stopped'
     },

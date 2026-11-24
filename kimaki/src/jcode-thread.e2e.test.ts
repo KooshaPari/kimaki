@@ -16,6 +16,9 @@
 //   4. A refused creation (empty primer) writes no row and creates no record.
 //   5. A coordinator channel (the default for a channel message) binds the channel id to
 //      a created session, so the default path is not left on OpenCode.
+//   6. The primer turn's assistant text is relayed to the thread as the answer to the
+//      user's first message (the fake Discord layer records it), and the created-notice
+//      is kept only for a turn that produced no text.
 //
 // What is structural here: the bot context is the fields this path reads (db, store,
 // backendKind, jcodeStore, a recording event-loop stub, analytics) rather than a live
@@ -25,11 +28,12 @@
 import fs from 'node:fs'
 import path from 'node:path'
 
+import { ChannelType } from 'discord.js'
 import { afterAll, beforeAll, describe, expect, test } from 'vitest'
 
 import type { Bot } from './bot.ts'
 import { openDb, type KimakiDb, type OpenedDb } from './db.ts'
-import { bindJcodeSession, startJcodeCoordinator } from './jcode-thread.ts'
+import { bindJcodeSession, createdSessionPost, startJcodeCoordinator, startJcodeThread } from './jcode-thread.ts'
 import { removeTempDir } from './test/cleanup.ts'
 import { tempDataDir } from './test/harness.ts'
 import { findJcodeBinary } from './test/jcode-harness.ts'
@@ -51,7 +55,7 @@ let saved: Record<string, string | undefined> = {}
 // A bot context shaped like the real one for the fields this path touches. `bind`
 // records what the writer wrote, so the in-memory routing can be asserted next to
 // the row it must agree with.
-function jcodeBot({ db, home, dataDir }: { db: KimakiDb; home: string; dataDir: string }) {
+function jcodeBot({ db, home, dataDir, discord }: { db: KimakiDb; home: string; dataDir: string; discord?: unknown }) {
   const binds: { threadId: string; sessionId: string; backend: string }[] = []
   const bot = {
     db,
@@ -59,7 +63,7 @@ function jcodeBot({ db, home, dataDir }: { db: KimakiDb; home: string; dataDir: 
     backendKind: 'jcode' as const,
     jcodeStore: { binary, home },
     autoWorktrees: false,
-    discord: { user: { id: 'bot-user' } },
+    discord: discord ?? { user: { id: 'bot-user' } },
     analytics: { track: () => {} },
     effects: { run: () => {} },
     store: { getState: () => ({ threadBackends: {} as Record<string, string> }) },
@@ -157,7 +161,7 @@ describe.skipIf(binary === null)(`jcode session creation on bind${binary === nul
     // (3) A second binding of the same thread follows the recorded session.
     const second = await bindJcodeSession(bot, { threadId: 'thread-new', channelId: 'channel-1', directory: cwd, primer: 'Reply with only: ok' })
     if (second instanceof Error) throw second
-    expect(second).toEqual({ sessionId: first.sessionId, reused: true })
+    expect(second).toEqual({ sessionId: first.sessionId, reused: true, primerReply: null })
     expect(sessionFiles(home)).toEqual([`${first.sessionId}.json`])
     expect(await db.query.thread_sessions.findMany()).toEqual(rows)
     expect(binds).toHaveLength(1)
@@ -188,8 +192,83 @@ describe.skipIf(binary === null)(`jcode session creation on bind${binary === nul
     expect(binds).toEqual([{ threadId: 'channel-coord', sessionId: started.sessionId, backend: 'jcode' }])
     expect(sessionFiles(home)).toHaveLength(before.length + 1)
     expect(fs.existsSync(path.join(home, 'sessions', `${started.sessionId}.json`))).toBe(true)
-    expect(sent.join('\n')).toContain(started.sessionId)
+    // The primer's assistant text is what the channel sees: the question is the
+    // primer, so its answer is the reply. No created-notice and no 'projected'.
+    expect(sent).toEqual(['ok'])
+    expect(sent.join('\n')).not.toContain('projected')
+
+    // A second call for the same channel finds the row and posts nothing: the
+    // creation and its answer were already relayed, so relaying again would
+    // duplicate the turn.
+    const again = await startJcodeCoordinator(bot, { channel: channel as never, route: { kind: 'steer', text: 'Reply with only: ok' }, author: { id: 'user-1', username: 'user' } })
+    if (again instanceof Error) throw again
+    expect(again.sessionId).toBe(started.sessionId)
+    expect(sent).toEqual(['ok'])
   }, 180_000)
+
+  // The fake Discord layer: the channel fetch `textChannel` performs, the thread
+  // creation `startJcodeThread` performs, and every `send` the product makes.
+  function fakeDiscord(threadId: string) {
+    const sent: string[] = []
+    const thread = {
+      id: threadId,
+      send: async (payload: { content: string }) => {
+        sent.push(payload.content)
+        return {}
+      },
+      members: { add: async () => undefined },
+    }
+    const channel = {
+      id: 'channel-thread',
+      type: ChannelType.GuildText,
+      threads: { create: async () => thread },
+    }
+    return { discord: { user: { id: 'bot-user' }, channels: { fetch: async () => channel } }, sent }
+  }
+
+  test("the primer turn's answer is relayed to the new thread; no created-notice is posted", async () => {
+    const db = opened.handle!.db
+    const { discord, sent } = fakeDiscord('thread-first')
+    const { bot } = jcodeBot({ db, home, dataDir, discord })
+    const started = await startJcodeThread(bot, {
+      channelId: 'channel-thread',
+      directory: cwd,
+      route: { kind: 'steer', text: 'Reply with only: ok' },
+      author: { id: 'user-1', username: 'user' },
+      messageId: 'message-1',
+    })
+    if (started instanceof Error) throw started
+    // The user's first message is the primer, and its assistant text reached the
+    // thread once: 'ok', not a created-notice, not the word 'projected'.
+    expect(sent).toEqual(['ok'])
+    expect(sent.join('\n')).not.toContain('projected')
+    // The relay came from the persisted record, not from anything this path invented.
+    const record = fs.readFileSync(path.join(home, 'sessions', `${started.sessionId}.json`), 'utf8')
+    const assistant = (JSON.parse(record) as { messages: { role: string; content: { type: string; text: string }[] }[] }).messages
+      .filter((message) => message.role === 'assistant')
+      .flatMap((message) => message.content.filter((part) => part.type === 'text').map((part) => part.text))
+    expect(assistant.join('\n\n').trim()).toBe('ok')
+    const row = await db.query.thread_sessions.findFirst({ where: { thread_id: 'thread-first' } })
+    expect(row).toMatchObject({ session_id: started.sessionId, backend: 'jcode' })
+  }, 180_000)
+
+  test('a created session with no assistant text posts the created-notice instead of a reply', async () => {
+    // The one post both callers use (src/jcode-thread.ts): a turn with no text
+    // keeps the notice, and the notice says what happened without 'projected'.
+    const notice = createdSessionPost({ sessionId: 'session_none', primerReply: null })
+    expect(notice.silent).toBe(true)
+    expect(notice.content).toContain('session_none')
+    expect(notice.content).toContain('created')
+    expect(notice.content).toContain('no text to post')
+    expect(notice.content).not.toContain('projected')
+    // Whitespace-only is no text either.
+    expect(createdSessionPost({ sessionId: 'session_none', primerReply: '   ' }).silent).toBe(true)
+    // With text the reply IS the post (a worktree line, when one exists, prefixes it).
+    expect(createdSessionPost({ sessionId: 'session_some', primerReply: 'the answer', ready: 'Worktree ready: x\n' })).toEqual({
+      content: 'Worktree ready: x\nthe answer',
+      silent: false,
+    })
+  })
 
   test('a refused creation (empty primer) writes no row and no record', async () => {
     const db = opened.handle!.db

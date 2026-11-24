@@ -18,12 +18,15 @@
 // What is deliberately not here: serving turns. The seam's create path mints and
 // primes a session, and this module stops that connection once the record settles
 // (the bot's long-lived connections are chosen at start, per thread-backend.ts).
-// Projecting a created thread's turns to Discord is the next step, not this one.
+// The primer turn's assistant reply IS relayed: creation returns it (the record is
+// read once, after the primer settles), and it is posted to the thread as the
+// answer to the user's first message. Later turns still need a long-lived
+// connection; that is the next step, not this one.
 
 import crypto from 'node:crypto'
 import path from 'node:path'
 
-import type { TextChannel } from 'discord.js'
+import type { TextChannel, ThreadChannel } from 'discord.js'
 
 import type { Author, Bot, PromptFile } from './bot.ts'
 import { routeText, textChannel } from './bot.ts'
@@ -53,6 +56,51 @@ export type JcodeSessionBound = {
   sessionId: string
   /** True when the row already named a session and nothing was created. */
   reused: boolean
+  /**
+   * The created session's primer reply, relayed to the thread by the callers
+   * below. Null when following (nothing was created to reply) and null when the
+   * primer turn produced no assistant text.
+   */
+  primerReply: string | null
+}
+
+// Discord refuses a message over its ceiling rather than splitting it, so a reply
+// that long is posted in order as consecutive messages.
+const DISCORD_TEXT_LIMIT = 2_000
+
+/**
+ * Post text to a thread or channel, splitting only at Discord's ceiling. One
+ * call per part, in order: the relay is the primer's single answer, not a turn
+ * loop. A failed send is returned, never swallowed.
+ */
+async function postText(target: ThreadChannel | TextChannel, text: string, silent: boolean): Promise<Error | void> {
+  const body = text.trim()
+  if (body === '') return
+  let rest = body
+  do {
+    const head = rest.slice(0, DISCORD_TEXT_LIMIT)
+    rest = rest.slice(head.length)
+    const posted = await target
+      .send({ content: head, allowedMentions: { parse: [] }, ...(silent ? { flags: SILENT_MESSAGE_FLAGS } : {}) })
+      .catch((cause) => new DiscordError({ operation: 'post jcode reply', cause }))
+    if (posted instanceof Error) return posted
+  } while (rest !== '')
+}
+
+/**
+ * What a created session posts, in one place so the two callers cannot disagree.
+ *
+ * The primer turn IS the user's first message, so its assistant reply is the
+ * answer the thread was waiting for: when there is text, that text is the post.
+ * The created-notice survives only for a turn that genuinely produced no text,
+ * and it says what happened without implying a reply was lost somewhere.
+ */
+export function createdSessionPost(input: { sessionId: string; primerReply: string | null; ready?: string; scope?: string }): { content: string; silent: boolean } {
+  const reply = input.primerReply === null ? '' : input.primerReply.trim()
+  const prefix = input.ready ?? ''
+  return reply === ''
+    ? { content: `${prefix}jcode session \`${input.sessionId}\` created${input.scope ?? ''}, but its first turn returned no text to post.`, silent: true }
+    : { content: `${prefix}${reply}`, silent: false }
 }
 
 /**
@@ -76,7 +124,7 @@ export async function bindJcodeSession(bot: Bot, { threadId, channelId, director
   if (existing instanceof Error) return existing
   if (existing && existing.session_id.trim() !== '') {
     logger.log(`thread ${threadId} already names session ${existing.session_id}; following it instead of creating`)
-    return { sessionId: existing.session_id, reused: true }
+    return { sessionId: existing.session_id, reused: true, primerReply: null }
   }
 
   const created = await createJcodeBotBackend({
@@ -96,7 +144,7 @@ export async function bindJcodeSession(bot: Bot, { threadId, channelId, director
   try {
     const bound = await bindThread(bot, { threadId, sessionId: created.sessionId, channelId, directory, isNew: true })
     if (bound instanceof Error) return bound
-    return { sessionId: created.sessionId, reused: false }
+    return { sessionId: created.sessionId, reused: false, primerReply: created.primerReply }
   } finally {
     // Creation only: the bot has no per-thread connection registry yet, so an
     // observer left running would poll a record nobody reads.
@@ -183,16 +231,11 @@ export async function startJcodeThread(bot: Bot, input: NewJcodeThreadInput): Pr
     const shown = names ? `${text}\nFiles: ${names}` : text
     bot.effects.run(thread.id, [{ type: 'send', text: formatEcho({ username: author.username, text: shown }), echo: true }])
   }
-  // Honest about what this step is: the session exists and its primer turn ran,
-  // but the seam projects turns to Discord only through a long-lived connection
-  // chosen at bot start, so this thread has no reply to show yet.
-  const posted = await thread
-    .send({
-      content: `${ready}jcode session \`${bound.sessionId}\` created. Replies from a jcode session are not projected to Discord yet; this thread keeps that session for when they are.`,
-      allowedMentions: { parse: [] },
-      flags: SILENT_MESSAGE_FLAGS,
-    })
-    .catch((cause) => new DiscordError({ operation: 'post jcode session', cause }))
+  // The primer's reply is the answer this thread was waiting for (one persisted
+  // record, read once after the turn settled). The created-notice survives only
+  // for a turn that genuinely produced no text to relay.
+  const post = createdSessionPost({ sessionId: bound.sessionId, primerReply: bound.primerReply, ready })
+  const posted = await postText(thread, post.content, post.silent)
   if (posted instanceof Error) return posted
   logger.log(`thread ${thread.id} bound to created jcode session ${bound.sessionId}`)
   return { threadId: thread.id, sessionId: bound.sessionId }
@@ -223,13 +266,14 @@ export async function startJcodeCoordinator(bot: Bot, { channel, route, author }
     return bound
   }
   bot.analytics.track('session_created', { has_worktree: false, source: 'discord' })
-  const posted = await channel
-    .send({
-      content: `jcode session \`${bound.sessionId}\` created for this channel. Replies from a jcode session are not projected to Discord yet; this channel keeps that session for when they are.`,
-      allowedMentions: { parse: [] },
-      flags: SILENT_MESSAGE_FLAGS,
-    })
-    .catch((cause) => new DiscordError({ operation: 'post jcode coordinator session', cause }))
+  if (bound.reused) {
+    // The channel already names this session: its creation and the primer's answer
+    // were posted then. Re-posting now would relay the same turn a second time.
+    logger.log(`channel ${channel.id} already bound to jcode session ${bound.sessionId}; nothing to post`)
+    return { threadId: channel.id, sessionId: bound.sessionId }
+  }
+  const post = createdSessionPost({ sessionId: bound.sessionId, primerReply: bound.primerReply, scope: ' for this channel' })
+  const posted = await postText(channel, post.content, post.silent)
   if (posted instanceof Error) return posted
   logger.log(`channel ${channel.id} bound to ${author.id}'s created jcode session ${bound.sessionId}`)
   return { threadId: channel.id, sessionId: bound.sessionId }

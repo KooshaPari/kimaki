@@ -178,6 +178,33 @@ const parseRecord = (raw: string): NativeTurnRecord | undefined => {
   return { sessionId: value['id'], messages }
 }
 
+/**
+ * The assistant texts a session record holds, in order; `undefined` when the
+ * bytes are not a record this module can read. Used by the creation path, whose
+ * primer turn is the one reply a brand-new thread must be shown: that reply is a
+ * persisted record, not a stream, so reading it is the only way to relay it.
+ */
+export function recordAssistantTexts(raw: string): { sessionId: string; texts: { id: string; text: string }[] } | undefined {
+  let value: unknown
+  try {
+    value = JSON.parse(raw)
+  } catch {
+    return undefined
+  }
+  if (!record(value) || typeof value['id'] !== 'string') return undefined
+  // A settled record with no messages has no reply, but it IS the session: the
+  // creation path must not spin to its timeout over an empty history.
+  if (!Array.isArray(value['messages'])) return { sessionId: value['id'], texts: [] }
+  const parsed = parseRecord(raw)
+  if (parsed === undefined) return undefined
+  return {
+    sessionId: parsed.sessionId,
+    texts: parsed.messages
+      .filter((message) => message.role === 'assistant' && message.text.trim() !== '')
+      .map((message) => ({ id: message.id, text: message.text })),
+  }
+}
+
 const inside = (parent: string, child: string): boolean => {
   const relative = nodePath.relative(nodePath.resolve(parent), nodePath.resolve(child))
   return relative === '' || (!relative.startsWith('..') && !nodePath.isAbsolute(relative))
