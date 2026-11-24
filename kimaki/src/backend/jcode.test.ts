@@ -25,7 +25,7 @@ function fakeAcp(overrides: Partial<AcpClient> = {}) {
   const client: AcpClient = {
     async initialize() {
       calls.initialize++
-      return { protocolVersion: 1, agentName: 'jcode', agentCapabilities: {}, supportsRetraction: false }
+      return { protocolVersion: 1, agentName: 'jcode', agentVersion: '1.1.0', agentCapabilities: {}, supportsRetraction: false }
     },
     async newSession(input) {
       calls.newSession.push(input)
@@ -211,12 +211,15 @@ describe('createJcodeBackend', () => {
 })
 
 // AC39: a profile, not the peer's self-reported label, resolves the executable
-// and the environment. KCode claims `jcode`, so a kcode profile must refuse a
-// `jcode` handshake instead of falling back to the stock binary.
+// and the environment. KCode claims `jcode` and so does stock jcode, so the only
+// discriminator is the -k<digits> fork segment in the version: a kcode profile
+// must refuse a stock `jcode` version instead of falling back to the stock binary.
 describe('Runtime profile identity', () => {
+  // A real kcode handshake: it names itself `jcode`, exactly like upstream, and
+  // only its version marks the KooshaPari fork (BASEVERSION-k<semver>).
   const kcodeHandshake: Partial<AcpClient> = {
     async initialize() {
-      return { protocolVersion: 1, agentName: 'kcode', agentCapabilities: {}, supportsRetraction: false }
+      return { protocolVersion: 1, agentName: 'jcode', agentVersion: '0.93.0-k0.1.0', agentCapabilities: {}, supportsRetraction: false }
     },
   }
 
@@ -228,7 +231,7 @@ describe('Runtime profile identity', () => {
       executable: 'kcode',
       envPrefix: 'KCODE_',
       storeDir: '~/.kcode',
-      expectedIdentity: 'kcode',
+      expectedIdentity: { name: 'jcode', fork: true },
     })
     expect(await backend.start()).toEqual({ sessionId: 'sess-1', model: null })
 
@@ -273,14 +276,15 @@ describe('Runtime profile identity', () => {
     expect(fake.calls.options).toEqual([])
   })
 
-  it('refuses a kcode handshake that self-reports jcode (ACP handshake)', async () => {
-    // The default fake reports `jcode`, which is exactly KCode's claim.
+  it('refuses a stock jcode handshake for a kcode profile (ACP handshake)', async () => {
+    // The default fake reports `jcode` 1.1.0, which is stock upstream, not kcode.
     const { backend, fake } = backendWith({}, { profile: 'kcode' })
     const refused = await backend.start()
     expect(refused).toBeInstanceOf(Error)
     const message = (refused as Error).message
-    expect(message).toContain("Runtime profile kcode expects identity 'kcode'")
-    expect(message).toContain("the ACP handshake reported 'jcode'")
+    expect(message).toContain("Runtime profile kcode expects identity 'jcode' with a -k<digits> fork segment")
+    expect(message).toContain("the ACP handshake reported identity 'jcode' version '1.1.0'")
+    expect(message).toContain('does not carry a -k<digits> fork segment')
     // The label never selects the binary and never creates a session.
     expect(fake.calls.newSession).toEqual([])
     expect(fake.calls.options[0]!.command).toBe('kcode')
@@ -289,15 +293,76 @@ describe('Runtime profile identity', () => {
   it('refuses a handshake that reports no identity at all', async () => {
     const silent: Partial<AcpClient> = {
       async initialize() {
-        return { protocolVersion: 1, agentName: null, agentCapabilities: {}, supportsRetraction: false }
+        return { protocolVersion: 1, agentName: null, agentVersion: null, agentCapabilities: {}, supportsRetraction: false }
       },
     }
     const { backend, fake } = backendWith(silent, { profile: 'kcode' })
     const refused = await backend.start()
     expect(refused).toBeInstanceOf(Error)
-    expect((refused as Error).message).toContain("expects the peer to report identity 'kcode'")
-    expect((refused as Error).message).toContain('reported none')
+    expect((refused as Error).message).toContain("Runtime profile kcode expects identity 'jcode' with a -k<digits> fork segment")
+    expect((refused as Error).message).toContain('the ACP handshake reported no identity')
     expect(fake.calls.newSession).toEqual([])
+  })
+
+  // The fork segment is the whole discriminator, so each side is pinned on a
+  // real measured pair: stock jcode 1.1.0 and kcode 0.93.0-k0.1.0.
+  const handshake = (name: string | null, version: string | null): Partial<AcpClient> => ({
+    async initialize() {
+      return { protocolVersion: 1, agentName: name, agentVersion: version, agentCapabilities: {}, supportsRetraction: false }
+    },
+  })
+
+  it('accepts stock jcode 1.1.0 for the jcode profile', async () => {
+    const { backend, fake } = backendWith(handshake('jcode', '1.1.0'))
+    expect(await backend.start()).toEqual({ sessionId: 'sess-1', model: null })
+    expect(fake.calls.newSession).toEqual([{ cwd: 'C:/work/project' }])
+  })
+
+  it('rejects stock jcode 1.1.0 for the kcode profile', async () => {
+    const { backend } = backendWith(handshake('jcode', '1.1.0'), { profile: 'kcode' })
+    const refused = await backend.start()
+    expect(refused).toBeInstanceOf(Error)
+    expect((refused as Error).message).toContain("version '1.1.0'")
+    expect((refused as Error).message).toContain('refusing to route a kcode session')
+  })
+
+  it('accepts kcode 0.93.0-k0.1.0 for the kcode profile', async () => {
+    const { backend, fake } = backendWith(handshake('jcode', '0.93.0-k0.1.0'), { profile: 'kcode' })
+    expect(await backend.start()).toEqual({ sessionId: 'sess-1', model: null })
+    expect(fake.calls.newSession).toEqual([{ cwd: 'C:/work/project' }])
+  })
+
+  it('rejects kcode 0.93.0-k0.1.0 for the jcode profile', async () => {
+    const { backend } = backendWith(handshake('jcode', '0.93.0-k0.1.0'))
+    const refused = await backend.start()
+    expect(refused).toBeInstanceOf(Error)
+    expect((refused as Error).message).toContain("Runtime profile jcode expects identity 'jcode' without a -k<digits> fork segment")
+    expect((refused as Error).message).toContain("version '0.93.0-k0.1.0'")
+    expect((refused as Error).message).toContain('refusing to route a jcode session')
+  })
+
+  it('refuses a peer that names itself kcode for either profile', async () => {
+    // Neither profile expects the literal name 'kcode': the fork reuses 'jcode'
+    // and is identified by its version, so a 'kcode' name is not a match.
+    const asJcode = backendWith(handshake('kcode', '1.1.0'))
+    const jcodeRefused = await asJcode.backend.start()
+    expect(jcodeRefused).toBeInstanceOf(Error)
+    expect((jcodeRefused as Error).message).toContain("the ACP handshake reported identity 'kcode' version '1.1.0'")
+
+    const asKcode = backendWith(handshake('kcode', '0.93.0-k0.1.0'), { profile: 'kcode' })
+    const kcodeRefused = await asKcode.backend.start()
+    expect(kcodeRefused).toBeInstanceOf(Error)
+    expect((kcodeRefused as Error).message).toContain("Runtime profile kcode expects identity 'jcode'")
+    expect((kcodeRefused as Error).message).toContain("reported identity 'kcode'")
+  })
+
+  it('never satisfies the kcode profile with a version that has no fork segment', async () => {
+    for (const version of ['1.1.0', '0.93.0', '0.99.1+linux', '0.93.0-rc.1']) {
+      const { backend } = backendWith(handshake('jcode', version), { profile: 'kcode' })
+      const refused = await backend.start()
+      expect(refused, `version ${version} must not satisfy kcode`).toBeInstanceOf(Error)
+      expect((refused as Error).message).toContain('does not carry a -k<digits> fork segment')
+    }
   })
 
   it('refuses an unknown profile id and records no provenance', async () => {

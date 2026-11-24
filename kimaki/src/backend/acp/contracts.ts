@@ -8,6 +8,8 @@
 // These types are the seam between the transport (client.ts), the backend
 // adapter (../jcode.ts), the CLI and the acceptance test. Keep them stable.
 
+import type { RuntimeIdentityExpectation } from '../../ops/contracts.ts'
+
 /** One decoded JSON-RPC frame from the agent. */
 export type AcpFrame = {
   jsonrpc: '2.0'
@@ -39,10 +41,12 @@ export type AcpClientOptions = {
   /**
    * Identity the peer must report in the initialize handshake. A runtime fork can
    * claim another runtime's name, so a caller that resolved a profile states what
-   * it expects and a mismatch refuses instead of routing the session.
+   * it expects and a mismatch refuses instead of routing the session. The
+   * expectation carries a fork requirement, because ACP's name alone is shared by
+   * stock jcode and its kcode fork; see `ops/identity.ts`.
    */
-  expectedIdentity?: string
-  /** Profile id used in a refusal message; defaults to `expectedIdentity`. */
+  expectedIdentity?: RuntimeIdentityExpectation
+  /** Profile id used in a refusal message; defaults to a generic label. */
   identityLabel?: string
   /**
    * Holds agent-initiated approval requests (`session/request_permission`)
@@ -89,6 +93,12 @@ export type AcpServerAnswerInput = {
 export type AcpInitializeResult = {
   protocolVersion: number
   agentName: string | null
+  /**
+   * The peer's `agentInfo.version` exactly as it arrived, or null when it sent
+   * none. This is the only fork discriminator ACP exposes: a kcode build carries
+   * a -k<semver> segment and stock upstream does not.
+   */
+  agentVersion: string | null
   /**
    * The peer's `agentCapabilities` object exactly as it arrived in the
    * handshake, unmodified. Empty when the peer declared none. Callers inspect

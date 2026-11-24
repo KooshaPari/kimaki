@@ -12,6 +12,7 @@
 import childProcess from 'node:child_process'
 import readline from 'node:readline'
 import { ConfigError } from '../../errors.ts'
+import { identityRefusal } from '../../ops/identity.ts'
 import { createApprovalChannel } from './approvals.ts'
 import type { AcpClient, AcpClientOptions, AcpFrame, AcpInitializeResult, AcpLoadResult, AcpPromptResult, CreateAcpClient } from './contracts.ts'
 
@@ -305,21 +306,25 @@ export const createAcpClient: CreateAcpClient = (options: AcpClientOptions): Acp
       const agentName = typeof result.agentName === 'string'
         ? result.agentName
         : typeof info?.name === 'string' ? info.name : null
+      // ACP declares no fork marker of its own, so the version is the only field
+      // that separates stock jcode from its kcode fork. Surfaced raw, like the
+      // name, so the identity check can read it and a caller can audit it.
+      const agentVersion = typeof info?.version === 'string' && info.version.trim() ? info.version : null
       // Surfaced raw and unmodified so a caller can audit what the peer really
       // declared instead of trusting our summary line.
       const agentCapabilities = record(result.agentCapabilities) ?? {}
       // A fork can reuse another runtime's ACP surface and still misreport who it
       // is, so the profile's expectation is checked here, once, for every caller.
-      if (options.expectedIdentity !== undefined && agentName !== options.expectedIdentity) {
-        const label = options.identityLabel ?? options.expectedIdentity
-        return new ConfigError({
-          reason: agentName === null
-            ? `Runtime profile ${label} expects the peer to report identity '${options.expectedIdentity}', but the ACP handshake reported none`
-            : `Runtime profile ${label} expects identity '${options.expectedIdentity}', but the ACP handshake reported '${agentName}'; refusing to route a ${label} session`,
-        })
+      if (options.expectedIdentity !== undefined) {
+        const refusal = identityRefusal(
+          options.expectedIdentity,
+          { name: agentName, version: agentVersion },
+          options.identityLabel ?? 'the resolved profile',
+        )
+        if (refusal !== null) return new ConfigError({ reason: refusal })
       }
       retractionSurface = declaresRetraction(agentCapabilities)
-      return { protocolVersion, agentName, agentCapabilities, supportsRetraction: retractionSurface }
+      return { protocolVersion, agentName, agentVersion, agentCapabilities, supportsRetraction: retractionSurface }
     },
 
     async newSession(input: { cwd: string }): Promise<{ sessionId: string } | Error> {

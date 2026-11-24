@@ -6,6 +6,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { afterEach, expect, test } from 'vitest'
 import { ConfigError } from '../../errors.ts'
+import type { RuntimeIdentityExpectation } from '../../ops/contracts.ts'
 import { createAcpClient } from './client.ts'
 import type { AcpClient } from './contracts.ts'
 
@@ -28,6 +29,9 @@ const rl = readline.createInterface({ input: process.stdin })
 const capabilities = process.argv[3]
   ? JSON.parse(process.argv[3])
   : { loadSession: true, sessionCapabilities: { close: {}, resume: {} } }
+// The measured jcode 0.99.1 version, unless a test passes an override. The
+// version is what separates stock jcode from a kcode fork build.
+const version = process.argv[4] || '0.99.1'
 
 rl.on('line', (line) => {
   const message = JSON.parse(line)
@@ -37,7 +41,7 @@ rl.on('line', (line) => {
       id: message.id,
       result: {
         protocolVersion: 1,
-        agentInfo: { name: 'jcode', title: 'Jcode', version: '0.99.1' },
+        agentInfo: { name: process.argv[5] || 'jcode', title: 'Jcode', version },
         agentCapabilities: capabilities,
         authMethods: [],
       },
@@ -180,16 +184,24 @@ const ok = <T>(value: T | Error): T => {
 
 const startAgent = async (options: {
   timeoutMs?: number
-  expectedIdentity?: string
+  expectedIdentity?: RuntimeIdentityExpectation
   identityLabel?: string
   capabilities?: Record<string, unknown>
+  /** Version the fake reports in `agentInfo`; defaults to stock 0.99.1. */
+  agentVersion?: string
+  /** Name the fake reports in `agentInfo`; defaults to 'jcode'. */
+  agentName?: string
 } = {}): Promise<AcpClient> => {
   dir ??= await fs.mkdtemp(path.join(os.tmpdir(), 'kimaki-acp-'))
   const script = path.join(dir, `agent-${Math.random().toString(36).slice(2)}.cjs`)
   const pidFile = path.join(dir, `${path.basename(script)}.pid`)
   await fs.writeFile(script, AGENT_SOURCE)
+  // Positional: caps at argv[3], version at argv[4], name at argv[5]. An empty
+  // string keeps a placeholder so later positions stay aligned.
   const args = [script, pidFile]
-  if (options.capabilities) args.push(JSON.stringify(options.capabilities))
+  args.push(options.capabilities ? JSON.stringify(options.capabilities) : '')
+  args.push(options.agentVersion ?? '')
+  args.push(options.agentName ?? '')
   const client = createAcpClient({
     command: process.execPath,
     args,
@@ -475,21 +487,46 @@ test('close terminates the child and is idempotent', async () => {
   expect(afterClose).toBeInstanceOf(ConfigError)
 })
 
-// A runtime fork reuses this ACP surface and can claim another runtime's name, so
-// a caller that resolved a profile states the identity it expects. The label is
-// evidence to check, never authority to route.
-test('a handshake that reports the expected identity is accepted', async () => {
-  const client = await startAgent({ expectedIdentity: 'jcode' })
+// A runtime fork reuses this ACP surface and claims the upstream name, so a
+// caller that resolved a profile states the name and the fork marker it expects.
+// The label is evidence to check, never authority to route.
+const STOCK: RuntimeIdentityExpectation = { name: 'jcode', fork: false }
+const FORK: RuntimeIdentityExpectation = { name: 'jcode', fork: true }
+
+test('a handshake that matches the expectation is accepted and surfaces its version', async () => {
+  const client = await startAgent({ expectedIdentity: STOCK })
   const initialized = ok(await client.initialize())
   expect(initialized.agentName).toBe('jcode')
+  expect(initialized.agentVersion).toBe('0.99.1')
 })
 
-test('a handshake that reports another identity is refused and names both sides', async () => {
-  const client = await startAgent({ expectedIdentity: 'kcode', identityLabel: 'kcode' })
+test('a stock version is refused for a fork expectation and names both sides', async () => {
+  const client = await startAgent({ expectedIdentity: FORK, identityLabel: 'kcode' })
   const initialized = await client.initialize()
   expect(initialized).toBeInstanceOf(ConfigError)
   const message = (initialized as Error).message
-  expect(message).toContain("expects identity 'kcode'")
-  expect(message).toContain("reported 'jcode'")
+  expect(message).toContain("expects identity 'jcode' with a -k<digits> fork segment")
+  expect(message).toContain("reported identity 'jcode' version '0.99.1'")
+  expect(message).toContain('refusing to route a kcode session')
+})
+
+test('a fork version is accepted for a fork expectation and refused for a stock one', async () => {
+  const accepted = await startAgent({ expectedIdentity: FORK, identityLabel: 'kcode', agentVersion: '0.93.0-k0.1.0' })
+  const initialized = ok(await accepted.initialize())
+  expect(initialized.agentVersion).toBe('0.93.0-k0.1.0')
+
+  const refused = await startAgent({ expectedIdentity: STOCK, agentVersion: '0.93.0-k0.1.0' })
+  const rejected = await refused.initialize()
+  expect(rejected).toBeInstanceOf(ConfigError)
+  expect((rejected as Error).message).toContain('carries a -k<digits> fork segment')
+})
+
+test('a handshake that reports another name is refused and names both sides', async () => {
+  const client = await startAgent({ expectedIdentity: FORK, identityLabel: 'kcode', agentName: 'kcode', agentVersion: '0.93.0-k0.1.0' })
+  const initialized = await client.initialize()
+  expect(initialized).toBeInstanceOf(ConfigError)
+  const message = (initialized as Error).message
+  expect(message).toContain("expects identity 'jcode'")
+  expect(message).toContain("reported identity 'kcode' version '0.93.0-k0.1.0'")
   expect(message).toContain('refusing to route a kcode session')
 })

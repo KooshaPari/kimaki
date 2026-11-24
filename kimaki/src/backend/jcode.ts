@@ -9,6 +9,7 @@
 import { ConfigError } from '../errors.ts'
 import type { RuntimeProfile } from '../ops/contracts.ts'
 import { RUNTIME_PROFILE_IDS, RUNTIME_PROFILES, STOCK_JCODE_PROFILE } from '../ops/contracts.ts'
+import { identityRefusal } from '../ops/identity.ts'
 import { createAcpClient } from './acp/client.ts'
 import type { AcpClient, AcpClientOptions, CreateAcpClient, CreateJcodeBackend, JcodeBackend } from './acp/contracts.ts'
 
@@ -143,21 +144,17 @@ export const createJcodeBackend = (input: JcodeBackendInput): JcodeBackendWithPr
       const initialized = await attempt(() => acp.initialize(), 'Jcode ACP initialize failed')
       if (initialized instanceof Error) return initialized
       // The peer's self-report is evidence, not authority. KCode claims `jcode`,
-      // so a kcode profile must observe `kcode` or refuse. The label never
-      // selects the executable and never falls back to the stock binary.
+      // so the profile's expectation carries a fork requirement and a kcode
+      // profile must observe a -k<digits> version segment or refuse. The label
+      // never selects the executable and never falls back to the stock binary.
       const resolved = profile
       if (!resolved) return new ConfigError({ reason: 'A runtime profile is required' })
-      const observed = initialized.agentName
-      if (observed === null) {
-        return new ConfigError({
-          reason: `Runtime profile ${resolved.id} expects the peer to report identity '${resolved.expectedIdentity}', but the ACP handshake reported none`,
-        })
-      }
-      if (observed !== resolved.expectedIdentity) {
-        return new ConfigError({
-          reason: `Runtime profile ${resolved.id} expects identity '${resolved.expectedIdentity}', but the ACP handshake reported '${observed}'; refusing to route a ${resolved.id} session`,
-        })
-      }
+      const refusal = identityRefusal(
+        resolved.expectedIdentity,
+        { name: initialized.agentName, version: initialized.agentVersion },
+        resolved.id,
+      )
+      if (refusal !== null) return new ConfigError({ reason: refusal })
       const session = await attempt(() => acp.newSession({ cwd: input.cwd }), 'Jcode ACP session/new failed')
       if (session instanceof Error) return session
       if (!session.sessionId?.trim()) return new ConfigError({ reason: 'Jcode returned an empty ACP session ID' })

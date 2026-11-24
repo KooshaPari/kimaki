@@ -203,7 +203,7 @@ describe('Runtime profile identity', () => {
       executable: 'kcode',
       envPrefix: 'KCODE_',
       storeDir: '~/.kcode',
-      expectedIdentity: 'kcode',
+      expectedIdentity: { name: 'jcode', fork: true },
     })
 
     const page = await observer.discover()
@@ -478,4 +478,3 @@ describe('Jcode concurrent write consistency', () => {
     expect(await fingerprint(dir)).toEqual(settledBytes)
   })
 })
-

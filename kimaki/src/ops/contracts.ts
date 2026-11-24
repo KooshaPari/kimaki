@@ -7,6 +7,19 @@ export type RuntimeProfileId = 'jcode' | 'kcode'
 
 export type RuntimeEnvPrefix = 'JCODE_' | 'KCODE_'
 
+// What a profile expects the peer to declare in the ACP initialize handshake.
+// ACP reports only a name and a version, and a fork reuses the upstream name, so
+// the name alone cannot separate stock jcode from kcode. The fork marker in the
+// version is the only discriminator: this repo's convention is
+// BASEVERSION-k<semver> (for example 0.93.0-k0.1.0), which upstream never emits.
+export type RuntimeIdentityExpectation = {
+  // Name the peer must report (both jcode and kcode report 'jcode').
+  readonly name: string
+  // true: the version must carry a -k<digits> fork segment (a kcode build).
+  // false: the version must not carry one (stock upstream jcode).
+  readonly fork: boolean
+}
+
 export type RuntimeProfile = {
   readonly id: RuntimeProfileId
   // Executable that speaks this profile's ACP surface.
@@ -16,7 +29,7 @@ export type RuntimeProfile = {
   // Directory holding sessions/session_*.json, in home-relative display form.
   readonly storeDir: string
   // Identity the peer must report in the ACP initialize handshake.
-  readonly expectedIdentity: string
+  readonly expectedIdentity: RuntimeIdentityExpectation
 }
 
 export const STOCK_JCODE_PROFILE: RuntimeProfile = Object.freeze({
@@ -24,7 +37,7 @@ export const STOCK_JCODE_PROFILE: RuntimeProfile = Object.freeze({
   executable: 'jcode',
   envPrefix: 'JCODE_',
   storeDir: '~/.jcode',
-  expectedIdentity: 'jcode',
+  expectedIdentity: Object.freeze({ name: 'jcode', fork: false }),
 })
 
 export const KCODE_PROFILE: RuntimeProfile = Object.freeze({
@@ -32,7 +45,7 @@ export const KCODE_PROFILE: RuntimeProfile = Object.freeze({
   executable: 'kcode',
   envPrefix: 'KCODE_',
   storeDir: '~/.kcode',
-  expectedIdentity: 'kcode',
+  expectedIdentity: Object.freeze({ name: 'jcode', fork: true }),
 })
 
 export const RUNTIME_PROFILES: Readonly<Record<RuntimeProfileId, RuntimeProfile>> = Object.freeze({
