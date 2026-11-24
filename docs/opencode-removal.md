@@ -24,9 +24,9 @@ path actually stands on its own:
 | jcode already holds credentials | `jcode auth status` reports `openai available` (OAuth, account `openai-otter`, automatic refresh) and `opencode-go available`; `jcode login`, `auth status`, `auth doctor`, `auth-test` and `provider` all exist, so Phase 2.4 is a kimaki wiring task, not a capability gap |
 | Packaging: the shipped build carries the export | `npx tsc` builds clean and `node dist/cli.js export verify --help` resolves the command from `dist`, not only from `src` |
 
-One gap the checks found: step 0.1 asked for `KIMAKI_BACKEND` as well as the flag, and the env half
-does not exist (`rg KIMAKI_BACKEND src` is empty), so a bot started without `--backend` still routes to
-OpenCode. That is a real hole in Phase 0, not a documentation detail.
+One gap the checks found: step 0.1 asked for `KIMAKI_BACKEND` as well as the flag. Correction
+(2026-11-23): the env half does exist, `KIMAKI_BACKEND` is defined at `kimaki/src/cli/bot.ts:30`, so
+the earlier statement that `rg KIMAKI_BACKEND src` was empty is stale.
 
 ## 0. Method and measured facts
 
