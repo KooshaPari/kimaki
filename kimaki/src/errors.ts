@@ -54,6 +54,14 @@ export class ConfigError extends errore.createTaggedError({
   message: '$reason',
 }) {}
 
+// A hub ack refusal keeps the hub's HTTP status, because the status is the only
+// part that is load-bearing to a caller: 404 means the hub no longer has this
+// client attached, every other refusal is a different problem.
+export class HubAckRefusedError extends errore.createTaggedError({
+  name: 'HubAckRefusedError',
+  message: 'Hub refused the ack with status $status',
+}) {}
+
 export class LockPortError extends errore.createTaggedError({
   name: 'LockPortError',
   message: 'Could not take lock port $port: $reason',

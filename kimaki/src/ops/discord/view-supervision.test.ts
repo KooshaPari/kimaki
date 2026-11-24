@@ -4,14 +4,16 @@
 // what proves the supervisor supplies enough for the view to post a turn.
 
 import fs from 'node:fs'
+import http from 'node:http'
+import type { ServerResponse } from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 import { afterAll, afterEach, beforeAll, expect, test } from 'vitest'
 import { ChannelType, REST } from 'discord.js'
 import { DigitalDiscord } from 'discord-digital-twin/src'
-import { createSessionHub, type HubBackend } from '../../backend/hub.ts'
+import { createSessionHub, type HubBackend, type HubEvent } from '../../backend/hub.ts'
 import { startHubServer } from '../../backend/hub-server.ts'
-import { ConfigError } from '../../errors.js'
+import { ConfigError, HubAckRefusedError } from '../../errors.js'
 import { defaultViewClientId } from './view.ts'
 import {
   parseViewBinding,
@@ -182,6 +184,151 @@ test('binding files round-trip and unsafe values are refused', async () => {
   expect(await removeViewBinding({ dataDir })).toBe(true)
   expect(fs.existsSync(path.join(dataDir, VIEW_BINDING_FILE))).toBe(false)
   expect(await readViewBinding({ dataDir })).toBeNull()
+})
+
+// --- the ack/stop ordering ------------------------------------------------
+
+// A hub double is the only way to hold the ack open exactly where the race is:
+// the turn posts and the cursor file lands, the ack request is received and
+// left unanswered, and the test decides whether the stop or the ack comes
+// first. The real hub answers too fast to order those two events reliably.
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((settle) => { resolve = settle })
+  return { promise, resolve }
+}
+
+async function startFakeHub(events: HubEvent[]) {
+  const ackSeen = deferred<{ client: string; seq: number }>()
+  const ackRelease = deferred<number>()
+  const streamClosed = deferred<void>()
+  const streams = new Set<ServerResponse>()
+  const server = http.createServer((request, response) => {
+    const url = new URL(request.url ?? '/', 'http://127.0.0.1')
+    if (request.method === 'GET' && url.pathname === '/state') {
+      response.writeHead(200, { 'content-type': 'application/json' })
+      response.end(JSON.stringify({
+        sessionId: 'race-session', model: null, busy: false, seq: events.length,
+        subscribers: streams.size, clients: [], durable: false,
+      }))
+      return
+    }
+    if (request.method === 'GET' && url.pathname === '/events') {
+      response.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' })
+      streams.add(response)
+      response.write(`event: ready\ndata: ${JSON.stringify({ client: url.searchParams.get('client'), cursor: Number(url.searchParams.get('cursor') ?? 0), clipped: false, source: 'none' })}\n\n`)
+      for (const event of events) response.write(`event: message\ndata: ${JSON.stringify(event)}\n\n`)
+      const cleanup = () => { streams.delete(response); streamClosed.resolve() }
+      request.on('close', cleanup)
+      response.on('close', cleanup)
+      return
+    }
+    if (request.method === 'POST' && url.pathname === '/ack') {
+      const chunks: Buffer[] = []
+      request.on('data', (chunk) => chunks.push(chunk as Buffer))
+      request.on('end', () => {
+        const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as { client: string; seq: number }
+        ackSeen.resolve(body)
+        void ackRelease.promise.then((status) => {
+          response.writeHead(status, { 'content-type': 'application/json' })
+          response.end(JSON.stringify({ error: status === 404 ? `Client ${body.client} is not attached` : 'Hub refused the ack' }))
+        })
+      })
+      return
+    }
+    response.writeHead(404, { 'content-type': 'application/json' })
+    response.end(JSON.stringify({ error: 'not found' }))
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()))
+  const address = server.address()
+  const port = typeof address === 'object' && address !== null ? address.port : 0
+  return {
+    url: `http://127.0.0.1:${port}`,
+    ackSeen: ackSeen.promise,
+    releaseAck: (status: number) => ackRelease.resolve(status),
+    streamClosed: streamClosed.promise,
+    close: async () => {
+      for (const stream of streams) stream.end()
+      streams.clear()
+      await new Promise<void>((resolve) => { server.close(() => resolve()); server.closeAllConnections?.() })
+    },
+  }
+}
+
+function fakeRest() {
+  const posted: string[] = []
+  const rest = {
+    async get() { return { id: binding.channelId, guild_id: binding.tenantId, type: ChannelType.GuildText } },
+    async post(_route: unknown, options: { body: { content: string } }) {
+      posted.push(options.body.content)
+      return { id: `message-${posted.length}` }
+    },
+  } as unknown as REST
+  return { rest, posted }
+}
+
+const turnEvents: HubEvent[] = [
+  { seq: 1, type: 'prompt.started', characters: 5 },
+  { seq: 2, type: 'prompt.chunk', text: 'answer' },
+  { seq: 3, type: 'prompt.finished', stopReason: 'end_turn', characters: 6 },
+]
+
+// The ordering this proves: the cursor lands and the ack is in flight, then
+// stop() detaches the client by closing the stream, and only then is the ack
+// answered with the hub's 404 "not attached". The view must read that as the
+// shutdown it was asked for, so the supervisor ends stopped with no failure.
+test('a stop that closes the stream before the ack is answered ends stopped, not failed', async () => {
+  const hub = await startFakeHub(turnEvents)
+  const dataDir = tmpDataDir()
+  await writeViewBinding({ dataDir, binding: { ...binding, baseUrl: hub.url } })
+  const { rest: viewRest, posted } = fakeRest()
+  const reported: Error[] = []
+  const supervisor = await startViewSupervision({ dataDir, rest: viewRest, report: (error) => reported.push(error) })
+  try {
+    // The ack request only arrives after the turn is posted and the cursor is
+    // persisted, so waiting for it also proves the file the flaky test waits on
+    // is on disk before the stop.
+    await hub.ackSeen
+    expect(posted).toEqual(['answer'])
+    expect(fs.existsSync(viewStatePath({ dataDir, channelId: binding.channelId }))).toBe(true)
+    const stopping = supervisor.stop()
+    // stop() aborts the view, which closes the SSE stream; the hub detaches the
+    // client only then. Answering the held ack afterwards is the exact 404 the
+    // real hub produces when a stop wins the race.
+    await hub.streamClosed
+    hub.releaseAck(404)
+    await stopping
+  } finally {
+    await hub.close()
+  }
+  expect(supervisor.state()).toBe('stopped')
+  expect(await supervisor.result).toBeUndefined()
+  expect(supervisor.error()).toBeUndefined()
+  expect(reported).toHaveLength(0)
+})
+
+// The other side of the same branch: an ack refused while nothing is aborting
+// is a real failure. Swallowing it would leave a view posting turns it can
+// never acknowledge.
+test('an ack refused while the view is still running still fails the view', async () => {
+  const hub = await startFakeHub(turnEvents)
+  const dataDir = tmpDataDir()
+  await writeViewBinding({ dataDir, binding: { ...binding, baseUrl: hub.url } })
+  const { rest: viewRest } = fakeRest()
+  const reported: Error[] = []
+  const supervisor = await startViewSupervision({ dataDir, rest: viewRest, report: (error) => reported.push(error) })
+  try {
+    await hub.ackSeen
+    expect(supervisor.state()).toBe('running')
+    hub.releaseAck(409)
+    expect(await supervisor.result).toBeInstanceOf(HubAckRefusedError)
+  } finally {
+    await supervisor.stop()
+    await hub.close()
+  }
+  expect(supervisor.state()).toBe('failed')
+  expect(supervisor.error()).toBeInstanceOf(HubAckRefusedError)
+  expect(reported).toHaveLength(1)
 })
 
 // --- the real view against a local hub and the Discord digital twin ---------

@@ -3,7 +3,7 @@
 // Any front end that can reach the loopback URL can attach, read the ordered
 // stream from its own cursor, prompt, cancel and acknowledge progress. This is
 // the piece that makes `ops jcode serve` usable by more than an ad-hoc script.
-import { ConfigError } from '../errors.js'
+import { ConfigError, HubAckRefusedError } from '../errors.js'
 import type { HubEvent, HubSnapshot } from './hub.ts'
 
 export type HubClientOptions = {
@@ -69,6 +69,14 @@ export async function cancelHub(options: HubClientOptions): Promise<true | Error
   return true
 }
 
+// Why a status and not a message match: the ack path uses 404 only for "this
+// client is not attached" (every other hub refusal is 409), so the status is an
+// exact discriminator that cannot be confused with a malformed or unreachable
+// hub. Callers that must tell a detach from a real failure use this.
+export function isAckNotAttached(error: unknown): boolean {
+  return error instanceof HubAckRefusedError && Number(error.status) === 404
+}
+
 export async function ackHub(options: HubClientOptions & { clientId: string; seq: number }): Promise<{ acked: number } | Error> {
   const response = await call(options, '/ack', {
     method: 'POST',
@@ -76,7 +84,7 @@ export async function ackHub(options: HubClientOptions & { clientId: string; seq
     body: JSON.stringify({ client: options.clientId, seq: options.seq }),
   })
   if (response instanceof Error) return response
-  if (!response.ok) return new ConfigError({ reason: `Hub refused the ack with status ${response.status}` })
+  if (!response.ok) return new HubAckRefusedError({ status: response.status })
   try {
     return (await response.json()) as { acked: number }
   } catch (cause) {

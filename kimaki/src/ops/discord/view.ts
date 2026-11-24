@@ -3,7 +3,7 @@ import path from 'node:path'
 import { ChannelType, REST, Routes } from 'discord.js'
 import type { KimakiDb } from '../../db.ts'
 import { ConfigError, DiscordError } from '../../errors.js'
-import { ackHub, openHubStream, readHubState } from '../../backend/hub-client.ts'
+import { ackHub, isAckNotAttached, openHubStream, readHubState } from '../../backend/hub-client.ts'
 import type { HubEvent } from '../../backend/hub.ts'
 import { claimSurface, type CutoverLedger, type SurfaceClaim, type SurfaceConsumer } from '../cutover.ts'
 
@@ -185,6 +185,15 @@ export async function openDiscordView({ rest, tenantId, channelId, clientId, cur
     }
     const acked = await ackHub({ baseUrl, clientId, seq: event.seq })
     if (acked instanceof Error) {
+      // Closing the stream is what detaches this client in the hub, so an ack
+      // still in flight when a stop begins arrives for a client that is already
+      // gone and is refused with 404 "not attached". That is the shutdown we
+      // asked for, not a failed view. The same is true of any ack error raised
+      // after the view was aborted, because nothing after the stop matters.
+      // Every other refusal (409, an unreachable hub, a malformed body) keeps
+      // the failure path intact, so a view that is still meant to run stops
+      // loudly instead of posting turns it can never acknowledge.
+      if (isAckNotAttached(acked) || controller.signal.aborted) return
       failure = acked
       controller.abort()
       return
