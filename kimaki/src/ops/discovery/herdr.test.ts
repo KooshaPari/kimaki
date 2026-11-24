@@ -117,7 +117,10 @@ describe('discoverHerdr', () => {
   })
 
   test('real isolated child exceeding output budget returns a sanitized error', async () => {
-    vi.stubEnv('NODE_OPTIONS', '--import=data:text/javascript,process.stdout.write(%22SECRET%22.repeat(300000));setInterval(()=>{},1000)')
+    // The import never settles, so the child stays alive and keeps writing: an
+    // import that settled would let the main module fail on `node agent list`
+    // (module not found) and exit before its buffered output crossed maxBuffer.
+    vi.stubEnv('NODE_OPTIONS', '--import=data:text/javascript,process.stdout.write(%22SECRET%22.repeat(300000));await%20new%20Promise(()=>setInterval(()=>{},1000))')
     const result = await discoverHerdr({ binary: process.execPath, timeoutMs: 3000 })
     expect(result).toBeInstanceOf(ConfigError)
     expect(result).toMatchObject({ reason: expect.stringContaining('output limit') })

@@ -26,9 +26,12 @@ function fakeBinary(script: string): { binary: string; env: NodeJS.ProcessEnv; m
 }
 
 test('parses two provider lines from a fake jcode auth status', async () => {
+  // printf with a single-quoted literal emits the TABs verbatim on bash, dash
+  // and zsh. An unquoted `echo a<TAB>b` lets the shell treat the TAB as a word
+  // separator and echo rejoins the words with spaces.
   const { binary, env } = fakeBinary([
-    'echo openai\tavailable\tOAuth\tOAuth account\treadiness: authenticated\tnot validated',
-    'echo opencode-go\tnot_configured\tAPI key\tnot configured\treadiness: not configured\tnot validated',
+    `printf '%s\\n' 'openai\tavailable\tOAuth\tOAuth account\treadiness: authenticated\tnot validated'`,
+    `printf '%s\\n' 'opencode-go\tnot_configured\tAPI key\tnot configured\treadiness: not configured\tnot validated'`,
   ].join('\n'))
   const status = await jcodeAuthStatus({ binary, timeoutMs: 3000, env, shell: process.platform === 'win32' })
   expect(status).toEqual([

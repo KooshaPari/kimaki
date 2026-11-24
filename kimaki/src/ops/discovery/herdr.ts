@@ -84,7 +84,13 @@ export async function discoverHerdr({
       if (error) {
         // Node's execFile errors include captured output and command text. Never
         // propagate them, including as cause. Retain only a fixed error category.
-        const category = error.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER'
+        // Node 22 and 26 report the exceeded buffer as code
+        // ERR_CHILD_PROCESS_STDIO_MAXBUFFER; other Node versions report a plain
+        // `Command failed` error whose message still names maxBuffer. Match on
+        // either shape so the output-limit branch does not depend on one
+        // version-specific string.
+        const exceededOutput = error.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' || /maxBuffer/i.test(error.message)
+        const category = exceededOutput
           ? 'output limit exceeded'
           : error.killed ? 'timed out' : 'command failed'
         resolve(new ConfigError({

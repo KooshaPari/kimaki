@@ -111,9 +111,21 @@ function startMockProvider(): Promise<{ url: string; close: () => Promise<void> 
 
 // One real one-shot turn. The provider is the loopback mock above, so jcode
 // persists the user prompt and the assistant answer itself.
+//
+// Model choice: jcode validates `-m` against its own model catalog, and an id
+// it does not know is rejected before any request is sent, even when the
+// endpoint's /models list advertises it:
+//   Error: Failed to select model 'mock-model': Unsupported OpenAI model
+//   'mock-model'. Use /model to choose from the models available to your account.
+// So the default here is "no -m": the binary uses its own configured default,
+// which is accepted on a cold install (measured: 5/5 runs, exit 0).
+// JCODE_MODEL overrides it for a host whose default is unusable.
+const modelOverride = process.env['JCODE_MODEL']?.trim() ?? ''
+const modelArgs = modelOverride === '' ? [] : ['-m', modelOverride]
+
 function runJcodeTurn({ binary, home, cwd, url }: { binary: string; home: string; cwd: string; url: string }): Promise<{ code: number | null; stderr: string }> {
   return new Promise((resolve) => {
-    const child = spawn(binary, ['run', '-p', 'openai-api', '-m', 'mock-model', '--tool-profile', 'none', '--no-update', '--quiet', '-C', cwd, 'Reply with only: ok'], {
+    const child = spawn(binary, ['run', '-p', 'openai-api', ...modelArgs, '--tool-profile', 'none', '--no-update', '--quiet', '-C', cwd, 'Reply with only: ok'], {
       env: {
         ...process.env,
         JCODE_HOME: home,
@@ -191,6 +203,9 @@ describe.skipIf(jcodeBinary === null)(`jcode turn observation over a real store$
     cursorFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-observe-cursor-')), 'cursor.json')
     mock = await startMockProvider()
     run = await runJcodeTurn({ binary, home, cwd, url: mock.url })
+    // Fail here with the binary's own message: a rejected model used to surface
+    // only as a 60 s hook timeout, which named neither the cause nor the output.
+    if (run.code !== 0) throw new Error(`jcode run exited ${String(run.code)}: ${run.stderr}`)
     settled = await settleStore(path.join(home, 'sessions'))
     const created = createJcodeTurnObserver({
       store: home,
@@ -222,9 +237,18 @@ describe.skipIf(jcodeBinary === null)(`jcode turn observation over a real store$
     const before = fs.readFileSync(settled.file, 'utf8')
     await active().poll()
     const types = events.map((event) => event.type)
-    expect(types).toEqual(['session.text.ended', 'session.execution.succeeded'])
-    const text = events[0]
-    if (text?.type !== 'session.text.ended') throw new Error('first event must be session.text.ended')
+    // The observer's contract (src/backend/jcode-observe.ts:22-28): a start
+    // marker from the last user message, the assistant text, a step carrying
+    // token usage, then the execution result. jcode v1.1.0 writes all four into
+    // one record, so the first poll emits exactly this sequence.
+    expect(types).toEqual([
+      'session.execution.started',
+      'session.text.ended',
+      'session.step.ended',
+      'session.execution.succeeded',
+    ])
+    const text = events[1]
+    if (text?.type !== 'session.text.ended') throw new Error('second event must be session.text.ended')
     expect(text.data.sessionID).toBe(settled.sessionId)
     expect(text.data.text).toBe('ok')
     expect(text.data.assistantMessageID).toMatch(/^message_\d+_\d+$/)

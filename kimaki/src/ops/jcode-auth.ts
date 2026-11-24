@@ -59,7 +59,17 @@ export async function jcodeAuthStatus({ binary = 'jcode', timeoutMs = 10_000, en
   return new Promise((resolve) => {
     let child: ReturnType<typeof spawn>
     try {
-      child = spawn(binary, ['auth', 'status'], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, env, shell })
+      child = spawn(binary, ['auth', 'status'], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+        env,
+        shell,
+        // POSIX: run the child in its own process group so a wrapper script's
+        // descendants (a shell that forked `sleep`, for example) can be killed
+        // with it. A surviving grandchild holds the stdio pipes open, so `close`
+        // would never fire and the timeout could not resolve.
+        detached: process.platform !== 'win32',
+      })
     } catch (cause) {
       resolve(new Error(`Cannot start ${binary} auth status: ${cause instanceof Error ? cause.message : String(cause)}`))
       return
@@ -104,8 +114,16 @@ export async function jcodeAuthStatus({ binary = 'jcode', timeoutMs = 10_000, en
       if (process.platform === 'win32') {
         const killer = spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true })
         killer.once('error', () => child.kill('SIGKILL'))
-      } else {
+      } else if (child.pid === undefined) {
         child.kill('SIGKILL')
+      } else {
+        // Negative pid signals the whole process group, so descendants spawned
+        // by a shell wrapper die with it.
+        try {
+          process.kill(-child.pid, 'SIGKILL')
+        } catch {
+          child.kill('SIGKILL')
+        }
       }
     }, timeoutMs)
   })
