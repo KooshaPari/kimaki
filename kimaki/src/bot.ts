@@ -53,7 +53,16 @@ export type Bot = {
   discord: Client
   db: KimakiDb
   store: BotStore
+  // The connection for the configured backend. Kept as the field every existing
+  // `oc(bot, ...)` call reaches, so a jcode start still reports its unsupported
+  // operations by name instead of silently reaching OpenCode.
   opencode: BotBackend
+  // Every connection this bot started, indexed by the backend a thread's row names
+  // (thread-backend.ts). A backend with no connection is null, never another one.
+  backends: { readonly opencode: OpencodeConnection | null; readonly jcode: JcodeBotConnection | null }
+  // The configured backend (`--backend` / KIMAKI_BACKEND). Recorded on every row
+  // bindThread writes, so a new thread is served by the default.
+  backendKind: 'opencode' | 'jcode'
   eventLoop: EventLoop
   effects: EffectsRunner
   analytics: Analytics

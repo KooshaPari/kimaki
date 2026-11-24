@@ -444,7 +444,7 @@ describe.skipIf(jcodeBinary === null)(`jcode bot seam over a real session${skipR
     })
     try {
       // Bound before the seam's first read, exactly as a bot that owns a thread.
-      await loop.bind({ threadId, sessionId: settled.sessionId, channelId, directory: cwd, isNew: false })
+      await loop.bind({ threadId, sessionId: settled.sessionId, channelId, directory: cwd, isNew: false, backend: 'jcode' })
       const events: V2Event[] = []
       const connection = await createJcodeBotBackend({
         binary,

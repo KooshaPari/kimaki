@@ -14,7 +14,7 @@ import { oc, type Bot, type WarmupTimers } from './bot.ts'
 import type { PromptSection } from './builtin-skills.ts'
 import { openDb } from './db.ts'
 import { createEffectsRunner } from './effects.ts'
-import { DiscordError } from './errors.ts'
+import { DbError, DiscordError } from './errors.ts'
 import { createEventLoop, type RunEnded } from './event-loop.ts'
 import { registerIngress } from './ingress.ts'
 import { runLockRoute } from './lock-routes.ts'
@@ -29,6 +29,7 @@ import { channelDefaults, createPluginWait, refreshCliContext } from './sessions
 import { createInteractionRegistry, registerSlashCommands } from './slash-commands.ts'
 import { createSleepLock } from './sleeps.ts'
 import { createBotStore } from './store.ts'
+import { backendPlan } from './thread-backend.ts'
 import type { TranscriptionBaseUrls } from './voice.ts'
 import { createVoiceCalls, type RealtimeBaseUrls } from './voice-call.ts'
 
@@ -125,6 +126,60 @@ export function startBotConnection(
   })
 }
 
+export type BotConnections = {
+  // `--backend` / KIMAKI_BACKEND: the backend new threads bind to.
+  backendKind: 'opencode' | 'jcode'
+  // The connection `bot.opencode` exposes: the configured backend.
+  primary: OpencodeConnection | JcodeBotConnection
+  // Every connection this bot started (thread-backend.ts resolves per thread).
+  backends: { readonly opencode: OpencodeConnection | null; readonly jcode: JcodeBotConnection | null }
+}
+
+/**
+ * Every connection one bot start needs.
+ *
+ * A jcode start still starts OpenCode when a persisted row says `opencode`, which is the
+ * plan step 1.1 mitigation: legacy threads keep resolving through the OpenCode connection.
+ * A start with no such row starts no OpenCode connection at all. The primary connection is
+ * always the configured backend, so a jcode bot reports OpenCode-only operations by name
+ * rather than silently falling back.
+ */
+export async function startBotConnections(
+  {
+    backend,
+    callbacks,
+    cursorDir,
+    intervalMs,
+    legacyOpencodeThreads,
+  }: {
+    backend?: JcodeBotBackendSpec
+    callbacks: BotConnectionCallbacks
+    cursorDir?: string
+    intervalMs?: number
+    // Rows whose backend is opencode (backendPlan().needsOpencode).
+    legacyOpencodeThreads: boolean
+  },
+  opencodeFactory: (options: BotConnectionCallbacks) => OpencodeConnection = watchOpencode,
+  jcodeFactory: (input: JcodeBotBackendInput) => Promise<Error | JcodeBotConnection> = createJcodeBotBackend,
+): Promise<Error | BotConnections> {
+  const backendKind: 'opencode' | 'jcode' = backend?.kind === 'jcode' ? 'jcode' : 'opencode'
+  const selected = startBotConnection(
+    {
+      ...(backend === undefined ? {} : { backend }),
+      callbacks,
+      ...(cursorDir === undefined ? {} : { cursorDir }),
+      ...(intervalMs === undefined ? {} : { intervalMs }),
+    },
+    opencodeFactory,
+    jcodeFactory,
+  )
+  const primary = selected instanceof Promise ? await selected : selected
+  if (primary instanceof Error) return primary
+  if (backendKind === 'opencode') return { backendKind, primary: primary as OpencodeConnection, backends: { opencode: primary as OpencodeConnection, jcode: null } }
+  if (!legacyOpencodeThreads) return { backendKind, primary: primary as JcodeBotConnection, backends: { opencode: null, jcode: primary as JcodeBotConnection } }
+  return { backendKind, primary: primary as JcodeBotConnection, backends: { opencode: opencodeFactory(callbacks), jcode: primary as JcodeBotConnection } }
+}
+
 export type BotHandle = Bot & {
   lock: LockServer
   // Tests drive scheduling with a manual clock and call this themselves.
@@ -213,9 +268,15 @@ export async function startBot(options: StartBotOptions): Promise<Error | BotHan
   // Before the service is used, so a service started by ensure() loads it at once.
   const plugin = await installPluginShim({ configDir: options.opencodeConfigDir })
   if (plugin instanceof Error) return plugin
-  const selected = startBotConnection({
-    backend: options.backend,
+  // Which persisted rows need which connection (step 1.1's mitigation). Read after
+  // eventLoop.load(), which reads the same table, so a failure is already reported.
+  const persistedRows = await db.query.thread_sessions.findMany({ columns: { thread_id: true, backend: true } }).catch((cause) => new DbError({ operation: 'read thread_sessions', cause }))
+  if (persistedRows instanceof Error) return persistedRows
+  const plan = backendPlan(persistedRows)
+  const connections = await startBotConnections({
+    ...(options.backend === undefined ? {} : { backend: options.backend }),
     cursorDir: path.join(options.dataDir, 'jcode-observe'),
+    legacyOpencodeThreads: plan.needsOpencode,
     callbacks: {
       serviceFile: options.opencodeServiceFile,
       ensure: options.ensureOpencode,
@@ -224,11 +285,12 @@ export async function startBot(options: StartBotOptions): Promise<Error | BotHan
       onDisconnect: eventLoop.onDisconnect,
     },
   })
-  // The default path returns synchronously; only the Jcode path awaits construction.
-  const candidate = selected instanceof Promise ? await selected : selected
-  if (candidate instanceof Error) return candidate
-  const opencode: Bot['opencode'] = candidate
+  if (connections instanceof Error) return connections
+  // `bot.opencode` is the configured backend; `bot.backends` is what thread rows resolve to.
+  const opencode: Bot['opencode'] = connections.primary
+  const { backends } = connections
   cleanup.defer(() => opencode.stop())
+  if (backends.opencode && backends.opencode !== opencode) cleanup.defer(() => backends.opencode?.stop())
   const shim = await installShim({ dataDir: options.dataDir, argv: options.kimakiArgv })
   if (shim instanceof Error) return shim
   // The features that non-interaction code reaches through bot.features.
@@ -239,6 +301,8 @@ export async function startBot(options: StartBotOptions): Promise<Error | BotHan
     db,
     store,
     opencode,
+    backends,
+    backendKind: connections.backendKind,
     eventLoop,
     effects,
     analytics: options.analytics,

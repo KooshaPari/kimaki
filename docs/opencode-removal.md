@@ -35,6 +35,12 @@ not restarted as jcode. `--backend opencode` and `KIMAKI_BACKEND=opencode` still
 legacy `thread_sessions` rows keep their per-row `backend` default of `opencode`, and any stored
 legacy thread still forces the OpenCode preflight under a jcode start.
 
+Step 1.1 landed 2026-11-24: the `backend` column is now read at runtime. `src/thread-backend.ts`
+is the only resolver (per-thread, named errors, no fallback), `dispatch` resolves a thread before
+its first OpenCode call, a jcode start also starts the OpenCode connection when any row says
+`opencode` and starts none when no row does, and new bindings record the configured backend.
+See "Step 1.1 landed" under Phase 1 for proof, the two open product decisions, and the test.
+
 ## 0. Method and measured facts
 
 Counts were produced with ripgrep, case-insensitive, from `kimaki/`:
@@ -470,6 +476,43 @@ sees them, because their `backend` column says `opencode` and the export ran.
 **Cannot be done without losing user data:** deleting or rewriting OpenCode session rows,
 or dropping `thread_sessions.session_id` values. Abandoning TUI-only sessions is a
 conscious loss and must be recorded in the release notes, not silently performed.
+
+#### Step 1.1 landed 2026-11-24: per-thread resolution, measured
+
+The routing decision is no longer one-per-bot. Before this change `main.ts` picked a single
+connection (`startBotConnection`), every `oc(bot, ...)` call read `bot.opencode.endpoint`, and a
+jcode backend's endpoint is null: an OpenCode thread under a jcode bot was simply **not served**
+(`OpenCodeUnavailableError: OpenCode service not reachable (not connected)`).
+
+Now:
+
+| Piece | Where |
+| --- | --- |
+| The only resolution rule (row -> backend, named errors, no fallback) | new `src/thread-backend.ts` |
+| Rows loaded into memory, kept as recorded so an unknown value stays visible | `src/eventLoop.ts` `load()`, `store.ts` `threadBackends` |
+| A new binding records the configured backend | `src/sessions.ts` `bindThread` (insert + `eventLoop.bind`) |
+| Both connections started when a row needs OpenCode, none when no row does | `src/main.ts` `startBotConnections` + `backendPlan` |
+| Every thread input resolved before its first OpenCode call | `src/prompt.ts` `dispatch` |
+| The OpenCode preflight counts only OpenCode rows | `src/cli/bot.ts` |
+
+Proof: `src/backend-default.e2e.test.ts` (5 cases). Real: the row/plan/resolution path, a real
+SQLite database (legacy row -> `opencode`, bound row -> `jcode`), and the jcode half against the
+real binary. Structural, and named as such in the test titles: the OpenCode twin cannot start on
+this host, so a recording fake connection proves which connection a legacy thread routes to and
+that its call arrives there, not that a real OpenCode service answers.
+
+Two items this step does **not** settle, left to a product decision rather than guessed:
+
+1. **`watchOpencode` "read-only" vs serving.** The step says keep it "alive read-only"; the same
+   connection also carries `session.prompt`. This implementation serves legacy threads (the
+   exit criteria require them to be reachable) and isolates the choice in one exported constant,
+   `LEGACY_OPENCODE_THREADS_ACCEPT_INPUT` in `src/thread-backend.ts`. Flipping it to `false`
+   makes legacy threads view-only with every input refused by name.
+2. **"New threads use jcode" is not yet achievable end to end.** `createJcodeBotBackend` follows
+   exactly one persisted session and creates none (`resolveSession` refuses an empty store), and
+   `startSession` creates sessions through `oc(...)`, i.e. OpenCode. A jcode bot can therefore
+   follow a seeded session but cannot create the "new thread" this step assumes. That gap is a
+   jcode session-creation path (Phase 0.3 scope), not a routing rule.
 
 ### Phase 2 — Remove the OpenCode runtime from shipped paths
 

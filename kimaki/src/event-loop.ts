@@ -25,6 +25,7 @@ import type { ConnectContext, OpenCodeClient, V2Event } from './opencode-server.
 import { formatDuration, type EventRecorder } from './session-events.ts'
 import { queuedItems } from './queue.ts'
 import type { BotStore, State } from './store.ts'
+import { threadBackendsOf, type ThreadBackendKind } from './thread-backend.ts'
 import {
   conversationTyping,
   emptyView,
@@ -381,6 +382,7 @@ export function createEventLoop({
       if (coordinator instanceof Error) return coordinator
       store.setState({
         roots: Object.fromEntries(rows.map((row) => [row.thread_id, row.session_id])),
+        threadBackends: threadBackendsOf(rows),
         sessionThreads: Object.fromEntries(rows.map((row) => [row.session_id, row.thread_id])),
         verbosity: Object.fromEntries(verbosity.map((row) => [row.channel_id, verbosityFromV1(row.verbosity)])),
         coordinator: Object.fromEntries(coordinator.map((row) => [row.channel_id, row.enabled === 1])),
@@ -396,6 +398,7 @@ export function createEventLoop({
       channelId,
       directory,
       isNew,
+      backend,
       first = [],
     }: {
       threadId: string
@@ -404,6 +407,9 @@ export function createEventLoop({
       directory: string
       // New sessions show a banner on their first step; forks do not.
       isNew: boolean
+      // The backend the thread_sessions row records: bindThread wrote the same
+      // value in the same call, so memory and SQLite cannot disagree.
+      backend: ThreadBackendKind
       first?: readonly KimakiEvent[]
     }): Promise<void> {
       ignoredSessions.delete(sessionId)
@@ -412,6 +418,7 @@ export function createEventLoop({
         threadId,
         update: (current) => ({
           roots: { ...current.roots, [threadId]: sessionId },
+          threadBackends: { ...current.threadBackends, [threadId]: backend },
           sessionThreads: { ...current.sessionThreads, [sessionId]: threadId },
           threads: { ...current.threads, [threadId]: emptyView({ sessionId, channelId, directory, isNew, coordinator: threadId === channelId }) },
         }),

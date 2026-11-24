@@ -368,7 +368,7 @@ describe.skipIf(jcodeBinary === null)(`a real jcode turn sends turn_started and 
     })
     let connection: Awaited<ReturnType<typeof createJcodeBotBackend>> | undefined
     try {
-      await loop.bind({ threadId: 'thread-analytics', sessionId: primed.sessionId, channelId: 'channel-analytics', directory: cwd, isNew: false })
+      await loop.bind({ threadId: 'thread-analytics', sessionId: primed.sessionId, channelId: 'channel-analytics', directory: cwd, isNew: false, backend: 'jcode' })
       // Construction polls once. The primed turn is emitted there, folded by
       // this loop: it is what makes the first funnel pair arrive.
       const promptEnv = {

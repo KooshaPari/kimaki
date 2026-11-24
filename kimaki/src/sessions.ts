@@ -113,12 +113,15 @@ async function bindThread(
   bot: Bot,
   { threadId, sessionId, channelId, directory, isNew }: { threadId: string; sessionId: string; channelId: string; directory: string; isNew: boolean },
 ): Promise<DbError | void> {
+  // The backend is recorded with the binding (docs/opencode-removal.md step 1.1):
+  // without it the column's default would make every new thread an OpenCode
+  // thread, and a jcode bot would refuse to serve the thread it just created.
   const inserted = await bot.db
     .insert(schema.thread_sessions)
-    .values({ thread_id: threadId, session_id: sessionId, source: 'kimaki' })
+    .values({ thread_id: threadId, session_id: sessionId, source: 'kimaki', backend: bot.backendKind })
     .catch((cause) => new DbError({ operation: 'insert thread_sessions', cause }))
   if (inserted instanceof Error) return inserted
-  await bot.eventLoop.bind({ threadId, sessionId, channelId, directory, isNew })
+  await bot.eventLoop.bind({ threadId, sessionId, channelId, directory, isNew, backend: bot.backendKind })
   logger.log(`session ${sessionId} bound to thread ${threadId}`)
 }
 
@@ -697,7 +700,7 @@ async function adoptSession(
           .delete(schema.thread_sessions)
           .where(orm.eq(schema.thread_sessions.session_id, sessionId))
           .returning({ threadId: schema.thread_sessions.thread_id }),
-        bot.db.insert(schema.thread_sessions).values({ thread_id: thread.id, session_id: sessionId, source: 'kimaki' }),
+        bot.db.insert(schema.thread_sessions).values({ thread_id: thread.id, session_id: sessionId, source: 'kimaki', backend: bot.backendKind }),
       ])
       .catch((cause) => new DbError({ operation: 'move thread_sessions', cause }))
     if (moved instanceof Error) return moved
@@ -715,6 +718,7 @@ async function adoptSession(
     sessionId,
     channelId: channel.id,
     directory: session.location.directory,
+    backend: bot.backendKind,
     isNew: false,
     first: [{ type: 'kimaki.replay', messages: prepared.history, note }],
   })

@@ -43,6 +43,7 @@ import { discordMessageId, formatEcho } from './queue.ts'
 import { noAnswerError, parseRemoteResult, remoteEnvelope, promptFilePath, REMOTE_TIMEOUT_MS, type RemoteResult } from './remote-send.ts'
 import { parseTextMessage, type Route } from './routes.ts'
 import { allMessages } from './session-events.ts'
+import { withThreadBackend } from './thread-backend.ts'
 import { ensureSessionMarker, forkBtw, startSession, switchAgent, conversationProject } from './sessions.ts'
 import { cancelSleep } from './sleeps.ts'
 import type { ScheduledRun } from './system-prompt.ts'
@@ -389,7 +390,7 @@ export async function runInSession(
 
 // One entry point for thread input of every source (spec 9.4).
 export async function dispatch(
-  bot: Bot,
+  unservedBot: Bot,
   {
     conversation,
     route,
@@ -413,6 +414,12 @@ export async function dispatch(
     parentSessionId?: string
   },
 ) {
+  // The thread's row decides which backend serves it (thread-backend.ts). Resolved
+  // before the first OpenCode call, so an OpenCode thread of a jcode bot reaches the
+  // OpenCode connection instead of failing with "not connected" and reaching nothing.
+  const served = withThreadBackend(unservedBot, conversation.id)
+  if (!served.ok) return served.error
+  const bot = served.bot
   const sessionId = rootSession(bot, conversation.id)
   if (sessionId instanceof Error) return sessionId
   // New input supersedes a pending `kimaki sleep` of this session.

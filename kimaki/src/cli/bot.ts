@@ -11,6 +11,7 @@ import dedent from 'string-dedent'
 import { wrapJsonSchema, type Goke } from 'goke'
 
 import { BOT_BACKENDS, BOT_BACKEND_CHOICES, DEFAULT_BOT_BACKEND, legacyOpencodeCheckFailure, shouldCheckOpencode, type BotBackend } from '../backend-selection.ts'
+import { backendPlan } from '../thread-backend.ts'
 export { BOT_BACKENDS, BOT_BACKEND_CHOICES, DEFAULT_BOT_BACKEND, shouldCheckOpencode, type BotBackend } from '../backend-selection.ts'
 import { distCliEntry, removeAutostartScript, stableNodePath, writeAutostartScript } from '../autostart.ts'
 import { parseDisabledPromptSections, parseDisabledSkills, PROMPT_SECTIONS } from '../builtin-skills.ts'
@@ -260,7 +261,10 @@ export function registerStartCommand(cli: Goke) {
       // Before onboarding: without OpenCode the OpenCode backend cannot start, so fail
       // (or install it) before the Discord install. The jcode backend needs no OpenCode,
       // except when persisted threads still belong to OpenCode (Phase 1.5).
-      const legacyThreadCount = await opened.db.query.thread_sessions.findMany({ columns: { thread_id: true } }).then((rows) => rows.length)
+      // Only rows whose backend is opencode need the OpenCode preflight. Counting every
+      // row would make a bot whose threads are all jcode refuse to start over OpenCode.
+      const persistedRows = await opened.db.query.thread_sessions.findMany({ columns: { thread_id: true, backend: true } })
+      const legacyThreadCount = backendPlan(persistedRows).opencodeThreads
       if (shouldCheckOpencode({ backend, legacyThreadCount })) {
         const opencodeCheck = await ensureOpencode({ serviceFile: process.env['KIMAKI_OPENCODE_SERVICE_FILE'] })
         if (opencodeCheck instanceof Error) {
