@@ -11,12 +11,12 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { afterEach, describe, expect, it } from 'vitest'
+import { scratchDir } from './test/cleanup.ts'
 
 const packageDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const cliSrc = path.resolve(packageDir, 'src', 'cli.ts')
 const cliDist = path.resolve(packageDir, 'dist', 'cli.js')
-const scratchRoot = 'E:/koosh/Agents/scratch/no-opencode-start'
-fs.mkdirSync(scratchRoot, { recursive: true })
+const scratchRoot = scratchDir('no-opencode-start')
 
 const OPENCODE_NAMES = process.platform === 'win32'
   ? ['opencode', 'opencode.exe', 'opencode.cmd', 'opencode.bat', 'opencode.com']

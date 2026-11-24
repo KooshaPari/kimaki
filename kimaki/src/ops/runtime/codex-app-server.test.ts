@@ -1,15 +1,15 @@
-import { mkdtemp, writeFile, rm, mkdir } from 'node:fs/promises'
+import { mkdtemp, writeFile, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { afterEach, expect, it } from 'vitest'
 import { startCodexAppServer } from './codex-app-server.js'
 import { createCodexController } from './codex.js'
+import { scratchDir } from '../../test/cleanup.ts'
 
 const dirs: string[] = []
 afterEach(async () => { await Promise.all(dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true }))) })
 
 it('streams a completed turn over a fake newline JSON-RPC child', async () => {
-  const scratch = 'E:/koosh/Agents/scratch/codex-transport'
-  await mkdir(scratch, { recursive: true })
+  const scratch = scratchDir('codex-transport')
   const dir = await mkdtemp(join(scratch, 'kimaki-codex-fake-'))
   dirs.push(dir)
   const script = join(dir, 'app-server.js')
@@ -47,7 +47,7 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
 it('names a missing codex home instead of reporting a spawn ENOENT', async () => {
   const server = await startCodexAppServer({
     binary: process.execPath,
-    codexHome: 'E:/koosh/Agents/scratch/codex-transport/definitely-missing-home',
+    codexHome: join(scratchDir('codex-transport'), 'definitely-missing-home'),
     timeoutMs: 5_000,
   })
   expect(server).toBeInstanceOf(Error)
@@ -55,8 +55,7 @@ it('names a missing codex home instead of reporting a spawn ENOENT', async () =>
 })
 
 it('answers an unhandled server request with a JSON-RPC error and still settles the turn', async () => {
-  const scratch = 'E:/koosh/Agents/scratch/codex-transport'
-  await mkdir(scratch, { recursive: true })
+  const scratch = scratchDir('codex-transport')
   const dir = await mkdtemp(join(scratch, 'kimaki-codex-approval-'))
   dirs.push(dir)
   const script = join(dir, 'app-server.js')
@@ -108,8 +107,7 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
 })
 
 it('holds an approval request for the controller so exactly one answer reaches the runtime', async () => {
-  const scratch = 'E:/koosh/Agents/scratch/codex-transport'
-  await mkdir(scratch, { recursive: true })
+  const scratch = scratchDir('codex-transport')
   const dir = await mkdtemp(join(scratch, 'kimaki-codex-hold-'))
   dirs.push(dir)
   const script = join(dir, 'app-server.js')
@@ -167,8 +165,7 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
 })
 
 it('fails a held server request when the transport closes instead of leaving it open', async () => {
-  const scratch = 'E:/koosh/Agents/scratch/codex-transport'
-  await mkdir(scratch, { recursive: true })
+  const scratch = scratchDir('codex-transport')
   const dir = await mkdtemp(join(scratch, 'kimaki-codex-hold-close-'))
   dirs.push(dir)
   const script = join(dir, 'app-server.js')
@@ -200,8 +197,7 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
 })
 
 it('drops held server requests and reports undelivered answers when the child exits on its own', async () => {
-  const scratch = 'E:/koosh/Agents/scratch/codex-transport'
-  await mkdir(scratch, { recursive: true })
+  const scratch = scratchDir('codex-transport')
   const dir = await mkdtemp(join(scratch, 'kimaki-codex-hold-exit-'))
   dirs.push(dir)
   const script = join(dir, 'app-server.js')

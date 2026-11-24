@@ -6,11 +6,11 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { afterEach, describe, expect, it } from 'vitest'
+import { scratchDir } from './test/cleanup.ts'
 
 const cli = path.resolve(path.dirname(fileURLToPath(import.meta.url)), 'cli.ts')
 const dirs: string[] = []
-const scratch = 'E:/koosh/Agents/scratch/export-opencode'
-fs.mkdirSync(scratch, { recursive: true })
+const scratch = scratchDir('export-opencode')
 
 const tmp = () => {
   const dir = fs.mkdtempSync(path.join(scratch, 'case-'))

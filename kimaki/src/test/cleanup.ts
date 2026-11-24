@@ -5,6 +5,20 @@
 // locked until every connection to the database is gone).
 import fs from 'node:fs'
 import { rm } from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
+
+// Portable scratch root for tests that need a real directory outside the repo.
+// A committed test must not bake a drive letter in: on a POSIX host `E:/x`
+// becomes a literal directory named `E:` inside the package. KIMAKI_TEST_SCRATCH
+// wins when set; otherwise the per-OS temp directory. The subdirectory is created
+// here so callers get an existing parent, which is what the old call sites assumed.
+export function scratchDir(name: string): string {
+  const root = process.env['KIMAKI_TEST_SCRATCH'] ?? path.join(os.tmpdir(), 'kimaki-tests')
+  const dir = path.join(root, name)
+  fs.mkdirSync(dir, { recursive: true })
+  return dir
+}
 
 // Each round spends up to 10 retries with a 100ms linear backoff (Node's fs.rm
 // waits 100, 200, ... 1000ms between tries, so a round is ~5.5s). Two rounds with
