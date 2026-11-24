@@ -13,13 +13,13 @@
 
 import { spawn } from 'node:child_process'
 import fs from 'node:fs'
-import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { afterAll, beforeAll, describe, expect, test } from 'vitest'
 
 import { createJcodeTurnObserver, type JcodeTurnEvent, type JcodeTurnHealth, type JcodeTurnObserver } from './jcode-observe.ts'
+import { startMockProvider } from '../test/jcode-seed.ts'
 
 function findJcode(): string | null {
   const candidates = [
@@ -47,66 +47,6 @@ function removeTree(target: string): void {
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 250)
   }
   if (fs.existsSync(target)) throw new Error(`cannot remove ${target}: files are still held open`)
-}
-
-// Responses API SSE: one assistant message whose full text is "ok". This is the
-// stream shape `jcode run -p openai-api` already parses, so the persisted
-// assistant message is written by jcode, not by the test.
-function startMockProvider(): Promise<{ url: string; close: () => Promise<void> }> {
-  const server = http.createServer((request, response) => {
-    request.resume()
-    request.on('end', () => {
-      if (request.method === 'GET' && (request.url ?? '').endsWith('/models')) {
-        response.writeHead(200, { 'content-type': 'application/json' })
-        response.end(JSON.stringify({ object: 'list', data: [{ id: 'mock-model', object: 'model' }] }))
-        return
-      }
-      if (!(request.url ?? '').endsWith('/responses')) {
-        response.writeHead(404, { 'content-type': 'application/json' })
-        response.end(JSON.stringify({ error: { message: 'not found' } }))
-        return
-      }
-      response.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' })
-      const event = (type: string, payload: Record<string, unknown>) => {
-        response.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...payload })}\n\n`)
-      }
-      const message = (text: string | null, status: string) => ({
-        id: 'msg_1',
-        type: 'message',
-        role: 'assistant',
-        status,
-        content: text === null ? [] : [{ type: 'output_text', text, annotations: [] }],
-      })
-      const base = { id: 'resp_1', object: 'response', created_at: 1, model: 'mock-model' }
-      event('response.created', { response: { ...base, status: 'in_progress', output: [] } })
-      event('response.output_item.added', { output_index: 0, item: message(null, 'in_progress') })
-      event('response.content_part.added', { item_id: 'msg_1', output_index: 0, content_index: 0, part: { type: 'output_text', text: '', annotations: [] } })
-      event('response.output_text.delta', { item_id: 'msg_1', output_index: 0, content_index: 0, delta: 'ok' })
-      event('response.output_text.done', { item_id: 'msg_1', output_index: 0, content_index: 0, text: 'ok' })
-      const done = message('ok', 'completed')
-      event('response.content_part.done', { item_id: 'msg_1', output_index: 0, content_index: 0, part: done.content[0] })
-      event('response.output_item.done', { output_index: 0, item: done })
-      event('response.completed', {
-        response: {
-          ...base,
-          status: 'completed',
-          output: [done],
-          usage: { input_tokens: 10, output_tokens: 1, total_tokens: 11, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } },
-        },
-      })
-      response.end()
-    })
-  })
-  return new Promise((resolve) => {
-    server.listen(0, '127.0.0.1', () => {
-      const address = server.address()
-      if (address === null || typeof address === 'string') throw new Error('mock provider has no port')
-      resolve({
-        url: `http://127.0.0.1:${address.port}`,
-        close: () => new Promise<void>((done) => server.close(() => done())),
-      })
-    })
-  })
 }
 
 // One real one-shot turn. The provider is the loopback mock above, so jcode

@@ -18,15 +18,15 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import http from 'node:http'
 import { createRequire } from 'node:module'
-import os from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
 import { setTimeout as sleep } from 'node:timers/promises'
-import { afterAll, beforeAll, expect, test } from 'vitest'
+import { expect, test } from 'vitest'
 
 import { createJcodeObserver } from './ops/runtime/jcode.ts'
 import { removeTempDir } from './test/cleanup.ts'
+import { seedJcodeSession } from './test/jcode-seed.ts'
 import {
   freePort,
   startOpencodeTestServer,
@@ -101,40 +101,6 @@ async function settleSessionStore(sessionsDir: string, timeoutMs = 30_000): Prom
   throw new Error(`the jcode session store at ${sessionsDir} did not settle within ${timeoutMs}ms (files: ${previous.length})`)
 }
 
-// One real session, written by the real binary. The provider call is incidental:
-// jcode persists the session record before it talks to a model, and the isolated
-// home has no provider credentials of the developer's, so the run exits without
-// spending anyone's quota or touching the live ~/.jcode store.
-async function createRealJcodeSession({ binary, home, cwd }: { binary: string; home: string; cwd: string }): Promise<number> {
-  const run = await new Promise<{ code: number | null }>((resolve) => {
-    const child = spawn(binary, ['run', 'Reply with only: ok', '--tool-profile', 'none', '--no-update', '--quiet', '-C', cwd], {
-      env: { ...process.env, JCODE_HOME: home, JCODE_NO_TELEMETRY: '1' },
-      stdio: ['ignore', 'ignore', 'pipe'],
-      windowsHide: true,
-    })
-    let stderr = ''
-    child.stderr?.setEncoding('utf8')
-    child.stderr?.on('data', (chunk: string) => { stderr = `${stderr}${chunk}`.slice(-2_000) })
-    const timer = setTimeout(() => child.kill('SIGKILL'), 120_000)
-    child.once('exit', (code) => {
-      clearTimeout(timer)
-      if (code === null) process.stderr.write(`jcode run left stderr: ${stderr}\n`)
-      resolve({ code })
-    })
-  })
-  return run.code ?? 1
-}
-
-function removeTree(target: string) {
-  for (let attempt = 0; attempt < 5; attempt += 1) {
-    fs.rmSync(target, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
-    if (!fs.existsSync(target)) return
-    // A file handle can outlive the process by a moment on Windows.
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 250)
-  }
-  if (fs.existsSync(target)) throw new Error(`cannot remove ${target}: files are still held open`)
-}
-
 const skipJcode = jcodeBinary === null
 const ac02Name = skipJcode
   ? 'AC02 passive observe: SKIPPED, no jcode executable found (set JCODE_BIN or install jcode)'
@@ -142,10 +108,12 @@ const ac02Name = skipJcode
 
 test.skipIf(skipJcode)(ac02Name, async () => {
   const binary = jcodeBinary!
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-ac02-store-'))
-  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-ac02-cwd-'))
+  // One real session, written by the real binary into an isolated home. The
+  // provider is a loopback mock, so a cold host persists the record without
+  // credentials, a paid call, or any network beyond 127.0.0.1.
+  const seed = await seedJcodeSession({ binary, prompt: 'Reply with only: ok' })
+  const home = seed.home
   try {
-    await createRealJcodeSession({ binary, home, cwd })
     const sessionsDir = path.join(home, 'sessions')
     const before = await settleSessionStore(sessionsDir)
     const sessionFile = before.find((file) => /(^|\/)session_[^/]*\.json$/.test(file.path))
@@ -224,8 +192,7 @@ test.skipIf(skipJcode)(ac02Name, async () => {
     }
     process.stdout.write(`AC02 witness: ${before.length} store file(s), session ${nativeSessionId}, unchanged after CLI discover + observer discover/snapshot/observe/detach\n`)
   } finally {
-    removeTree(home)
-    removeTree(cwd)
+    seed.cleanup()
   }
 })
 
@@ -241,7 +208,12 @@ let supervisorPid: number | null = null
 // Every bot pid observed, so cleanup can prove none of them survives.
 const botPids = new Set<number>()
 
-beforeAll(async () => {
+// AC35's stack (an OpenCode server, a gateway twin and a fake kimaki.dev) is
+// started and stopped around the test that needs it, not in file-scope hooks.
+// A file-scope `beforeAll` failure marked AC02 skipped as well, and its
+// `afterAll` awaited a server that was never started, which turned the setup
+// error into a bare 60 s hook timeout.
+async function startWitnessStack(): Promise<void> {
   dataDir = tempDataDir()
   // Onboarding `git init`s dataDir/projects/kimaki; pin the branch the footer prints.
   const defaultProject = path.join(dataDir, 'projects', 'kimaki')
@@ -280,19 +252,23 @@ beforeAll(async () => {
   const port = await freePort()
   await new Promise<void>((resolve) => website.listen(port, '127.0.0.1', resolve))
   websiteUrl = `http://127.0.0.1:${port}`
-}, 120_000)
+}
 
-afterAll(async () => {
+async function stopWitnessStack(): Promise<void> {
   await stopSupervisor()
   for (const pid of botPids) await waitForPidGone(pid, 10_000)
-  await new Promise<void>((resolve) => website?.close(() => resolve()))
+  // A failed startWitnessStack leaves some of these unset. Never await a server that was
+  // never started: `new Promise((resolve) => website?.close(() => resolve()))`
+  // never settles when `website` is undefined, which turned a setup error into a
+  // 60 s hook timeout that named neither the cause nor the setup failure.
+  if (website) await new Promise<void>((resolve) => website.close(() => resolve()))
   await twin?.stop()
   await server?.stop()
-  if (dataDir) {
+  if (dataDir && fs.existsSync(dataDir)) {
     await removeTempDir(dataDir)
     expect(fs.existsSync(dataDir), `the witness left ${dataDir} behind`).toBe(false)
   }
-})
+}
 
 function pidAlive(pid: number): boolean {
   try {
@@ -357,7 +333,8 @@ async function waitForEvent({
   throw new Error(`Timed out waiting for ${label} after ${timeoutMs}ms (${diagnose()})`)
 }
 
-test('AC35 a supervised bot restart exits 75, respawns a new pid, emits ready again and leaves no orphan (real cli.ts + supervise)', async () => {
+async function witnessSupervisedRestart(): Promise<void> {
+  await startWitnessStack()
   const proxy = new URL('/', twin.discord.restUrl).toString()
   const lockPort = await freePort()
   supervisor = spawn(
@@ -436,4 +413,14 @@ test('AC35 a supervised bot restart exits 75, respawns a new pid, emits ready ag
   )
   expect(noLongerRunning).toContain('"running":false')
   process.stdout.write(`AC35 witness: bot pid ${before.pid} -> ${after.pid}, supervisor ${supervisorPid} unchanged, ready events 2, orphans 0\n`)
+}
+
+test('AC35 a supervised bot restart exits 75, respawns a new pid, emits ready again and leaves no orphan (real cli.ts + supervise)', async () => {
+  // The cleanup runs for a failed setup too, so a stack that never started reports
+  // its own error instead of a timeout, and a started stack leaves no orphan.
+  try {
+    await witnessSupervisedRestart()
+  } finally {
+    await stopWitnessStack()
+  }
 }, 300_000)

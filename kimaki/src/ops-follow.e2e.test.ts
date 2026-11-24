@@ -1,15 +1,13 @@
-import { execFile, spawn } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import fs from 'node:fs'
 import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 import type { AddressInfo } from 'node:net'
-import { promisify } from 'node:util'
 import { afterAll, beforeAll, expect, test } from 'vitest'
 import { JCODE_SKIP_NO_BINARY, startJcodeTestHub } from './test/jcode-harness.ts'
+import { seedJcodeSession } from './test/jcode-seed.ts'
 import { startTwin, type TestTwin } from './test/harness.js'
-
-const execFileAsync = promisify(execFile)
 
 let twin: TestTwin
 beforeAll(async () => { twin = await startTwin() }, 75_000)
@@ -30,16 +28,9 @@ test('follow publishes one fixed line only with consent', async (ctx) => {
   // A real session record, written by the real binary into an explicit home.
   // `ops follow --source jcode` polls persisted records, so the seed has to be
   // one; a synthetic rewrite would only test this test's own JSON.
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-jcode-follow-real-'))
-  const home = path.join(root, 'home')
-  const cwd = path.join(root, 'cwd')
-  fs.mkdirSync(home, { recursive: true })
-  fs.mkdirSync(cwd, { recursive: true })
-  const jcodeEnv = { ...process.env, JCODE_HOME: home, JCODE_NO_TELEMETRY: '1' }
   const secret = 'SYNTHETIC SECRET BODY'
-  await execFileAsync(binary, ['run', secret, '--tool-profile', 'none', '--no-update', '--quiet', '-C', cwd], { env: jcodeEnv, timeout: 120_000 }).catch(() => undefined)
-  const sessions = path.join(home, 'sessions')
-  const nativeId = fs.readdirSync(sessions).find((name) => name.endsWith('.json'))!.replace(/\.json$/, '')
+  const seed = await seedJcodeSession({ binary, prompt: secret })
+  const { home, nativeId } = seed
   const args = ['--source', 'jcode', '--jcode-home', home, '--host', 'host', '--endpoint', 'endpoint', '--native-session', nativeId, '--tenant', twin.discord.guildId, '--surface', twin.channelId, '--timeout', '9000']
   const run = (extra: string[]) => {
     const child = spawn(process.execPath, ['--import', 'tsx', path.join(import.meta.dirname, 'cli.ts'), 'ops', 'follow', ...args, ...extra], {
@@ -65,7 +56,7 @@ test('follow publishes one fixed line only with consent', async (ctx) => {
       await expect.poll(() => follow.stderr(), { timeout: 120_000 }).toContain('Follow subscription ready')
       // A real rename through the product's own CLI, not a JSON rewrite: this
       // is the write the follower has to notice.
-      await execFileAsync(binary, ['session', 'rename', nativeId, 'Private rename @everyone', '--no-update', '--quiet', '-C', cwd], { env: jcodeEnv, timeout: 30_000 })
+      await seed.rename('Private rename @everyone')
       await expect.poll(async () => (await twin.discord.channel(twin.channelId).getMessages()).length, { timeout: 60_000 }).toBe(1)
       const result = await follow.done
       expect(await twin.discord.channel(twin.channelId).text()).toMatchInlineSnapshot(`
@@ -80,7 +71,7 @@ test('follow publishes one fixed line only with consent', async (ctx) => {
       expect(await twin.discord.channel(twin.channelId).text()).not.toContain('Private rename')
     } finally { follow.child.kill() }
   } finally {
-    fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
+    seed.cleanup()
   }
 }, 300_000)
 

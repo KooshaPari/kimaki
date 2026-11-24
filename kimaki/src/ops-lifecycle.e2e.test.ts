@@ -1,12 +1,11 @@
 import { execFile, spawn } from 'node:child_process'
-import fs from 'node:fs'
-import os from 'node:os'
 import path from 'node:path'
 import { promisify } from 'node:util'
 import { afterAll, beforeAll, expect, test } from 'vitest'
 import { openDb } from './db.ts'
 import { removeDataDir } from './test/cleanup.ts'
 import { JCODE_SKIP_NO_BINARY, startJcodeTestHub } from './test/jcode-harness.ts'
+import { seedJcodeSession } from './test/jcode-seed.ts'
 import { startTwin, tempDataDir, type TestTwin } from './test/harness.ts'
 
 const exec = promisify(execFile)
@@ -42,26 +41,6 @@ async function jcodeBinaryOrSkip(ctx: { skip(condition?: boolean, reason?: strin
   return binary
 }
 
-// A real session record, written by the real binary into an explicit home.
-// The lifecycle tests read persisted state, so the seed has to be produced by
-// the runtime itself; a hand-written JSON file would only test the test.
-async function seedJcodeSession(binary: string, prompt: string) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-jcode-lifecycle-'))
-  const home = path.join(root, 'home')
-  const cwd = path.join(root, 'cwd')
-  fs.mkdirSync(home, { recursive: true })
-  fs.mkdirSync(cwd, { recursive: true })
-  const env = { ...process.env, JCODE_HOME: home, JCODE_NO_TELEMETRY: '1' }
-  await exec(binary, ['run', prompt, '--tool-profile', 'none', '--no-update', '--quiet', '-C', cwd], { env, timeout: 120_000 }).catch(() => undefined)
-  const recordFile = path.join(home, 'sessions')
-  const nativeId = fs.readdirSync(recordFile).find((name) => name.endsWith('.json'))!.replace(/\.json$/, '')
-  const readRecord = () => JSON.parse(fs.readFileSync(path.join(recordFile, `${nativeId}.json`), 'utf8')) as { id: string; title?: string; custom_title?: string }
-  // A rename through the product's own binary, the write the follower must notice.
-  const rename = (title: string) => exec(binary, ['session', 'rename', nativeId, title, '--no-update', '--quiet', '-C', cwd], { env, timeout: 30_000 })
-  const cleanup = () => fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
-  return { root, home, cwd, env, nativeId, readRecord, rename, cleanup }
-}
-
 beforeAll(async () => {
   twin = await startTwin()
   const opened = await openDb({ dataDir, migrate: true })
@@ -78,7 +57,10 @@ afterAll(async () => {
 test('public ops lifecycle observes an external session without controlling it', async (ctx) => {
   const binary = await jcodeBinaryOrSkip(ctx)
   if (binary === null) return
-  const seed = await seedJcodeSession(binary, 'External session')
+  // A real session record, written by the real binary into an explicit home.
+  // The lifecycle tests read persisted state, so the seed has to be produced by
+  // the runtime itself; a hand-written JSON file would only test the test.
+  const seed = await seedJcodeSession({ binary, prompt: 'External session' })
   try {
     const identity = ['--host', 'pilot-host', '--endpoint', 'pilot-endpoint', '--native-session', seed.nativeId, '--tenant', twin.discord.guildId, '--surface', twin.channelId]
     const env: NodeJS.ProcessEnv = { ...process.env, KIMAKI_VITEST: '1', KIMAKI_TEST_LOGS: '1', KIMAKI_STRADA_ENABLED: '0', KIMAKI_DISCORD_REST_URL: twin.discord.restUrl }
@@ -134,7 +116,7 @@ test('public ops lifecycle observes an external session without controlling it',
 test('a restarted follow process republishes nothing it already delivered', async (ctx) => {
   const binary = await jcodeBinaryOrSkip(ctx)
   if (binary === null) return
-  const seed = await seedJcodeSession(binary, 'Restart session')
+  const seed = await seedJcodeSession({ binary, prompt: 'Restart session' })
   try {
     const identity = ['--source', 'jcode', '--jcode-home', seed.home, '--host', 'restart-host', '--endpoint', 'restart-endpoint', '--native-session', seed.nativeId, '--tenant', twin.discord.guildId, '--surface', twin.channelId, '--consent', '--timeout', '15000']
     const env: NodeJS.ProcessEnv = { ...process.env, KIMAKI_VITEST: '1', KIMAKI_TEST_LOGS: '1', KIMAKI_STRADA_ENABLED: '0', KIMAKI_DISCORD_REST_URL: twin.discord.restUrl, KIMAKI_BOT_TOKEN: twin.discord.botToken }
