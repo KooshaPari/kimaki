@@ -26,11 +26,12 @@
 import crypto from 'node:crypto'
 import path from 'node:path'
 
-import type { TextChannel, ThreadChannel } from 'discord.js'
+import { ChannelType, type TextChannel, type ThreadChannel } from 'discord.js'
 
 import type { Author, Bot, PromptFile } from './bot.ts'
 import { routeText, textChannel } from './bot.ts'
-import { createJcodeBotBackend } from './backend/jcode-bot-backend.ts'
+import { createJcodeBotBackend, resolveJcodeBinary, resolveJcodeHome } from './backend/jcode-bot-backend.ts'
+import { createJcodeBotWriter } from './backend/jcode-bot-prompt.ts'
 import { bindThread } from './bind-thread.ts'
 import { ConfigError, DbError, DiscordError } from './errors.ts'
 import { formatError, SILENT_MESSAGE_FLAGS } from './format-parts.ts'
@@ -150,6 +151,99 @@ export async function bindJcodeSession(bot: Bot, { threadId, channelId, director
     // observer left running would poll a record nobody reads.
     created.stop()
   }
+}
+
+export type JcodeTurnServed = {
+  sessionId: string
+  /** The assistant text, empty when the turn completed without one. */
+  text: string
+}
+
+/**
+ * Serve one user message as one prompt turn on an already-bound session.
+ *
+ * The turn runs through the seam's own write primitive
+ * (backend/jcode-bot-prompt.ts), not through the bot's long-lived connection:
+ * that connection follows the session the bot was started on, and a thread bound
+ * later names a different one. `sessionId` here is the thread's recorded session,
+ * read by the caller; this function never mints one.
+ *
+ * The answer is posted as the assistant's reply, split only at Discord's ceiling.
+ * A turn that fails is returned as its named error and nothing is posted in its
+ * place: the caller surfaces the reason. A turn that completes with no text posts
+ * a one-line notice rather than looking like a message that vanished.
+ *
+ * Turns on one session are serialized. There is no cancellation in this lane, and
+ * two messages would otherwise start two ACP children on one record: the writer's
+ * in-flight guard is per writer, and each turn owns its own. Queueing keeps one
+ * message equal to one turn, in order, at the cost of a later answer.
+ */
+export async function serveJcodeTurn(
+  bot: Bot,
+  { threadId, sessionId, directory, text }: { threadId: string; sessionId: string; directory: string; text: string },
+): Promise<Error | JcodeTurnServed> {
+  const prior = turnChains.get(sessionId) ?? Promise.resolve()
+  // A throw is a named error too: this lane must never reject into the ingress
+  // chain, where an unhandled rejection would take the bot down.
+  const attempt = async (): Promise<Error | JcodeTurnServed> => {
+    try {
+      return await runJcodeTurn(bot, { threadId, sessionId, directory, text })
+    } catch (cause) {
+      return cause instanceof Error ? cause : new ConfigError({ reason: `Thread ${threadId} jcode turn threw while serving ${sessionId}` })
+    }
+  }
+  const run = prior.then(attempt, attempt)
+  turnChains.set(sessionId, run)
+  try {
+    return await run
+  } finally {
+    // Only the turn that is still the tail may clear the entry: a later turn has
+    // chained itself after this one and must keep its place in line.
+    if (turnChains.get(sessionId) === run) turnChains.delete(sessionId)
+  }
+}
+
+// Session id -> the turn currently running or last queued for it.
+const turnChains = new Map<string, Promise<unknown>>()
+
+async function runJcodeTurn(
+  bot: Bot,
+  { threadId, sessionId, directory, text }: { threadId: string; sessionId: string; directory: string; text: string },
+): Promise<Error | JcodeTurnServed> {
+  const binary = resolveJcodeBinary(bot.jcodeStore.binary ?? undefined)
+  if (binary instanceof Error) return binary
+  const home = resolveJcodeHome(bot.jcodeStore.home ?? undefined)
+  if (home === '') return new ConfigError({ reason: `Thread ${threadId} cannot take a jcode turn: the Jcode home resolved to an empty path` })
+  if (directory.trim() === '') return new ConfigError({ reason: `Thread ${threadId} cannot take a jcode turn: it has no working directory` })
+
+  // One writer per turn. It owns its ACP child, closes it after the turn, and
+  // refuses a second concurrent turn; a bot that only observes never spawns one.
+  const writer = createJcodeBotWriter({ home, sessionId, binary, cwd: directory, closed: () => false })
+  let outcome: Awaited<ReturnType<typeof writer.prompt>>
+  try {
+    outcome = await writer.prompt({ text })
+  } finally {
+    writer.close()
+  }
+  if (outcome instanceof Error) return outcome
+
+  const target = await bot.discord.channels
+    .fetch(threadId)
+    .catch((cause) => new DiscordError({ operation: 'fetch jcode thread', cause }))
+  if (target instanceof Error) return target
+  if (!target || !(target.isThread() || target.type === ChannelType.GuildText)) {
+    return new DiscordError({ operation: 'post jcode reply', cause: new Error(`${threadId} is not a thread or text channel`) })
+  }
+
+  const answer = outcome.text.trim()
+  // A completed turn with no text is not a failure, but silence would read as one.
+  const body = answer === ''
+    ? `jcode turn on \`${sessionId}\` completed (${outcome.stopReason}) but returned no text to post.`
+    : answer
+  const posted = await postText(target, body, answer === '')
+  if (posted instanceof Error) return posted
+  logger.log(`thread ${threadId} served a jcode turn on ${sessionId} (${outcome.stopReason}, ${outcome.updateCount} updates)`)
+  return { sessionId, text: outcome.text }
 }
 
 export type NewJcodeThreadInput = {

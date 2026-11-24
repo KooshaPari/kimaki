@@ -44,6 +44,7 @@ import { noAnswerError, parseRemoteResult, remoteEnvelope, promptFilePath, REMOT
 import { parseTextMessage, type Route } from './routes.ts'
 import { allMessages } from './session-events.ts'
 import { withThreadBackend } from './thread-backend.ts'
+import { serveJcodeTurn } from './jcode-thread.ts'
 import { ensureSessionMarker, forkBtw, startSession, switchAgent, conversationProject } from './sessions.ts'
 import { cancelSleep } from './sleeps.ts'
 import type { ScheduledRun } from './system-prompt.ts'
@@ -181,13 +182,63 @@ export async function steer(
     skills?: readonly string[]
     echo?: string
     sender?: Sender
+    // The thread's working directory. Required for a jcode turn, which runs the
+    // prompt in the directory the session was created in.
+    directory?: string
   },
-): Promise<OpenCodeUnavailableError | OpenCodeError | void> {
+): Promise<OpenCodeUnavailableError | OpenCodeError | Error | void> {
+  // A jcode thread has no OpenCode endpoint: cancelPendingUi and interrupt are
+  // OpenCode calls and would fail with "not connected" before the message ran.
+  // Its turn is one session/prompt on the session the thread's row records.
+  if (bot.opencode.kind === 'jcode') return steerJcode(bot, input)
   const cancelled = await cancelPendingUi(bot, input.threadId)
   if (cancelled instanceof Error) return cancelled
   const interrupted = await interrupt(bot, input.sessionId)
   if (interrupted instanceof Error) return interrupted
   return prompt(bot, { ...input, delivery: 'steer' })
+}
+
+/**
+ * One user message on a bound jcode thread is one prompt turn on that thread's
+ * recorded session, and the answer is posted back to the thread.
+ *
+ * Three named refusals, no silent workarounds:
+ *   * no `thread_sessions` row: the thread was never bound; nothing is sent and
+ *     no session is created (requirement: a missing bind is an error, not a
+ *     fresh session the user did not ask for);
+ *   * no working directory: the turn needs the cwd the session was created in;
+ *     the writer refuses an empty one and a guess would run it elsewhere;
+ *   * attachments or a skill id: this lane serves text only, and dropping them
+ *     silently would answer a question the user did not ask.
+ */
+async function steerJcode(
+  bot: Bot,
+  input: { sessionId: string; threadId: string; text: string; files?: readonly PromptFile[]; skills?: readonly string[]; directory?: string },
+): Promise<Error | void> {
+  const row = await bot.db.query.thread_sessions
+    .findFirst({ where: { thread_id: input.threadId }, columns: { session_id: true } })
+    .catch((cause) => new DbError({ operation: 'read thread_sessions', cause }))
+  if (row instanceof Error) return row
+  const sessionId = row?.session_id.trim() ?? ''
+  if (sessionId === '') {
+    return new ConfigError({
+      reason: `Thread ${input.threadId} has no bound jcode session; the message was not sent and no session was created`,
+    })
+  }
+  if ((input.files?.length ?? 0) > 0) {
+    return new ConfigError({ reason: `Thread ${input.threadId} cannot take a jcode turn with attachments yet; the message was not sent` })
+  }
+  if ((input.skills?.length ?? 0) > 0) {
+    return new ConfigError({ reason: `Thread ${input.threadId} cannot take a jcode skill turn yet; the message was not sent` })
+  }
+  const directory = (input.directory ?? '').trim()
+  if (directory === '') {
+    return new ConfigError({ reason: `Thread ${input.threadId} cannot take a jcode turn: no working directory was resolved for it` })
+  }
+  // The row is the authority: a stale in-memory session id never redirects a turn.
+  if (input.sessionId !== sessionId) logger.warn(`thread ${input.threadId} routes ${input.sessionId} but its row records ${sessionId}; the row wins`)
+  const served = await serveJcodeTurn(bot, { threadId: input.threadId, sessionId, directory, text: input.text })
+  if (served instanceof Error) return served
 }
 
 export async function cancelQueuedPrompt(bot: Bot, { threadId, inboxID }: { threadId: string; inboxID: string }) {
@@ -303,7 +354,7 @@ async function command(
     files: readonly PromptFile[]
     echo?: string
   },
-): Promise<OpenCodeUnavailableError | OpenCodeError | void> {
+): Promise<OpenCodeUnavailableError | OpenCodeError | Error | void> {
   const { route } = input
   const commands = await oc(bot, 'command.list', (client) => client.command.list({ location: { directory: input.directory } }))
   if (commands instanceof Error) return commands
@@ -365,7 +416,8 @@ export async function runInSession(
     model?: ModelChoice | null
   },
 ) {
-  const base = { sessionId, threadId, threadName, author, messageId, files, echo, sender }
+  // `directory`: the worktree session's cwd, which a jcode turn runs in.
+  const base = { sessionId, threadId, threadName, directory, author, messageId, files, echo, sender }
   switch (route.kind) {
     case 'shell':
       return shell(bot, { threadId, sessionId, command: route.command })

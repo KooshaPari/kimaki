@@ -290,6 +290,7 @@ test('a jcode backend is constructed through the jcode factory, never OpenCode',
   const sentinel: JcodeBotConnection = {
     kind: 'jcode',
     sessionId: 'session_x',
+    primerReply: null,
     connected: true,
     endpoint: null,
     ready: Promise.resolve(new Error('none')),

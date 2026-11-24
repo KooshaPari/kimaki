@@ -185,11 +185,20 @@ const binaryCandidates = (explicit: string | undefined): string[] => {
 }
 
 /**
+ * The Jcode home a seam write is pinned to. Exported so a later turn on a thread
+ * (jcode-thread.ts) reads the same store this backend was started with instead of
+ * re-deriving a default that might name another one.
+ */
+export const resolveJcodeHome = (explicit: string | undefined): string =>
+  (explicit ?? process.env['JCODE_HOME'] ?? path.join(os.homedir(), '.jcode')).trim()
+
+/**
  * A binary exists and starts, or the reason is named. An explicit path that is
  * missing is an error, not a cue to look elsewhere: the caller asked for that
- * file.
+ * file. Exported so a turn on a thread resolves the same executable this backend
+ * probed at start, rather than a bare `jcode` from PATH.
  */
-const resolveBinary = (explicit: string | undefined): string | JcodeBotBackendError => {
+export const resolveJcodeBinary = (explicit: string | undefined): string | JcodeBotBackendError => {
   // An explicit path is the caller's decision: a missing file is the answer, not
   // a cue to look for another runtime on the host.
   if (explicit !== undefined && explicit.trim() !== '') {
@@ -458,10 +467,10 @@ const attachApprovals = async (input: JcodeBotBackendInput, binary: string, home
  * session to follow. Every failure is a named JcodeBotBackendError.
  */
 export async function createJcodeBotBackend(input: JcodeBotBackendInput): Promise<Error | JcodeBotConnection> {
-  const home = (input.home ?? process.env['JCODE_HOME'] ?? path.join(os.homedir(), '.jcode')).trim()
+  const home = resolveJcodeHome(input.home)
   if (home === '') return new JcodeBotBackendError({ stage: 'home', reason: 'Jcode home resolved to an empty path' })
 
-  const binary = resolveBinary(input.binary)
+  const binary = resolveJcodeBinary(input.binary)
   if (binary instanceof Error) return binary
   const probe = input.probe ?? probeBinary
   const started = await probe(binary)

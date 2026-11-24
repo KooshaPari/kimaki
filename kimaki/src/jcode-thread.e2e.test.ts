@@ -19,11 +19,18 @@
 //   6. The primer turn's assistant text is relayed to the thread as the answer to the
 //      user's first message (the fake Discord layer records it), and the created-notice
 //      is kept only for a turn that produced no text.
+//   7. A SECOND user message on the bound thread is one prompt turn on the recorded
+//      session through src/prompt.ts's steer path, and its assistant answer is posted
+//      to the thread. The session record gains the second message and its reply
+//      (counts compared before and after).
+//   8. A message on a thread with no `thread_sessions` row is a named error that
+//      creates no session.
 //
-// What is structural here: the bot context is the fields this path reads (db, store,
-// backendKind, jcodeStore, a recording event-loop stub, analytics) rather than a live
-// Discord client. Discord thread creation is `startJcodeThread`, covered by its own
-// branch of the product, not simulated here. Creation itself is the real binary.
+// What is structural here: the bot context is the fields these paths read (db, store,
+// backendKind, jcodeStore, a recording event-loop/discord stub, analytics) rather than a
+// live Discord client. Discord thread creation is `startJcodeThread`, covered by its own
+// branch of the product, not simulated here. Creation, and the second turn, are the real
+// binary: the assertions read the session file the binary wrote.
 
 import fs from 'node:fs'
 import path from 'node:path'
@@ -34,10 +41,13 @@ import { afterAll, beforeAll, describe, expect, test } from 'vitest'
 import type { Bot } from './bot.ts'
 import { openDb, type KimakiDb, type OpenedDb } from './db.ts'
 import { bindJcodeSession, createdSessionPost, startJcodeCoordinator, startJcodeThread } from './jcode-thread.ts'
+import { steer } from './prompt.ts'
+import { createBotStore } from './store.ts'
 import { removeTempDir } from './test/cleanup.ts'
 import { tempDataDir } from './test/harness.ts'
 import { findJcodeBinary } from './test/jcode-harness.ts'
 import { startMockProvider, type MockProvider } from './test/jcode-seed.ts'
+import { withThreadBackend } from './thread-backend.ts'
 
 const binary = findJcodeBinary()
 
@@ -45,6 +55,30 @@ function sessionFiles(home: string): string[] {
   const dir = path.join(home, 'sessions')
   if (!fs.existsSync(dir)) return []
   return fs.readdirSync(dir).filter((name) => name.endsWith('.json')).sort()
+}
+
+// The persisted messages of one session, read the way the product's observer does.
+function recordMessages(home: string, sessionId: string): { role: string; text: string }[] {
+  const raw = JSON.parse(fs.readFileSync(path.join(home, 'sessions', `${sessionId}.json`), 'utf8')) as {
+    messages?: { role: string; content?: { type: string; text?: string }[] }[]
+  }
+  return (raw.messages ?? []).map((message) => ({
+    role: message.role,
+    text: (message.content ?? []).filter((part) => part.type === 'text').map((part) => part.text ?? '').join(''),
+  }))
+}
+
+// The turn reaches the record when the writer's ACP child ends, not when the
+// prompt answer arrives; the await above covers that, and this bounded wait makes
+// a slow filesystem write a retry rather than a flake.
+async function waitForMessages(home: string, sessionId: string, atLeast: number, timeoutMs = 20_000) {
+  const deadline = Date.now() + timeoutMs
+  let messages = recordMessages(home, sessionId)
+  while (messages.length < atLeast && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    messages = recordMessages(home, sessionId)
+  }
+  return messages
 }
 
 const opened: { handle: OpenedDb | null } = { handle: null }
@@ -283,4 +317,209 @@ describe.skipIf(binary === null)(`jcode session creation on bind${binary === nul
     expect(binds).toEqual([])
     expect(sessionFiles(home)).toEqual(before)
   }, 60_000)
+
+  test('a SECOND message on a bound thread is one prompt turn whose answer is posted', async () => {
+    const db = opened.handle!.db
+    const threadId = 'thread-second'
+    const second = 'Reply with only: ok (second message)'
+
+    // Bind first, exactly as a first Discord message would: this is where the
+    // primer turn and the row come from.
+    const { bot: bindingBot } = jcodeBot({ db, home, dataDir })
+    const bound = await bindJcodeSession(bindingBot, { threadId, channelId: 'channel-second', directory: cwd, primer: 'Reply with only: ok' })
+    if (bound instanceof Error) throw bound
+    expect(bound.reused).toBe(false)
+
+    const before = recordMessages(home, bound.sessionId)
+    // The primer persisted a turn (at least one user message) and does not yet
+    // contain the message this case sends.
+    expect(before.length).toBeGreaterThanOrEqual(1)
+    expect(before.some((message) => message.role === 'user')).toBe(true)
+    expect(before.some((message) => message.text.includes(second))).toBe(false)
+
+    // The bot the steer path runs on: a real store naming the thread's session
+    // and backend, an OpenCode-less connection of kind jcode, and a Discord layer
+    // that records what the thread would show.
+    const store = createBotStore()
+    store.setState({
+      roots: { [threadId]: bound.sessionId },
+      threadBackends: { [threadId]: 'jcode' },
+      sessionThreads: { [bound.sessionId]: threadId },
+    })
+    const sent: string[] = []
+    const thread = {
+      id: threadId,
+      isThread: () => true,
+      send: async (payload: { content: string }) => {
+        sent.push(payload.content)
+        return {}
+      },
+    }
+    const discord = { user: { id: 'bot-user' }, channels: { fetch: async () => thread } }
+    const base = jcodeBot({ db, home, dataDir, discord }).bot as unknown as Bot
+    const bot = {
+      ...base,
+      store,
+      opencode: { kind: 'jcode' },
+      backends: { opencode: null, jcode: { kind: 'jcode' } },
+    } as unknown as Bot
+
+    // The resolution the product performs before a prompt (thread-backend.ts), then
+    // the steer path itself. This is the seam that was inert after the primer.
+    const served = withThreadBackend(bot, threadId)
+    if (!served.ok) throw served.error
+    expect(served.backend).toBe('jcode')
+    const result = await steer(served.bot, {
+      sessionId: bound.sessionId,
+      threadId,
+      threadName: 'thread-second',
+      text: second,
+      author: { id: 'user-1', username: 'user' },
+      messageId: 'message-2',
+      directory: cwd,
+    })
+    if (result instanceof Error) throw result
+
+    // The session file gained the second message and a reply to it: the real
+    // binary wrote it, and the counts are compared, not assumed.
+    const after = await waitForMessages(home, bound.sessionId, before.length + 2)
+    expect(after.length).toBeGreaterThan(before.length)
+    const users = after.filter((message) => message.role === 'user').map((message) => message.text)
+    // The user's second message is in the record exactly once: this turn, not a replay.
+    expect(users.filter((text) => text.includes('Reply with only: ok (second message)'))).toHaveLength(1)
+    // The primer is still there: this turn appended a second user message rather
+    // than replacing or re-sending the first.
+    expect(users.some((text) => text.includes('Reply with only: ok'))).toBe(true)
+    expect(after.filter((message) => message.role === 'assistant').length).toBeGreaterThanOrEqual(2)
+
+    // The answer reached the thread: one post, the mock's reply, not a notice.
+    expect(sent).toEqual(['ok'])
+    expect(sent.join('\n')).not.toContain('completed (')
+
+    // Still one session, one row: a turn never mints or rebinds.
+    expect(sessionFiles(home)).toContain(`${bound.sessionId}.json`)
+    expect(await db.query.thread_sessions.findFirst({ where: { thread_id: threadId } })).toMatchObject({
+      session_id: bound.sessionId,
+      backend: 'jcode',
+    })
+  }, 300_000)
+
+  test('two messages at once are two turns, served in order on one session', async () => {
+    const db = opened.handle!.db
+    const threadId = 'thread-concurrent'
+    const { bot: bindingBot } = jcodeBot({ db, home, dataDir })
+    const bound = await bindJcodeSession(bindingBot, { threadId, channelId: 'channel-concurrent', directory: cwd, primer: 'Reply with only: ok' })
+    if (bound instanceof Error) throw bound
+    const before = recordMessages(home, bound.sessionId)
+
+    const sent: string[] = []
+    const thread = { id: threadId, isThread: () => true, send: async (payload: { content: string }) => {
+      sent.push(payload.content)
+      return {}
+    } }
+    const store = createBotStore()
+    store.setState({ roots: { [threadId]: bound.sessionId }, threadBackends: { [threadId]: 'jcode' }, sessionThreads: { [bound.sessionId]: threadId } })
+    const base = jcodeBot({ db, home, dataDir, discord: { user: { id: 'bot-user' }, channels: { fetch: async () => thread } } }).bot as unknown as Bot
+    const bot = { ...base, store, opencode: { kind: 'jcode' }, backends: { opencode: null, jcode: { kind: 'jcode' } } } as unknown as Bot
+
+    const send = (text: string, messageId: string) => steer(bot, {
+      sessionId: bound.sessionId, threadId, threadName: 'thread-concurrent', text,
+      author: { id: 'user-1', username: 'user' }, messageId, directory: cwd,
+    })
+    // No cancellation exists in this lane: the second message queues behind the
+    // first instead of racing it, so neither turn is written over the other.
+    const results = await Promise.all([send('first queued', 'message-c1'), send('second queued', 'message-c2')])
+    for (const result of results) expect(result).not.toBeInstanceOf(Error)
+
+    const after = await waitForMessages(home, bound.sessionId, before.length + 4)
+    const sentTexts = after.filter((message) => message.role === 'user').map((message) => message.text)
+      .filter((text) => text.includes('queued'))
+    expect(sentTexts.filter((text) => text.includes('first queued'))).toHaveLength(1)
+    expect(sentTexts.filter((text) => text.includes('second queued'))).toHaveLength(1)
+    // In the order the user sent them: the first turn completed before the second began.
+    expect(sentTexts.findIndex((text) => text.includes('first queued'))).toBeLessThan(sentTexts.findIndex((text) => text.includes('second queued')))
+    expect(sent).toEqual(['ok', 'ok'])
+  }, 300_000)
+
+  test('a turn whose session record is gone is a named error and posts nothing', async () => {
+    const db = opened.handle!.db
+    const threadId = 'thread-norecord'
+    const { bot: bindingBot } = jcodeBot({ db, home, dataDir })
+    const bound = await bindJcodeSession(bindingBot, { threadId, channelId: 'channel-norecord', directory: cwd, primer: 'Reply with only: ok' })
+    if (bound instanceof Error) throw bound
+
+    // The row still names a session; the record behind it is gone. That is the
+    // half-written state a turn must refuse instead of prompting a fresh session.
+    const file = path.join(home, 'sessions', `${bound.sessionId}.json`)
+    fs.renameSync(file, `${file}.gone`)
+
+    const sent: string[] = []
+    const thread = { id: threadId, isThread: () => true, send: async (payload: { content: string }) => {
+      sent.push(payload.content)
+      return {}
+    } }
+    const store = createBotStore()
+    store.setState({ roots: { [threadId]: bound.sessionId }, threadBackends: { [threadId]: 'jcode' }, sessionThreads: { [bound.sessionId]: threadId } })
+    const base = jcodeBot({ db, home, dataDir, discord: { user: { id: 'bot-user' }, channels: { fetch: async () => thread } } }).bot as unknown as Bot
+    const bot = { ...base, store, opencode: { kind: 'jcode' }, backends: { opencode: null, jcode: { kind: 'jcode' } } } as unknown as Bot
+
+    const result = await steer(bot, {
+      sessionId: bound.sessionId,
+      threadId,
+      threadName: 'thread-norecord',
+      text: 'second',
+      author: { id: 'user-1', username: 'user' },
+      messageId: 'message-norecord',
+      directory: cwd,
+    })
+    // The named refusal from the write path (backend/jcode-bot-prompt.ts): the
+    // turn never starts, so nothing is posted in its place.
+    expect(result).toBeInstanceOf(Error)
+    expect((result as Error).message).toContain('is not persisted')
+    expect(sent).toEqual([])
+    // And no second session was minted to serve it.
+    expect(sessionFiles(home).filter((name) => name === `${bound.sessionId}.json`)).toEqual([])
+  }, 180_000)
+})
+
+// Always runs: the refusal needs no binary, and it is the one the brief names
+// (no recorded session id is a named error, never a silent create).
+test('a thread with no bound session is a named error and creates nothing', async () => {
+  const dataDir = tempDataDir()
+  const handle = await openDb({ dataDir, migrate: true })
+  if (handle instanceof Error) throw handle
+  try {
+    const store = createBotStore()
+    // The bot knows the thread's backend, so dispatch resolves jcode, but no row
+    // records a session: exactly the half-bound state the refusal is for.
+    store.setState({ roots: {}, threadBackends: { 'thread-unbound': 'jcode' }, sessionThreads: {} })
+    const bot = {
+      db: handle.db,
+      store,
+      opencode: { kind: 'jcode' },
+      backendKind: 'jcode',
+      jcodeStore: { binary: null, home: null },
+      dataDir,
+      discord: { user: { id: 'bot-user' }, channels: { fetch: async () => null } },
+      effects: { run: () => {} },
+      analytics: { track: () => {} },
+    } as unknown as Bot
+    const result = await steer(bot, {
+      sessionId: 'session_never_bound',
+      threadId: 'thread-unbound',
+      threadName: 'thread-unbound',
+      text: 'hello',
+      author: { id: 'user-1', username: 'user' },
+      messageId: 'message-unbound',
+      directory: '/tmp',
+    })
+    expect(result).toBeInstanceOf(Error)
+    expect((result as Error).message).toContain('has no bound jcode session')
+    expect((result as Error).message).toContain('no session was created')
+    // Nothing was written: no row, no session file.
+    expect(await handle.db.query.thread_sessions.findMany()).toEqual([])
+  } finally {
+    handle.close()
+    await removeTempDir(dataDir).catch(() => undefined)
+  }
 })
