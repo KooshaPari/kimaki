@@ -10,6 +10,7 @@ import { readBuiltinSkills } from '../builtin-skills.ts'
 import { fileEditTool, recordToolEdits } from '../file-edit-log.ts'
 import { registerCoordinatorRoles, registerWarmup } from './coordinator.ts'
 import { turnContext } from '../system-prompt.ts'
+import { sessionIdChildEnv } from '../session-id-env.ts'
 
 const exec = promisify(execFile)
 
@@ -136,7 +137,12 @@ export default Plugin.define({
       if (!('command' in event.input) || typeof event.input.command !== 'string') return
       const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`
       const bin = path.join(dataDir, 'bin')
-      const env = { KIMAKI_DATA_DIR: dataDir, KIMAKI_LOCK_PORT: String(lockPort), KIMAKI_TOOL_CALL: `${event.messageID}:${event.id}` }
+      const env = {
+        KIMAKI_DATA_DIR: dataDir,
+        KIMAKI_LOCK_PORT: String(lockPort),
+        KIMAKI_TOOL_CALL: `${event.messageID}:${event.id}`,
+        ...sessionIdChildEnv(event.sessionID),
+      }
       const command = event.input.command
       const prefixed = `export PATH=${quote(bin)}:"$PATH" ${Object.entries(env).map(([key, value]) => `${key}=${quote(value)}`).join(' ')}; ${command}`
       event.input.command = prefixed
