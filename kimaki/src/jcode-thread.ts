@@ -38,6 +38,7 @@ import { formatError, SILENT_MESSAGE_FLAGS } from './format-parts.ts'
 import { createLogger } from './logger.ts'
 import { formatEcho } from './queue.ts'
 import type { Route } from './routes.ts'
+import type { ScheduledRun, SessionInstructionInput } from './system-prompt.ts'
 import { createWorktree } from './worktrees.ts'
 
 const logger = createLogger('JCODE-THREAD')
@@ -51,6 +52,8 @@ export type JcodeSessionBinding = {
   directory: string
   /** The user's first message. The seam requires it: a record appears only after a turn. */
   primer: string
+  /** Durable instruction inputs, excluding fields this path derives. */
+  instruction?: Partial<Omit<SessionInstructionInput, 'sessionId' | 'threadId' | 'channelId' | 'dataDir'>>
 }
 
 export type JcodeSessionBound = {
@@ -111,7 +114,7 @@ export function createdSessionPost(input: { sessionId: string; primerReply: stri
  * but persists no record, so the primer turn is what makes the session real, and
  * construction refuses to return a connection whose record has not settled.
  */
-export async function bindJcodeSession(bot: Bot, { threadId, channelId, directory, primer }: JcodeSessionBinding): Promise<Error | JcodeSessionBound> {
+export async function bindJcodeSession(bot: Bot, { threadId, channelId, directory, primer, instruction }: JcodeSessionBinding): Promise<Error | JcodeSessionBound> {
   if (bot.backendKind !== 'jcode') {
     return new ConfigError({ reason: `Thread ${threadId} cannot get a jcode session: this bot's backend is ${bot.backendKind}` })
   }
@@ -134,6 +137,20 @@ export async function bindJcodeSession(bot: Bot, { threadId, channelId, director
     cwd: directory,
     follow: 'create',
     createPrompt: primer,
+    createInstruction: {
+      threadId,
+      channelId,
+      guildId: instruction?.guildId ?? '',
+      userId: instruction?.userId ?? '',
+      dataDir: bot.dataDir,
+      channelTopic: instruction?.channelTopic ?? null,
+      agents: instruction?.agents ?? [],
+      parentSessionId: instruction?.parentSessionId ?? null,
+      scheduledTask: instruction?.scheduledTask ?? null,
+      coordinator: threadId === channelId,
+      worktree: false,
+      disabled: bot.disabledPrompt,
+    },
     // Same durable dedupe location the bot's other connections use.
     cursorDir: path.join(bot.dataDir, 'jcode-observe'),
     // The primer's own turn is this construction's write and is never news; this
@@ -182,14 +199,14 @@ export type JcodeTurnServed = {
  */
 export async function serveJcodeTurn(
   bot: Bot,
-  { threadId, sessionId, directory, text }: { threadId: string; sessionId: string; directory: string; text: string },
+  { threadId, sessionId, directory, text, instruction }: { threadId: string; sessionId: string; directory: string; text: string; instruction?: string },
 ): Promise<Error | JcodeTurnServed> {
   const prior = turnChains.get(sessionId) ?? Promise.resolve()
   // A throw is a named error too: this lane must never reject into the ingress
   // chain, where an unhandled rejection would take the bot down.
   const attempt = async (): Promise<Error | JcodeTurnServed> => {
     try {
-      return await runJcodeTurn(bot, { threadId, sessionId, directory, text })
+      return await runJcodeTurn(bot, { threadId, sessionId, directory, text, instruction })
     } catch (cause) {
       return cause instanceof Error ? cause : new ConfigError({ reason: `Thread ${threadId} jcode turn threw while serving ${sessionId}` })
     }
@@ -210,7 +227,7 @@ const turnChains = new Map<string, Promise<unknown>>()
 
 async function runJcodeTurn(
   bot: Bot,
-  { threadId, sessionId, directory, text }: { threadId: string; sessionId: string; directory: string; text: string },
+  { threadId, sessionId, directory, text, instruction }: { threadId: string; sessionId: string; directory: string; text: string; instruction?: string },
 ): Promise<Error | JcodeTurnServed> {
   const binary = resolveJcodeBinary(bot.jcodeStore.binary ?? undefined)
   if (binary instanceof Error) return binary
@@ -223,7 +240,7 @@ async function runJcodeTurn(
   const writer = createJcodeBotWriter({ home, sessionId, binary, cwd: directory, closed: () => false })
   let outcome: Awaited<ReturnType<typeof writer.prompt>>
   try {
-    outcome = await writer.prompt({ text })
+    outcome = await writer.prompt({ text, ...(instruction === undefined ? {} : { instruction }) })
   } finally {
     writer.close()
   }
@@ -263,6 +280,8 @@ export type NewJcodeThreadInput = {
   worktree?: string | false
   baseBranch?: string
   run?: boolean
+  parentSessionId?: string | null
+  task?: ScheduledRun | null
 }
 
 /**
@@ -304,7 +323,20 @@ export async function startJcodeThread(bot: Bot, input: NewJcodeThreadInput): Pr
     if (id !== bot.discord.user?.id) void thread.members.add(id).catch((e: Error) => logger.warn(`add member ${id}`, e))
   }
 
-  const bound = await bindJcodeSession(bot, { threadId: thread.id, channelId, directory, primer: text })
+  const bound = await bindJcodeSession(bot, {
+    threadId: thread.id,
+    channelId,
+    directory,
+    primer: text,
+    instruction: {
+      channelTopic: channel.topic ?? null,
+      guildId: channel.guildId ?? '',
+      userId: author.id,
+      parentSessionId: input.parentSessionId ?? null,
+      scheduledTask: input.task ?? null,
+      worktree: checkout !== null,
+    },
+  })
   if (bound instanceof Error) {
     // The named refusal belongs where the user is looking: the thread it was for.
     await thread
@@ -356,7 +388,13 @@ export async function startJcodeCoordinator(bot: Bot, { channel, route, author }
   if (defaults instanceof Error) return defaults
   if (!defaults) return new ConfigError({ reason: 'This channel is not configured with a project directory' })
 
-  const bound = await bindJcodeSession(bot, { threadId: channel.id, channelId: channel.id, directory: defaults.directory, primer: routeText(route) })
+  const bound = await bindJcodeSession(bot, {
+    threadId: channel.id,
+    channelId: channel.id,
+    directory: defaults.directory,
+    primer: routeText(route),
+    instruction: { channelTopic: channel.topic ?? null, guildId: channel.guildId ?? '', userId: author.id },
+  })
   if (bound instanceof Error) {
     await channel.send({ content: formatError(bound.message), allowedMentions: { parse: [] }, flags: SILENT_MESSAGE_FLAGS }).catch(() => undefined)
     return bound

@@ -51,9 +51,11 @@ import { createAcpClient } from './acp/client.ts'
 import type { AcpClient, AcpServerAnswerInput, AcpServerRequest, AcpServerRequestHandler, CreateAcpClient } from './acp/contracts.ts'
 import { cancelJcodeTurn, type JcodeCancelOutcome } from './jcode-bot-cancel.ts'
 import { JcodeBotBackendError, JcodeSessionDeferredError, type JcodeBotRefusal } from './jcode-bot-error.ts'
+import { applyInstruction, planInstruction } from './instructions.ts'
 import { botSocketPath, createJcodeBotWriter, type JcodeBotPromptInput, type JcodeBotPromptOutcome } from './jcode-bot-prompt.ts'
 import { readConsistentRecord } from '../ops/runtime/jcode.ts'
 import { createJcodeTurnObserver, recordAssistantTexts, type JcodeObservationLatency, type JcodeTurnEvent, type JcodeTurnHealth } from './jcode-observe.ts'
+import { sessionInstruction, type SessionInstructionInput } from '../system-prompt.ts'
 
 // The named failure and the refusal record live in their own module so the write
 // path can construct the same error; they stay exported from here unchanged.
@@ -103,6 +105,12 @@ export type JcodeBotBackendInput = {
    * the record with a real turn. This turn is never emitted as an event.
    */
   createPrompt?: string
+  /**
+   * The durable instruction inputs OpenCode would put under INSTRUCTION_KEY.
+   * The backend builds the text after ACP mints the session id so the jcode
+   * instruction carries the same sessionId as OpenCode's.
+   */
+  createInstruction?: Omit<SessionInstructionInput, 'sessionId'>
   /** Bound for a created session's record to settle. Default 60s. */
   createTimeoutMs?: number
   /** Durable cursor directory, outside the Jcode store. One file per session. */
@@ -386,9 +394,16 @@ const createSession = async (
       return new JcodeBotBackendError({ stage: 'create-session', reason: `ACP session/new returned an empty session id for ${cwd}` })
     }
     created = session.sessionId
+    const primerPlan = planInstruction({
+      instruction: input.createInstruction === undefined ? '' : sessionInstruction({ ...input.createInstruction, sessionId: created }),
+    })
+    if (primerPlan.kind === 'rejected') {
+      return new JcodeBotBackendError({ stage: 'create-prompt', reason: primerPlan.reason })
+    }
+    const primerText = applyInstruction(primerPlan, primer)
     const turn = await client.prompt({
       sessionId: created,
-      text: primer,
+      text: primerText,
       ...(input.promptTimeoutMs === undefined ? {} : { timeoutMs: input.promptTimeoutMs }),
     })
     if (turn instanceof Error) {

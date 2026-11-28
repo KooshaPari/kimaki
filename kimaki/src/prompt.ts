@@ -43,6 +43,7 @@ import { discordMessageId, formatEcho } from './queue.ts'
 import { noAnswerError, parseRemoteResult, remoteEnvelope, promptFilePath, REMOTE_TIMEOUT_MS, type RemoteResult } from './remote-send.ts'
 import { parseTextMessage, type Route } from './routes.ts'
 import { allMessages } from './session-events.ts'
+import { sessionInstruction } from './system-prompt.ts'
 import { withThreadBackend } from './thread-backend.ts'
 import { abortJcode, conversationBackendKind, JcodeSurfaceUnavailableError, jcodeConnectionOf, jcodeSurfaceRefusal } from './jcode-surfaces.ts'
 import { serveJcodeTurn } from './jcode-thread.ts'
@@ -219,7 +220,7 @@ export async function steer(
  */
 async function steerJcode(
   bot: Bot,
-  input: { sessionId: string; threadId: string; text: string; files?: readonly PromptFile[]; skills?: readonly string[]; directory?: string },
+  input: { sessionId: string; threadId: string; text: string; author: Author; files?: readonly PromptFile[]; skills?: readonly string[]; directory?: string },
 ): Promise<Error | void> {
   const row = await bot.db.query.thread_sessions
     .findFirst({ where: { thread_id: input.threadId }, columns: { session_id: true } })
@@ -243,7 +244,23 @@ async function steerJcode(
   }
   // The row is the authority: a stale in-memory session id never redirects a turn.
   if (input.sessionId !== sessionId) logger.warn(`thread ${input.threadId} routes ${input.sessionId} but its row records ${sessionId}; the row wins`)
-  const served = await serveJcodeTurn(bot, { threadId: input.threadId, sessionId, directory, text: input.text })
+  const conversation = await textChannel(bot, input.threadId)
+  if (conversation instanceof Error) return conversation
+  const channelId = projectChannelOf(conversation) ?? input.threadId
+  const instruction = sessionInstruction({
+    sessionId,
+    threadId: input.threadId,
+    channelId,
+    guildId: conversation.guildId ?? '',
+    userId: input.author.id,
+    dataDir: bot.dataDir,
+    channelTopic: conversation.topic ?? null,
+    agents: [],
+    parentSessionId: null,
+    coordinator: conversation.id === channelId,
+    disabled: bot.disabledPrompt,
+  })
+  const served = await serveJcodeTurn(bot, { threadId: input.threadId, sessionId, directory, text: input.text, instruction })
   if (served instanceof Error) return served
 }
 

@@ -39,7 +39,7 @@ import { formatEcho } from './queue.ts'
 import type { Route } from './routes.ts'
 import * as schema from './schema.ts'
 import { disabledSkillRules } from './builtin-skills.ts'
-import { baseInstructions, INSTRUCTION_KEY, type ScheduledRun } from './system-prompt.ts'
+import { sessionInstruction, INSTRUCTION_KEY, type ScheduledRun } from './system-prompt.ts'
 import { createWorktree, isLinkedWorktree, resolveWorkingDirectory } from './worktrees.ts'
 
 const logger = createLogger('SESSIONS')
@@ -219,7 +219,7 @@ async function putInstructions(
   if (found instanceof Error) logger.warn(`agent list for instructions failed`, found)
   // The ID is what switchAgent and session.create take.
   const agents = found instanceof Error ? [] : found.map((agent) => ({ name: agent.id, description: agent.description ?? '' }))
-  const value = baseInstructions({
+  const value = sessionInstruction({
     sessionId,
     threadId: conversation.id,
     channelId: channel.id,
@@ -447,6 +447,8 @@ export async function startSession(
       worktree,
       baseBranch,
       run,
+      parentSessionId,
+      task,
     })
   }
   const defaults = await bot.db.query.channel_directories

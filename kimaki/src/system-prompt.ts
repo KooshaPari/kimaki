@@ -11,6 +11,46 @@ export const INSTRUCTION_KEY = 'kimaki'
 
 export type InstructionAgent = { name: string; description: string }
 
+/** Inputs to the one durable session instruction Kimaki builds. */
+export type SessionInstructionInput = {
+  sessionId: string
+  threadId: string
+  channelId: string
+  guildId: string
+  userId: string
+  dataDir: string
+  channelTopic: string | null
+  agents: readonly InstructionAgent[]
+  parentSessionId?: string | null
+  scheduledTask?: ScheduledRun | null
+  coordinator?: boolean
+  worktree?: boolean
+  disabled?: readonly PromptSection[]
+}
+
+/**
+ * The full durable session instruction. OpenCode puts this exact string under
+ * INSTRUCTION_KEY; the jcode path sends the same text as a one-time prompt prefix.
+ * Pure by construction: no I/O, no bot, no client, no mutable state.
+ */
+export function sessionInstruction(input: SessionInstructionInput): string {
+  return baseInstructions({
+    sessionId: input.sessionId,
+    threadId: input.threadId,
+    channelId: input.channelId,
+    guildId: input.guildId,
+    userId: input.userId,
+    dataDir: input.dataDir,
+    channelTopic: input.channelTopic,
+    agents: input.agents,
+    parentSessionId: input.parentSessionId ?? null,
+    scheduledTask: input.scheduledTask ?? null,
+    coordinator: input.coordinator ?? false,
+    worktree: input.worktree ?? false,
+    disabled: input.disabled ?? [],
+  })
+}
+
 // The routine that started a session (scheduler.ts). Set once at
 // session.create, so the instruction entry stays stable across turns.
 export type ScheduledRun = { id: number; cronExpr: string | null; timezone: string | null }
