@@ -9,12 +9,13 @@ import { wrapJsonSchema, type Goke } from 'goke'
 
 import dedent from 'string-dedent'
 
+import { readSessionIdEnv } from '../session-id-env.ts'
 import { callBot } from '../lock-server.ts'
 import { action, DATA_DIR_HELP, dataDirOrDefault, discordApi, fail, isThread, printRows, SESSION_HELP, targetOrEnv } from './shared.ts'
 
 // From an agent shell the bot waits for this shell's tool line, so the UI posts after it.
 function agentShell() {
-  return { fromShell: Boolean(process.env['OPENCODE_SESSION_ID']), toolCall: process.env['KIMAKI_TOOL_CALL'] }
+  return { fromShell: Boolean(readSessionIdEnv()), toolCall: process.env['KIMAKI_TOOL_CALL'] }
 }
 
 // The model reads this after `kimaki buttons`. Text planned before a tool call

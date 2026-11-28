@@ -169,7 +169,7 @@ test('CLI help documents the supported P7 commands', async () => {
 
       session diff                      Upload the git diff of the session folder to critique.work and print the URL
         --data-dir <path>               Data directory (default: ~/.kimaki)
-        -s, --session <id>              Session ID, Discord thread ID or thread URL (default: OPENCODE_SESSION_ID)
+        -s, --session <id>              Session ID, Discord thread ID or thread URL (default: KIMAKI_SESSION_ID)
 
       session url <id>                  Print the Discord URL of a session or thread
         --data-dir <path>               Data directory (default: ~/.kimaki)
@@ -201,41 +201,41 @@ test('CLI help documents the supported P7 commands', async () => {
 
       session title <title>             Rename the session and its Discord thread
         --data-dir <path>               Data directory (default: ~/.kimaki)
-        -s, --session <id>              Session ID, Discord thread ID or thread URL (default: OPENCODE_SESSION_ID)
+        -s, --session <id>              Session ID, Discord thread ID or thread URL (default: KIMAKI_SESSION_ID)
 
       session queue add <value>         add native queued prompts
         --data-dir <path>               Data directory (default: ~/.kimaki)
-        -s, --session <id>              Session ID, Discord thread ID or thread URL (default: OPENCODE_SESSION_ID)
+        -s, --session <id>              Session ID, Discord thread ID or thread URL (default: KIMAKI_SESSION_ID)
         --json                          Output as JSON
 
       session queue remove <value>      remove native queued prompts
         --data-dir <path>               Data directory (default: ~/.kimaki)
-        -s, --session <id>              Session ID, Discord thread ID or thread URL (default: OPENCODE_SESSION_ID)
+        -s, --session <id>              Session ID, Discord thread ID or thread URL (default: KIMAKI_SESSION_ID)
         --json                          Output as JSON
 
       session queue list                list native queued prompts
         --data-dir <path>               Data directory (default: ~/.kimaki)
-        -s, --session <id>              Session ID, Discord thread ID or thread URL (default: OPENCODE_SESSION_ID)
+        -s, --session <id>              Session ID, Discord thread ID or thread URL (default: KIMAKI_SESSION_ID)
         --json                          Output as JSON
 
       session queue clear               clear native queued prompts
         --data-dir <path>               Data directory (default: ~/.kimaki)
-        -s, --session <id>              Session ID, Discord thread ID or thread URL (default: OPENCODE_SESSION_ID)
+        -s, --session <id>              Session ID, Discord thread ID or thread URL (default: KIMAKI_SESSION_ID)
         --json                          Output as JSON
 
       session command <name> [...args]  Run an agent command, skill, or MCP prompt
         --data-dir <path>               Data directory (default: ~/.kimaki)
-        -s, --session <id>              Session ID, Discord thread ID or thread URL (default: OPENCODE_SESSION_ID)
+        -s, --session <id>              Session ID, Discord thread ID or thread URL (default: KIMAKI_SESSION_ID)
         --queue                         Run after the current turn instead of interrupting
 
       session shell <text>              Run shell through the shared session action
         --data-dir <path>               Data directory (default: ~/.kimaki)
-        -s, --session <id>              Session ID, Discord thread ID or thread URL (default: OPENCODE_SESSION_ID)
+        -s, --session <id>              Session ID, Discord thread ID or thread URL (default: KIMAKI_SESSION_ID)
         --queue                         Queue an agent command
 
       session btw <text>                Run btw through the shared session action
         --data-dir <path>               Data directory (default: ~/.kimaki)
-        -s, --session <id>              Session ID, Discord thread ID or thread URL (default: OPENCODE_SESSION_ID)
+        -s, --session <id>              Session ID, Discord thread ID or thread URL (default: KIMAKI_SESSION_ID)
         --queue                         Queue an agent command
 
       session fork [id]                 Fork a root or child session into a new thread
@@ -249,12 +249,12 @@ test('CLI help documents the supported P7 commands', async () => {
 
       buttons                           Show 1-3 action buttons. Explain them in your text
         --data-dir <path>               Data directory (default: ~/.kimaki)
-        -s, --session <id>              Session ID, Discord thread ID or thread URL (default: OPENCODE_SESSION_ID)
+        -s, --session <id>              Session ID, Discord thread ID or thread URL (default: KIMAKI_SESSION_ID)
         -b, --button <spec>             Repeatable: Label[:white|blue|green|red]
 
       upload-request                    Ask for file uploads; waits up to 6 minutes. Shell timeout must be 10 minutes
         --data-dir <path>               Data directory (default: ~/.kimaki)
-        -s, --session <id>              Session ID, Discord thread ID or thread URL (default: OPENCODE_SESSION_ID)
+        -s, --session <id>              Session ID, Discord thread ID or thread URL (default: KIMAKI_SESSION_ID)
         -p, --prompt <text>             Text above the upload button
         --max-files <n>                 1 to 10 (default: 5)
 
@@ -306,7 +306,7 @@ test('CLI help documents the supported P7 commands', async () => {
 
       session cwd [directory]           Show or change the working directory at a native safe boundary
         --data-dir <path>               Data directory (default: ~/.kimaki)
-        -s, --session <id>              Session ID, Discord thread ID or thread URL (default: OPENCODE_SESSION_ID)
+        -s, --session <id>              Session ID, Discord thread ID or thread URL (default: KIMAKI_SESSION_ID)
 
       Agent operations:
       ops codex turn                    Run one explicit Codex app-server turn and stream text deltas
@@ -569,7 +569,7 @@ test('CLI help documents the supported P7 commands', async () => {
         --duration <duration>           Relative wait, e.g. 30m, 2h, 1d
         --until <date>                  UTC ISO date ending in Z
         --reason <text>                 Shown in Discord and in the wake message
-        -s, --session <id>              Session ID, Discord thread ID or thread URL (default: OPENCODE_SESSION_ID)
+        -s, --session <id>              Session ID, Discord thread ID or thread URL (default: KIMAKI_SESSION_ID)
 
       Discord:
       thread list                       List active and optionally archived threads in a channel
@@ -586,7 +586,7 @@ test('CLI help documents the supported P7 commands', async () => {
 
       upload-to-discord <...files>      Attach local files to a session thread or the Kimaki voice channel chat. Pass many files in one call: Discord shows them numbered in argument order
         --data-dir <path>               Data directory (default: ~/.kimaki)
-        -s, --session <id>              Session ID, Discord thread ID or thread URL (default: OPENCODE_SESSION_ID)
+        -s, --session <id>              Session ID, Discord thread ID or thread URL (default: KIMAKI_SESSION_ID)
         -c, --channel <id>              Kimaki voice channel to post in (default in voice calls: KIMAKI_CHANNEL_ID)
 
       diagram <input>                   Render a Mermaid diagram (file path, or - for stdin) to a light themed PNG. Upload it with upload-to-discord

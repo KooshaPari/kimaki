@@ -16,10 +16,11 @@ import { canonicalPath } from '../file-edit-log.ts'
 import type { LockRouteInput, LockRouteName } from '../lock-routes.ts'
 import { callBot } from '../lock-server.ts'
 import { resolveOpencode } from '../opencode-server.ts'
+import { readSessionIdEnv } from '../session-id-env.ts'
 import { readSessionMarkdown, resolveSession, waitForSessions, type WaitStatus } from '../session-events.ts'
 
 export const DATA_DIR_HELP = 'Data directory (default: ~/.kimaki)'
-export const SESSION_HELP = 'Session ID, Discord thread ID or thread URL (default: OPENCODE_SESSION_ID)'
+export const SESSION_HELP = 'Session ID, Discord thread ID or thread URL (default: KIMAKI_SESSION_ID)'
 
 // Prints the error and its cause chain: "Discord login failed" alone hides why.
 export function fail(error: Error, code = 1): never {
@@ -54,9 +55,9 @@ export function parseTarget(value: string): SessionTarget | Error {
   return new Error(`Not a session ID, Discord thread ID or thread URL: ${value}`)
 }
 
-// The target of a session command; inside an agent shell OPENCODE_SESSION_ID is the default.
+// The target of a session command; inside an agent shell KIMAKI_SESSION_ID is the default.
 export function targetOrEnv(value: string | undefined): SessionTarget | Record<string, never> {
-  const id = value ?? process.env['OPENCODE_SESSION_ID']
+  const id = value ?? readSessionIdEnv()
   if (!id) return {}
   const target = parseTarget(id)
   if (target instanceof Error) fail(target)

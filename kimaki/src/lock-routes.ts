@@ -85,7 +85,7 @@ const sendFields = {
   notifyOnly: z.boolean({ error: 'notifyOnly must be boolean' }).optional(),
   // Seconds the CLI waits for the run (`--wait [seconds]`): a run that ends within them sends no coordinator note.
   wait: z.number({ error: 'wait must be a number of seconds' }).positive({ error: 'wait must be a positive number of seconds' }).optional(),
-  // OPENCODE_SESSION_ID of the shell that ran `kimaki send`: a coordinator wakes when the runs it prompted end.
+  // KIMAKI_SESSION_ID of the shell that ran `kimaki send` (legacy name read for one release): a coordinator wakes when the runs it prompted end.
   senderSessionId: text('senderSessionId').optional(),
   permissions: z.array(z.string(), { error: 'Permission rules must be strings' }).optional(),
   prompt: text('prompt'),

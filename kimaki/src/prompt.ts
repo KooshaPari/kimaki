@@ -61,7 +61,7 @@ const logger = createLogger('PROMPT')
 // remote sends, sleep wakes. Stored in the prompt metadata; at the run end
 // coordinator.ts reads it: only a run a coordinator prompted wakes that coordinator.
 export type Sender = {
-  // The session whose shell ran `kimaki send` (OPENCODE_SESSION_ID).
+  // The session whose shell ran `kimaki send` (KIMAKI_SESSION_ID; legacy name read for one release).
   sessionId?: string
   // `kimaki send --wait`: until this time (epoch ms) the sender waits for the result itself, so a run that ends before it sends no note.
   waitUntil?: number

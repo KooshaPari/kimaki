@@ -11,6 +11,7 @@ import { wrapJsonSchema, type Goke } from 'goke'
 import { parseDuration } from '../duration.ts'
 import { OpenCodeError } from '../errors.ts'
 import { editorsForFile, loadFileEditEvents } from '../file-edit-log.ts'
+import { readSessionIdEnv } from '../session-id-env.ts'
 import { allMessages, allSessions, readSessionMarkdown, sessionEventsFile, syncTranscripts, transcriptsDir } from '../session-events.ts'
 import {
   action,
@@ -59,7 +60,7 @@ export function registerSessionQueryCommands(cli: Goke) {
       if (permissions instanceof Error) fail(permissions, errorCode)
       const waiting = new Set([...forms.data.map((form) => form.sessionID), ...permissions.data.map((permission) => permission.sessionID)])
       // an agent waiting for active sessions must not wait for itself
-      const self = options.active ? process.env['OPENCODE_SESSION_ID'] : undefined
+      const self = options.active ? readSessionIdEnv() : undefined
       const excluded = [...(options.exclude ?? []), ...(self ? [self] : [])]
       const rows = sessions
         .filter((session) => !excluded.includes(session.id) && (!options.active || session.id in active))
@@ -139,7 +140,7 @@ export function registerSessionQueryCommands(cli: Goke) {
     .option('--data-dir <path>', DATA_DIR_HELP)
     .option('-s, --session <id>', SESSION_HELP)
     .action(async (options) => {
-      const id = options.session ?? process.env['OPENCODE_SESSION_ID']
+      const id = options.session ?? readSessionIdEnv()
       if (!id) fail(new Error('Use --session or run inside an agent session'))
       const client = await readClient()
       const { sessionId } = await resolveTarget(id, options.dataDir)

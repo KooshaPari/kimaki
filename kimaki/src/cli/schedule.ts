@@ -7,6 +7,7 @@ import { wrapJsonSchema, type Goke } from 'goke'
 
 import { BotNotRunningError } from '../errors.ts'
 import { callBot } from '../lock-server.ts'
+import { readSessionIdEnv } from '../session-id-env.ts'
 import { action, DATA_DIR_HELP, dataDirOrDefault, discordApi, fail, openCliDb, parseTarget, printJson, readClient, SESSION_HELP, targetOrEnv, waitAndPrintSessions } from './shared.ts'
 
 // Bare `--wait`: long enough that the shell timeout ends it first.
@@ -56,7 +57,7 @@ export function registerSendCommand(cli: Goke) {
         signal: AbortSignal.timeout(25 * 60_000),
         input: {
           ...input, wait, sendAt: options.sendAt, preRun: options.preRun, allowConcurrency: options.allowConcurrency,
-          senderSessionId: process.env['OPENCODE_SESSION_ID'] || undefined,
+          senderSessionId: readSessionIdEnv() || undefined,
         },
       })
       if (result instanceof BotNotRunningError) {
