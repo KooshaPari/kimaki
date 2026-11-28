@@ -177,6 +177,7 @@ test('fresh install gets kimaki.db with the kimaki tables; subcommands never cre
       "channel_models",
       "channel_verbosity",
       "channel_worktrees",
+      "codex_credentials",
       "global_models",
       "guild_categories",
       "ops_paperclip_launch_fence",

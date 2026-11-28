@@ -137,6 +137,20 @@ export const bot_api_keys = s.sqliteTable('bot_api_keys', {
   created_at: datetime('created_at').default(orm.sql`CURRENT_TIMESTAMP`),
 })
 
+// One-time handoff of the Codex OAuth credential OpenCode owns (docs/opencode-removal.md 1.4).
+// Kimaki never refreshes this token: refresh tokens rotate and a refresh here would log
+// OpenCode out. An expired row is skipped, not deleted, so the token can be replaced by a
+// later explicit import. DB_VERSION stays 1: migrations.ts applies the additive DDL from
+// schema.sql on every start (CREATE TABLE IF NOT EXISTS).
+export const codex_credentials = s.sqliteTable('codex_credentials', {
+  app_id: s.text('app_id').primaryKey().notNull().references(() => bot_tokens.app_id, { onUpdate: 'cascade' }),
+  access_token: s.text('access_token').notNull(),
+  account_id: s.text('account_id'),
+  token_expires_at: s.integer('token_expires_at', { mode: 'number' }),
+  imported_from: s.text('imported_from').notNull(),
+  imported_at: datetime('imported_at').default(orm.sql`CURRENT_TIMESTAMP`),
+})
+
 // Bot-wide settings that must survive restarts. Start flags like --voice write them.
 export const bot_settings = s.sqliteTable('bot_settings', {
   app_id: s.text('app_id').primaryKey().notNull().references(() => bot_tokens.app_id, { onUpdate: 'cascade' }),
@@ -244,6 +258,7 @@ export const relations = defineRelations({
   thread_sessions,
   bot_tokens,
   bot_api_keys,
+  codex_credentials,
   bot_settings,
   channel_directories,
   guild_categories,
@@ -265,11 +280,15 @@ export const relations = defineRelations({
   },
   bot_tokens: {
     api_keys: r.one.bot_api_keys({ from: r.bot_tokens.app_id, to: r.bot_api_keys.app_id }),
+    codex_credential: r.one.codex_credentials({ from: r.bot_tokens.app_id, to: r.codex_credentials.app_id }),
     global_model: r.one.global_models({ from: r.bot_tokens.app_id, to: r.global_models.app_id }),
     settings: r.one.bot_settings({ from: r.bot_tokens.app_id, to: r.bot_settings.app_id }),
   },
   bot_api_keys: {
     bot: r.one.bot_tokens({ from: r.bot_api_keys.app_id, to: r.bot_tokens.app_id }),
+  },
+  codex_credentials: {
+    bot: r.one.bot_tokens({ from: r.codex_credentials.app_id, to: r.bot_tokens.app_id }),
   },
   bot_settings: {
     bot: r.one.bot_tokens({ from: r.bot_settings.app_id, to: r.bot_tokens.app_id }),
