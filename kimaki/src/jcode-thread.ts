@@ -143,9 +143,11 @@ export async function bindJcodeSession(bot: Bot, { threadId, channelId, director
   if (created instanceof Error) return created
 
   try {
-    const bound = await bindThread(bot, { threadId, sessionId: created.sessionId, channelId, directory, isNew: true })
+    const boundSessionId = created.sessionId
+    if (boundSessionId === null) throw new Error('follow: create returned no session')
+    const bound = await bindThread(bot, { threadId, sessionId: boundSessionId, channelId, directory, isNew: true })
     if (bound instanceof Error) return bound
-    return { sessionId: created.sessionId, reused: false, primerReply: created.primerReply }
+    return { sessionId: boundSessionId, reused: false, primerReply: created.primerReply }
   } finally {
     // Creation only: the bot has no per-thread connection registry yet, so an
     // observer left running would poll a record nobody reads.

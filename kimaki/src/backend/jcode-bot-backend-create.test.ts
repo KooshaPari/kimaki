@@ -225,14 +225,16 @@ describe.skipIf(jcodeBinary === null)(`creation over the real binary${skipReason
     })
     if (created instanceof Error) throw created
     const connection: JcodeBotConnection = created
+    const sessionId = created.sessionId
+    if (sessionId === null) throw new Error('follow: create returned no session')
     try {
       expect(connection.kind).toBe('jcode')
-      expect(connection.sessionId).toMatch(/^session_/)
+      expect(sessionId).toMatch(/^session_/)
       // (a) the id exists on disk under this home's sessions directory.
-      const file = sessionFile(home, connection.sessionId)
+      const file = sessionFile(home, sessionId)
       expect(fs.existsSync(file)).toBe(true)
-      const record = readRecord(home, connection.sessionId)
-      expect(record.id).toBe(connection.sessionId)
+      const record = readRecord(home, sessionId)
+      expect(record.id).toBe(sessionId)
       expect(record.messages.length).toBeGreaterThan(0)
       // Evidence a turn really ran: the primer text is in the user history.
       expect(JSON.stringify(record.messages)).toContain('Reply with only: ok')

@@ -27,6 +27,7 @@
 import * as errore from 'errore'
 
 import type { Bot } from './bot.ts'
+import { JcodeBotBackendError } from './backend/jcode-bot-error.ts'
 import type { JcodeBotConnection } from './backend/jcode-bot-backend.ts'
 
 /** Every surface that assumes an OpenCode connection and is decided here. */
@@ -229,7 +230,7 @@ export async function abortJcode(connection: Pick<JcodeBotConnection, 'cancel'>)
   const note = 'no queue, forms or shells to clear on the jcode backend'
   if (outcome instanceof Error) {
     // Nothing running: the post-condition the user asked for already holds.
-    if (outcome.stage === 'cancel-not-running') return { cleared: 0, note }
+    if (outcome instanceof JcodeBotBackendError && outcome.stage === 'cancel-not-running') return { cleared: 0, note }
     return outcome
   }
   return { cleared: 0, note }

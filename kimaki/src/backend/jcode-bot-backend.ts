@@ -12,10 +12,11 @@
 //
 // What construction guarantees: the returned value is either a connection or a
 // named Error. A missing binary, a binary that cannot answer `--version`, a
-// store with no persisted session, an ambiguous store (several sessions and no
-// explicit id), or a first read that is not settled all fail closed here. There
-// is no fallback to OpenCode anywhere in this module, by design: a silent
-// fallback would make a jcode test pass while exercising the OpenCode path.
+// non-deferred store with no persisted session, an ambiguous store (several
+// sessions and no explicit id), or a first read that is not settled all fail
+// closed here. There is no fallback to OpenCode anywhere in this module, by
+// design: a silent fallback would make a jcode test pass while exercising the
+// OpenCode path.
 //
 // Dedupe is the observer's durable cursor, one file per session under an
 // explicit `cursorDir` outside the Jcode store. Without that directory the seam
@@ -27,14 +28,16 @@
 // the caller supplies a handler; without one it starts no child and keeps the
 // historical drop. An approval is not a turn, so it is never a V2 event.
 //
-// Creation (`follow: 'create'`) is the one way in that does not start from an
-// existing record. It mints a session over ACP on a home-pinned socket, then
-// primes the record with one first turn (`createPrompt`), because the binary
-// writes no session record until a turn runs. Only after that record settles
-// does construction continue down the same path a follower takes: approvals
-// attach, one settled read, the durable cursor. The priming turn is suppressed
-// from the event stream, and a failed creation is a named error rather than a
-// fallback to following some other session.
+// Creation (`follow: 'create'`) and deferral (`follow: 'defer'`) are the two ways
+// in that do not start from an existing record. Creation mints a session over
+// ACP on a home-pinned socket, then primes the record with one first turn
+// (`createPrompt`), because the binary writes no session record until a turn
+// runs. Only after that record settles does construction continue down the same
+// path a follower takes: approvals attach, one settled read, the durable cursor.
+// The priming turn is suppressed from the event stream, and a failed creation is
+// a named error rather than a fallback to following some other session. Deferral
+// starts the bot with no session at all; a thread creates its own session when
+// it binds, and session-needing bot operations refuse by name.
 
 import { spawn } from 'node:child_process'
 import fs from 'node:fs'
@@ -47,14 +50,14 @@ import type { Backend, OpencodeEndpoint } from '../opencode-server.ts'
 import { createAcpClient } from './acp/client.ts'
 import type { AcpClient, AcpServerAnswerInput, AcpServerRequest, AcpServerRequestHandler, CreateAcpClient } from './acp/contracts.ts'
 import { cancelJcodeTurn, type JcodeCancelOutcome } from './jcode-bot-cancel.ts'
-import { JcodeBotBackendError, type JcodeBotRefusal } from './jcode-bot-error.ts'
+import { JcodeBotBackendError, JcodeSessionDeferredError, type JcodeBotRefusal } from './jcode-bot-error.ts'
 import { botSocketPath, createJcodeBotWriter, type JcodeBotPromptInput, type JcodeBotPromptOutcome } from './jcode-bot-prompt.ts'
 import { readConsistentRecord } from '../ops/runtime/jcode.ts'
 import { createJcodeTurnObserver, recordAssistantTexts, type JcodeObservationLatency, type JcodeTurnEvent, type JcodeTurnHealth } from './jcode-observe.ts'
 
 // The named failure and the refusal record live in their own module so the write
 // path can construct the same error; they stay exported from here unchanged.
-export { JcodeBotBackendError, type JcodeBotRefusal } from './jcode-bot-error.ts'
+export { JcodeBotBackendError, JcodeSessionDeferredError, type JcodeBotRefusal } from './jcode-bot-error.ts'
 export { JCODE_BOT_NOT_PROJECTED, JCODE_BOT_NOT_PROJECTED_REASON, JCODE_BOT_PROJECTED_EVENTS } from './jcode-bot-not-projected.ts'
 export type { JcodeBotPromptInput, JcodeBotPromptOutcome } from './jcode-bot-prompt.ts'
 
@@ -73,6 +76,8 @@ export type JcodeBotBackendSpec = {
   binary?: string
   home?: string
   sessionId?: string
+  follow?: 'existing' | 'create' | 'defer'
+  createPrompt?: string
 }
 
 /** Construction and runtime knobs for one bot following one persisted session. */
@@ -87,8 +92,10 @@ export type JcodeBotBackendInput = {
    * persisted record exactly as before. `create` mints a new session over ACP
    * and primes its record with one first turn, because jcode writes no session
    * record until a turn runs (measured; see `createPrompt`).
+   * `defer` starts no session; the first thread's binding creates one. Passing
+   * `sessionId` with defer is refused, because the bot would never follow it.
    */
-  follow?: 'existing' | 'create'
+  follow?: 'existing' | 'create' | 'defer'
   /**
    * Text of the first turn a `follow: 'create'` construction runs. Required for
    * creation: ACP `session/new` mints an id but persists no record, and this
@@ -143,7 +150,7 @@ export type JcodeBotApprovals = {
  */
 export type JcodeBotConnection = Backend & {
   readonly kind: 'jcode'
-  readonly sessionId: string
+  readonly sessionId: string | null
   /**
    * The assistant text a `follow: 'create'` primer turn produced; null when
    * following, and null when the turn produced no text. The primer is suppressed
@@ -164,12 +171,12 @@ export type JcodeBotConnection = Backend & {
    */
   prompt: (input: string | JcodeBotPromptInput) => Promise<JcodeBotPromptOutcome | Error>
   /** One deterministic observer read, so a caller can surface a just-finished turn. */
-  flush: () => Promise<void>
+  flush: () => Promise<void | JcodeSessionDeferredError>
   /**
    * Cancel the running turn over the seam's own ACP connection. Returns the
    * primitive's outcome or a named refusal; never emits an event.
    */
-  cancel: () => Promise<JcodeCancelOutcome | JcodeBotBackendError>
+  cancel: () => Promise<JcodeCancelOutcome | JcodeBotBackendError | JcodeSessionDeferredError>
   /** Present only when an approval handler was supplied. Surfaced to the caller, never emitted as an event. */
   approvals?: JcodeBotApprovals
 }
@@ -466,7 +473,63 @@ const attachApprovals = async (input: JcodeBotBackendInput, binary: string, home
  * exists and is settled, so a bot that owns this connection always has a
  * session to follow. Every failure is a named JcodeBotBackendError.
  */
+export async function createJcodeBotBackend(input: JcodeBotBackendInput & { follow: 'defer' }): Promise<Error | (JcodeBotConnection & { sessionId: null })>
+export async function createJcodeBotBackend(input: JcodeBotBackendInput & { follow?: 'existing' | 'create' }): Promise<Error | (JcodeBotConnection & { sessionId: string })>
+export async function createJcodeBotBackend(input: JcodeBotBackendInput): Promise<Error | JcodeBotConnection>
 export async function createJcodeBotBackend(input: JcodeBotBackendInput): Promise<Error | JcodeBotConnection> {
+  if (input.follow === 'defer') {
+    // A cold start resolves no session, starts no poller and needs no binary.
+    // An explicit session id would be silently ignored, so refuse it by name. A
+    // creation prompt would never be run, so refuse it too rather than dropping
+    // the user's first turn. Both stay named JcodeBotBackendErrors.
+    if (input.sessionId !== undefined && input.sessionId.trim() !== '') {
+      return new JcodeBotBackendError({
+        stage: 'follow',
+        reason: 'follow: defer has no session of its own; pass sessionId only with follow: existing',
+      })
+    }
+    if (input.createPrompt !== undefined && input.createPrompt.trim() !== '') {
+      return new JcodeBotBackendError({
+        stage: 'follow',
+        reason: 'follow: defer starts no session and will not run createPrompt; pass follow: create to prime one',
+      })
+    }
+    const refusals: JcodeBotRefusal[] = [
+      {
+        name: 'subscribe',
+        reason: 'the deferred bot has no session, so it emits no catalog hints; a thread creates one when it binds',
+      },
+      {
+        name: 'endpoint',
+        reason: 'the deferred bot has no session, so it exposes no OpenCode endpoint',
+      },
+    ]
+    let stopped = false
+    const deferred = (operation: string) => () => Promise.resolve(new JcodeSessionDeferredError({ operation }))
+    return {
+      kind: 'jcode',
+      connected: true,
+      endpoint: null,
+      // startBot joins every backend's ready promise. A deferred bot is ready
+      // without a session; the marker carries no usable OpenCode client.
+      ready: Promise.resolve<Error | OpencodeEndpoint>({
+        client: refusingClient(),
+        url: 'jcode://deferred',
+        version: 'jcode-deferred',
+      }),
+      sessionId: null,
+      primerReply: null,
+      subscribe: () => () => undefined,
+      stop: () => { stopped = true },
+      health: () => ({ state: 'stopped', lastPollAt: 0 }),
+      latency: { pollIntervalMs: 0, minPollIntervalMs: 0, maxPollIntervalMs: 0, confirmMs: 0 },
+      refusals: () => [...refusals],
+      prompt: deferred('prompt'),
+      cancel: deferred('cancel'),
+      flush: deferred('flush'),
+    }
+  }
+
   const home = resolveJcodeHome(input.home)
   if (home === '') return new JcodeBotBackendError({ stage: 'home', reason: 'Jcode home resolved to an empty path' })
 

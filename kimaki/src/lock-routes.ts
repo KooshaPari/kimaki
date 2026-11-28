@@ -311,6 +311,9 @@ export const lockRoutes = {
         mode: bot.token.includes(':') ? 'gateway' as const : 'self_hosted' as const,
         analytics: bot.analytics.enabled,
         opencode: { connected: bot.opencode.connected, url: endpoint?.url ?? null, version: endpoint?.version ?? null },
+        ...(bot.opencode.kind === 'jcode' && bot.opencode.sessionId === null
+          ? { jcode: { sessionId: null, deferred: true, reason: 'the bot has no session of its own yet; a thread creates one when it binds' } }
+          : {}),
         guilds: [...bot.discord.guilds.cache.values()].map((guild) => ({ id: guild.id, name: guild.name })),
       }
     },

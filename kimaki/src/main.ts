@@ -2,12 +2,13 @@
 // Discord login in parallel. Returns a handle so tests can drive the bot
 // in-process and stop it cleanly.
 
+import fs from 'node:fs'
 import path from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { Client, Events, GatewayIntentBits, Partials } from 'discord.js'
 import * as errore from 'errore'
 
-import { createJcodeBotBackend, type JcodeBotBackendInput, type JcodeBotBackendSpec, type JcodeBotConnection } from './backend/jcode-bot-backend.ts'
+import { createJcodeBotBackend, resolveJcodeHome, type JcodeBotBackendInput, type JcodeBotBackendSpec, type JcodeBotConnection } from './backend/jcode-bot-backend.ts'
 import { createAgentUi } from './agent-ui.ts'
 import type { Analytics } from './analytics.ts'
 import { oc, type Bot, type WarmupTimers } from './bot.ts'
@@ -120,10 +121,58 @@ export function startBotConnection(
     ...(backend.binary === undefined ? {} : { binary: backend.binary }),
     ...(backend.home === undefined ? {} : { home: backend.home }),
     ...(backend.sessionId === undefined ? {} : { sessionId: backend.sessionId }),
+    ...(backend.follow === undefined ? {} : { follow: backend.follow }),
+    ...(backend.createPrompt === undefined ? {} : { createPrompt: backend.createPrompt }),
     ...(cursorDir === undefined ? {} : { cursorDir }),
     ...(intervalMs === undefined ? {} : { intervalMs }),
     onEvent: callbacks.onEvent,
   })
+}
+
+/** Session ids already persisted under the home the bot will observe. */
+const persistedJcodeSessions = (home: string | undefined): string[] => {
+  const dir = path.join(resolveJcodeHome(home), 'sessions')
+  if (!fs.existsSync(dir)) return []
+  return fs.readdirSync(dir).filter((name) => name.endsWith('.json')).map((name) => name.slice(0, -'.json'.length)).sort()
+}
+
+export type JcodeStartupFollow =
+  | { follow: 'defer'; reason: string }
+  | { follow?: 'existing' | 'create' | 'defer'; reason: null }
+
+/**
+ * The one place the bot decides how its own jcode session starts.
+ *
+ * A cold install has no explicit session id, no creation prompt and no persisted
+ * record, so it defers: a thread creates its own session when it binds. Every
+ * other case keeps the previous choice, including the loud refusal for a
+ * non-explicit follow over an empty store, because callers that need one bot
+ * session must hear about that fault.
+ */
+export function jcodeStartupFollow({
+  backend,
+  persistedSessions,
+}: {
+  backend?: JcodeBotBackendSpec
+  persistedSessions: readonly string[]
+}): JcodeStartupFollow {
+  const deferred: JcodeStartupFollow = { follow: 'defer', reason: 'no persisted session; the first thread creates its own session when it binds' }
+  const explicit = backend?.follow
+  // An explicit defer is honoured, and reported the same way as an inferred one.
+  if (backend?.kind === 'jcode' && explicit === 'defer') return deferred
+  // Only an unconfigured cold install defers. Any explicit follow, including a
+  // `create` prompt or an `existing` id, keeps today's behaviour: creation mints
+  // a session, an id is followed, and a non-explicit empty store still refuses.
+  if (
+    backend?.kind === 'jcode' &&
+    explicit === undefined &&
+    (backend.sessionId === undefined || backend.sessionId.trim() === '') &&
+    (backend.createPrompt === undefined || backend.createPrompt.trim() === '') &&
+    persistedSessions.length === 0
+  ) {
+    return deferred
+  }
+  return { follow: explicit, reason: null }
 }
 
 export type BotConnections = {
@@ -133,6 +182,8 @@ export type BotConnections = {
   primary: OpencodeConnection | JcodeBotConnection
   // Every connection this bot started (thread-backend.ts resolves per thread).
   backends: { readonly opencode: OpencodeConnection | null; readonly jcode: JcodeBotConnection | null }
+  // Cold-install notice: the bot is up but has no session until a thread binds.
+  startupNotice?: string
 }
 
 /**
@@ -151,6 +202,7 @@ export async function startBotConnections(
     cursorDir,
     intervalMs,
     legacyOpencodeThreads,
+    persistedSessions,
   }: {
     backend?: JcodeBotBackendSpec
     callbacks: BotConnectionCallbacks
@@ -158,14 +210,17 @@ export async function startBotConnections(
     intervalMs?: number
     // Rows whose backend is opencode (backendPlan().needsOpencode).
     legacyOpencodeThreads: boolean
+    // Session ids already persisted under the configured jcode home.
+    persistedSessions?: readonly string[]
   },
   opencodeFactory: (options: BotConnectionCallbacks) => OpencodeConnection = watchOpencode,
   jcodeFactory: (input: JcodeBotBackendInput) => Promise<Error | JcodeBotConnection> = createJcodeBotBackend,
 ): Promise<Error | BotConnections> {
   const backendKind: 'opencode' | 'jcode' = backend?.kind === 'jcode' ? 'jcode' : 'opencode'
+  const follow = jcodeStartupFollow({ backend, persistedSessions: persistedSessions ?? [] })
   const selected = startBotConnection(
     {
-      ...(backend === undefined ? {} : { backend }),
+      ...(backend === undefined ? {} : { backend: { ...backend, ...(follow.reason === null ? {} : { follow: follow.follow }) } }),
       callbacks,
       ...(cursorDir === undefined ? {} : { cursorDir }),
       ...(intervalMs === undefined ? {} : { intervalMs }),
@@ -176,8 +231,16 @@ export async function startBotConnections(
   const primary = selected instanceof Promise ? await selected : selected
   if (primary instanceof Error) return primary
   if (backendKind === 'opencode') return { backendKind, primary: primary as OpencodeConnection, backends: { opencode: primary as OpencodeConnection, jcode: null } }
-  if (!legacyOpencodeThreads) return { backendKind, primary: primary as JcodeBotConnection, backends: { opencode: null, jcode: primary as JcodeBotConnection } }
-  return { backendKind, primary: primary as JcodeBotConnection, backends: { opencode: opencodeFactory(callbacks), jcode: primary as JcodeBotConnection } }
+  const jcode = (): BotConnections => ({
+    backendKind,
+    primary: primary as JcodeBotConnection,
+    backends: {
+      opencode: legacyOpencodeThreads ? opencodeFactory(callbacks) : null,
+      jcode: primary as JcodeBotConnection,
+    },
+    ...(follow.reason === null ? {} : { startupNotice: follow.reason }),
+  })
+  return jcode()
 }
 
 export type BotHandle = Bot & {
@@ -277,6 +340,7 @@ export async function startBot(options: StartBotOptions): Promise<Error | BotHan
     ...(options.backend === undefined ? {} : { backend: options.backend }),
     cursorDir: path.join(options.dataDir, 'jcode-observe'),
     legacyOpencodeThreads: plan.needsOpencode,
+    persistedSessions: options.backend?.kind === 'jcode' ? persistedJcodeSessions(options.backend.home) : [],
     callbacks: {
       serviceFile: options.opencodeServiceFile,
       ensure: options.ensureOpencode,
@@ -286,6 +350,7 @@ export async function startBot(options: StartBotOptions): Promise<Error | BotHan
     },
   })
   if (connections instanceof Error) return connections
+  const { startupNotice } = connections
   // `bot.opencode` is the configured backend; `bot.backends` is what thread rows resolve to.
   const opencode: Bot['opencode'] = connections.primary
   const { backends } = connections
@@ -370,7 +435,8 @@ export async function startBot(options: StartBotOptions): Promise<Error | BotHan
   // After Discord and OpenCode are ready: a due task needs both.
   const scheduling = await scheduler.start()
   if (scheduling instanceof Error) return scheduling
-  logger.info(`bot ready as ${discord.user?.tag} in ${discord.guilds.cache.size} server(s)`)
+  if (startupNotice === undefined) logger.info(`bot ready as ${discord.user?.tag} in ${discord.guilds.cache.size} server(s)`)
+  else logger.info(`bot ready as ${discord.user?.tag} in ${discord.guilds.cache.size} server(s); ${startupNotice}`)
   const projects = await countUserProjects({ db, dataDir: options.dataDir })
   if (projects instanceof Error) logger.warn(projects)
   options.analytics.track('bot_started', {
