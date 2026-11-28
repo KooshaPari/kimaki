@@ -28,6 +28,7 @@ import {
   type PromptFile,
 } from './bot.ts'
 import { bindThread } from './bind-thread.ts'
+import { jcodeConnectionRefusal, JcodeSurfaceUnavailableError, jcodeSurfaceRefusal } from './jcode-surfaces.ts'
 import { startJcodeCoordinator, startJcodeThread } from './jcode-thread.ts'
 import { ConfigError, DbError, DiscordError, OpenCodeError, OpenCodeUnavailableError } from './errors.ts'
 import { SILENT_MESSAGE_FLAGS } from './format-parts.ts'
@@ -122,6 +123,8 @@ export async function catalogReady(bot: Pick<Bot, 'opencode'>, directory: string
 // Agents a session may switch to (not subagents, not hidden ones). OpenCode lists
 // its default agent (`default_agent`, else build) first: core/src/agent.ts `list`.
 export async function primaryAgents(bot: Pick<Bot, 'opencode'>, directory: string) {
+  const refused = jcodeConnectionRefusal(bot, 'agent')
+  if (refused) return refused
   const ready = await catalogReady(bot, directory)
   if (ready instanceof Error) return ready
   const agents = await oc(bot, 'agent.list', (client) => client.agent.list({ location: { directory } }))
@@ -817,6 +820,8 @@ export async function fork(
     worktree?: { name: string; baseBranch?: string }
   },
 ) {
+  const refused = jcodeSurfaceRefusal(bot, source.id, 'fork')
+  if (refused) return refused
   const root = rootSession(bot, source.id)
   if (root instanceof Error) return root
   if (sessionId !== root) {
@@ -903,7 +908,9 @@ export async function forkBtw(
     parentSessionId?: string
     sender?: Sender
   },
-): Promise<ConfigError | OpenCodeUnavailableError | OpenCodeError | DiscordError | DbError | { threadId: string; sessionId: string }> {
+): Promise<ConfigError | OpenCodeUnavailableError | OpenCodeError | JcodeSurfaceUnavailableError | DiscordError | DbError | { threadId: string; sessionId: string }> {
+  const refused = jcodeSurfaceRefusal(bot, source.id, 'btw')
+  if (refused) return refused
   const sourceSessionId = rootSession(bot, source.id)
   if (sourceSessionId instanceof Error) return sourceSessionId
   const project = await conversationProject(bot, source)

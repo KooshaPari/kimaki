@@ -44,6 +44,7 @@ import { noAnswerError, parseRemoteResult, remoteEnvelope, promptFilePath, REMOT
 import { parseTextMessage, type Route } from './routes.ts'
 import { allMessages } from './session-events.ts'
 import { withThreadBackend } from './thread-backend.ts'
+import { abortJcode, conversationBackendKind, JcodeSurfaceUnavailableError, jcodeConnectionOf, jcodeSurfaceRefusal } from './jcode-surfaces.ts'
 import { serveJcodeTurn } from './jcode-thread.ts'
 import { ensureSessionMarker, forkBtw, startSession, switchAgent, conversationProject } from './sessions.ts'
 import { cancelSleep } from './sleeps.ts'
@@ -104,7 +105,12 @@ export async function prompt(
     // Unset: a person typed it in Discord.
     sender?: Sender
   },
-): Promise<OpenCodeUnavailableError | OpenCodeError | void> {
+): Promise<OpenCodeUnavailableError | OpenCodeError | JcodeSurfaceUnavailableError | void> {
+  // A queued message parks in the OpenCode inbox; jcode has none (jcode-surfaces.ts).
+  if (delivery === 'queue') {
+    const refused = jcodeSurfaceRefusal(bot, threadId, 'queue')
+    if (refused) return refused
+  }
   const { attached, attachments } = await splitPromptFiles(files)
   // The text stays as the user wrote it. The plugin renders the <discord-user>
   // context from this metadata into the model request only (turnContext()).
@@ -252,7 +258,9 @@ export async function cancelQueuedPrompt(bot: Bot, { threadId, inboxID }: { thre
 export async function clearQueue(
   bot: Bot,
   { threadId, position }: { threadId: string; position?: number | null },
-): Promise<OpenCodeUnavailableError | OpenCodeError | { cleared: number }> {
+): Promise<OpenCodeUnavailableError | OpenCodeError | JcodeSurfaceUnavailableError | { cleared: number }> {
+  const refused = jcodeSurfaceRefusal(bot, threadId, 'clear-queue')
+  if (refused) return refused
   const sessionId = rootSession(bot, threadId)
   if (sessionId instanceof Error) return sessionId
   const inbox = await oc(bot, 'session.inbox.list', (client) => client.session.inbox.list({ sessionID: sessionId }))
@@ -271,6 +279,13 @@ export async function abort(bot: Bot, { threadId }: { threadId: string }) {
   const sessionId = rootSession(bot, threadId)
   if (sessionId instanceof Error) return sessionId
   await cancelSleep(bot, sessionId)
+  // Only the stop has a jcode primitive; the rest of this function is OpenCode-only
+  // and is reported as not applicable rather than attempted (jcode-surfaces.ts).
+  if (conversationBackendKind(bot, threadId) === 'jcode') {
+    const connection = jcodeConnectionOf(bot)
+    if (!connection) return new ConfigError({ reason: `Thread ${threadId} records the jcode backend, but this bot runs no jcode connection to cancel over` })
+    return abortJcode(connection)
+  }
   const cleared = await clearQueue(bot, { threadId })
   if (cleared instanceof Error) return cleared
   const cancelled = await cancelPendingUi(bot, threadId)
@@ -314,6 +329,8 @@ export async function requeueEdited(
 // queued. The request returns only when the command ends, so it is never
 // awaited; output arrives as session.shell.* events.
 export function shell(bot: Bot, { threadId, sessionId, command }: { threadId: string; sessionId: string; command: string }) {
+  const refused = jcodeSurfaceRefusal(bot, threadId, 'shell')
+  if (refused) return refused
   const client = bot.opencode.endpoint?.client
   if (!client) return new OpenCodeUnavailableError({ reason: 'not connected' })
   void client.session
@@ -355,6 +372,8 @@ async function command(
     echo?: string
   },
 ): Promise<OpenCodeUnavailableError | OpenCodeError | Error | void> {
+  const refused = jcodeSurfaceRefusal(bot, input.threadId, 'command')
+  if (refused) return refused
   const { route } = input
   const commands = await oc(bot, 'command.list', (client) => client.command.list({ location: { directory: input.directory } }))
   if (commands instanceof Error) return commands
@@ -550,6 +569,8 @@ const revertFiles = false
 
 // Hides the last turn. Repeating goes one turn further back.
 export async function undo(bot: Bot, { threadId }: { threadId: string }) {
+  const refused = jcodeSurfaceRefusal(bot, threadId, 'undo')
+  if (refused) return refused
   const session = await idleSession(bot, threadId)
   if (session instanceof Error) return session
   const { messages } = session
@@ -565,6 +586,8 @@ export async function undo(bot: Bot, { threadId }: { threadId: string }) {
 
 // One turn forward again; past the last turn the revert is cleared.
 export async function redo(bot: Bot, { threadId }: { threadId: string }) {
+  const refused = jcodeSurfaceRefusal(bot, threadId, 'redo')
+  if (refused) return refused
   const session = await idleSession(bot, threadId)
   if (session instanceof Error) return session
   if (!session.revert) return { restored: 'nothing' as const }
