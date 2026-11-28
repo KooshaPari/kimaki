@@ -65,6 +65,13 @@ starts (`src/ingest-injection.test.ts`, `src/observe-restart-witness.test.ts` "A
 in isolation and failed in a full-suite run. Baseline proof: a detached worktree of `0f188987` with
 none of the six surface files present fails the same four.
 
+Second host caveat, and the reason two lanes nearly shipped a regression (2026-11-28): every jcode
+end-to-end suite SKIPS its real-binary cases when `JCODE_BIN` is unset, so a green summary without
+that variable proves nothing about the jcode path. `JCODE_BIN=/home/kooshapari/.local/bin/jcode` is
+mandatory on any run whose result is going to be quoted as evidence. The cost of missing it is
+concrete: `5981d69c` passed its author's suites because they were skipped and broke three live
+turns in `src/jcode-thread.e2e.test.ts`, fixed in `2bf73517`.
+
 
 ## 0. Method and measured facts
 
