@@ -24,10 +24,38 @@ import {
 import type { IntegrationInfo } from '@opencode/client'
 
 import { oc, type Bot } from '../bot.ts'
+import { formatJcodeCredentialReport, readJcodeCredentials, type JcodeCredentialSnapshot } from '../jcode-credentials.ts'
 import { ConfigError, DbError } from '../errors.ts'
 import { button, buttonRow, paginate, SELECT_PAGE_SIZE, selectedPage, selectRow } from '../format-parts.ts'
 import { replyError, resolveTarget, type InteractionRoutes } from '../interaction-context.ts'
 import { handleTranscriptionKeyModal, TRANSCRIPTION_KEY_MODAL, transcriptionKeyModal } from '../voice.ts'
+
+const LOGIN_BASE = 'Connect a provider. Credentials are stored by OpenCode, not Kimaki.'
+const JCODE_LOGIN_BASE = 'Connect a provider. Jcode holds its own credentials; Kimaki never copies them.'
+
+type LoginIntroBot = Pick<Bot, 'backendKind' | 'jcodeStore'>
+type JcodeCredentialReader = (input: Parameters<typeof readJcodeCredentials>[0]) => Promise<
+  JcodeCredentialSnapshot | Error
+>
+
+// The Discord /login preamble. Kept separate from the wizard so the jcode
+// addition is testable without starting a bot or a Discord connection.
+export async function loginIntro(
+  bot: LoginIntroBot,
+  read: JcodeCredentialReader = readJcodeCredentials,
+): Promise<string> {
+  if (bot.backendKind !== 'jcode') return LOGIN_BASE
+  // Use the same binary/home the bot's jcode backend uses, never a different
+  // store. A named failure is still shown: the user needs to know the read did
+  // not happen, not a silently missing report.
+  const env = bot.jcodeStore.home ? { ...process.env, JCODE_HOME: bot.jcodeStore.home } : process.env
+  const result = await read({ binary: bot.jcodeStore.binary ?? process.env['JCODE_BIN'] ?? 'jcode', env })
+  if (result instanceof Error) {
+    const detail = result.message.slice(0, 900)
+    return `${JCODE_LOGIN_BASE}\n\nJcode credential read unavailable (${result.constructor.name}): ${detail}`
+  }
+  return `${JCODE_LOGIN_BASE}\n\n${formatJcodeCredentialReport(result, 1500)}`
+}
 
 type LoginWizard = { userId: string; directory: string; provider: IntegrationInfo | null; expires: number; attempt?: string }
 
@@ -181,8 +209,9 @@ export function createLoginRoutes(): InteractionRoutes {
     const options = await providers(bot, target.directory)
     if (options instanceof Error) return replyError(interaction, options)
     const id = remember({ userId: interaction.user.id, directory: target.directory, provider: null, expires: Date.now() + TTL })
+    const intro = await loginIntro(bot)
     await interaction.editReply({
-      content: 'Connect a provider. Credentials are stored by OpenCode, not Kimaki.',
+      content: intro,
       components: [selectRow({ customId: `login_provider:${id}`, placeholder: 'Provider', options: paginate(options, 0) })],
     })
   }
