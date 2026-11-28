@@ -85,7 +85,7 @@ const sendFields = {
   notifyOnly: z.boolean({ error: 'notifyOnly must be boolean' }).optional(),
   // Seconds the CLI waits for the run (`--wait [seconds]`): a run that ends within them sends no coordinator note.
   wait: z.number({ error: 'wait must be a number of seconds' }).positive({ error: 'wait must be a positive number of seconds' }).optional(),
-  // OPENCODE_SESSION_ID of the shell that ran `kimaki send`: a coordinator wakes when the runs it prompted end.
+  // KIMAKI_SESSION_ID of the shell that ran `kimaki send` (legacy name read for one release): a coordinator wakes when the runs it prompted end.
   senderSessionId: text('senderSessionId').optional(),
   permissions: z.array(z.string(), { error: 'Permission rules must be strings' }).optional(),
   prompt: text('prompt'),
@@ -196,7 +196,7 @@ function localSession(bot: Bot, input: { sessionId?: string; threadId?: string }
 function sessionOf(bot: Bot, input: { sessionId?: string; threadId?: string }) {
   if (input.sessionId) return input.sessionId
   const root = input.threadId ? bot.store.getState().roots[input.threadId] : undefined
-  if (!root) return new ConfigError({ reason: 'No local session. Use --session or run inside an OpenCode session.' })
+  if (!root) return new ConfigError({ reason: 'No local session. Use --session or run inside an agent session.' })
   return root
 }
 
@@ -311,6 +311,9 @@ export const lockRoutes = {
         mode: bot.token.includes(':') ? 'gateway' as const : 'self_hosted' as const,
         analytics: bot.analytics.enabled,
         opencode: { connected: bot.opencode.connected, url: endpoint?.url ?? null, version: endpoint?.version ?? null },
+        ...(bot.opencode.kind === 'jcode' && bot.opencode.sessionId === null
+          ? { jcode: { sessionId: null, deferred: true, reason: 'the bot has no session of its own yet; a thread creates one when it binds' } }
+          : {}),
         guilds: [...bot.discord.guilds.cache.values()].map((guild) => ({ id: guild.id, name: guild.name })),
       }
     },
@@ -331,9 +334,14 @@ export const lockRoutes = {
       if (!bot.supervised) {
         return new ConfigError({ reason: 'This bot was not started by the `kimaki` command, so nothing would start it again. Stop it and start it yourself.' })
       }
-      // After the response: the SIGTERM handler stops the bot and exits with this code.
+      // After the response: the bot stops and exits with this code, so the `kimaki`
+      // supervisor spawns a new one. Stop in-process rather than SIGTERM ourselves:
+      // Windows has no catchable SIGTERM, where process.kill terminates the process
+      // with exit code 1, and the supervisor reads that as a crash and exits too.
       process.exitCode = RESTART_EXIT_CODE
-      setTimeout(() => process.kill(process.pid, 'SIGTERM'), 100)
+      // No listener: `restart` arrived before the bot wired shutdown. Exiting here
+      // keeps the exit code the supervisor acts on instead of hanging at 75 forever.
+      setTimeout(() => (process.listenerCount('SIGTERM') > 0 ? process.emit('SIGTERM', 'SIGTERM') : process.exit()), 100)
       return { restarting: true, pid: process.pid }
     },
   }),

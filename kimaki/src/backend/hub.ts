@@ -1,0 +1,462 @@
+// One backend session, many clients.
+//
+// A hub owns exactly one backend session and is the only writer. Clients attach
+// as subscribers with a cursor and receive an ordered event stream, so several
+// front ends (CLI, Discord, an agent chat) can watch the same turn while only one
+// of them is allowed to prompt at a time.
+//
+// Durability, when a log path is supplied:
+// - every event is appended to a JSONL file before it is handed to subscribers
+// - a new hub restores its sequence and replay window from that file
+// - a cursor older than the in-memory window replays from the file instead of
+//   being silently clipped
+// - a lease file keeps two hubs from writing the same session at once
+//
+// Honest limits, deliberate:
+// - Ordering is per hub process, and appends are synchronous, so throughput is
+//   local-file bound rather than a database.
+// - The lease is advisory. It stops a second hub that honors it, not a foreign
+//   process that ignores the file.
+// - One prompt is in flight at a time. A second submit is refused, not queued,
+//   because Jcode offers no exclusive writer lease of its own.
+import fs from 'node:fs'
+import path from 'node:path'
+import { ConfigError } from '../errors.js'
+import type { DurableLaunchFence } from '../ops/paperclip/launch-fence-durable.js'
+
+export type HubEvent =
+  | { seq: number; type: 'session.started'; sessionId: string; model: string | null }
+  | { seq: number; type: 'prompt.started'; characters: number }
+  | { seq: number; type: 'prompt.chunk'; text: string }
+  | { seq: number; type: 'prompt.finished'; stopReason: string; characters: number }
+  | { seq: number; type: 'prompt.failed'; reason: string }
+
+/** The slice of a backend the hub needs. JcodeBackend satisfies it. */
+export type HubBackend = {
+  start(input?: { model?: string }): Promise<{ sessionId: string; model: string | null } | Error>
+  prompt(text: string, onChunk?: (text: string) => void): Promise<{ stopReason: string; text: string; updateCount: number } | Error>
+  cancel(): Promise<Error | undefined>
+  close(): Promise<void>
+}
+
+export type HubSnapshot = {
+  sessionId: string | null
+  model: string | null
+  busy: boolean
+  seq: number
+  subscribers: number
+  /** Attached clients with the last sequence each has acknowledged. */
+  clients: Array<{ clientId: string; acked: number }>
+  durable: boolean
+}
+
+export type HubSubscription = {
+  /** Server-assigned or caller-supplied identity of this attachment. */
+  clientId: string
+  /** Next cursor to pass on reconnect. */
+  cursor: number
+  /** True when the requested cursor predates every source the hub can read. */
+  clipped: boolean
+  /** Where the replayed events came from. */
+  source: 'none' | 'buffer' | 'log'
+  unsubscribe(): void
+}
+
+export const hubCapabilities = Object.freeze({
+  multiClientStream: true,
+  singleWriter: true,
+  replayBuffer: true,
+  durableLog: true,
+  writerLease: true,
+  crossProcessLog: false,
+} as const)
+
+export type SessionHub = {
+  capabilities: typeof hubCapabilities
+  start(): Promise<{ sessionId: string; model: string | null } | Error>
+  submit(text: string, options?: { requestId?: string }): Promise<{ accepted: true; characters: number; duplicate: boolean } | Error>
+  cancel(): Promise<Error | undefined>
+  subscribe(input: { cursor?: number; clientId?: string; onEvent: (event: HubEvent) => void }): HubSubscription | Error
+  /** Record the last sequence a client has processed. Monotonic, per client. */
+  ack(input: { clientId: string; seq: number }): { acked: number } | Error
+  snapshot(): HubSnapshot
+  close(): Promise<void>
+}
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  value !== null && typeof value === 'object' && !Array.isArray(value)
+
+const parseEvent = (line: string): HubEvent | undefined => {
+  try {
+    const value: unknown = JSON.parse(line)
+    if (!isRecord(value) || typeof value['seq'] !== 'number' || typeof value['type'] !== 'string') return undefined
+    return value as HubEvent
+  } catch {
+    return undefined
+  }
+}
+
+function readLog(logFile: string): HubEvent[] {
+  let text: string
+  try {
+    text = fs.readFileSync(logFile, 'utf8')
+  } catch {
+    return []
+  }
+  const events: HubEvent[] = []
+  for (const line of text.split('\n')) {
+    if (!line.trim()) continue
+    const event = parseEvent(line)
+    // A torn or hand-edited line is skipped rather than failing the whole replay.
+    if (event) events.push(event)
+  }
+  return events
+}
+
+function readAcks(acksFile: string): Record<string, number> {
+  try {
+    const parsed: unknown = JSON.parse(fs.readFileSync(acksFile, 'utf8'))
+    if (!isRecord(parsed)) return {}
+    const acks: Record<string, number> = {}
+    for (const [clientId, value] of Object.entries(parsed)) {
+      if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) acks[clientId] = value
+    }
+    return acks
+  } catch {
+    // A missing or torn ack file just means nothing is remembered yet.
+    return {}
+  }
+}
+
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM'
+  }
+}
+
+function acquireLease(leaseFile: string): ConfigError | undefined {
+  const payload = JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() })
+  try {
+    fs.mkdirSync(path.dirname(leaseFile), { recursive: true })
+    fs.writeFileSync(leaseFile, payload, { flag: 'wx' })
+    return undefined
+  } catch (cause) {
+    let holder: unknown
+    try {
+      holder = JSON.parse(fs.readFileSync(leaseFile, 'utf8'))
+    } catch {
+      holder = undefined
+    }
+    const pid = isRecord(holder) && typeof holder['pid'] === 'number' ? holder['pid'] : undefined
+    // A live holder always wins, including another hub inside this same process.
+    // Only a dead pid, or an unreadable lease file, may be taken over.
+    if (pid !== undefined && pidAlive(pid)) {
+      return new ConfigError({ reason: `Another hub holds this session lease (pid ${pid})` })
+    }
+    try {
+      fs.writeFileSync(leaseFile, payload)
+      return undefined
+    } catch (takeoverCause) {
+      return new ConfigError({ reason: 'Cannot take over a stale hub lease', cause: takeoverCause ?? cause })
+    }
+  }
+}
+
+export function createSessionHub({
+  backend,
+  bufferLimit = 500,
+  model,
+  logFile,
+  leaseFile,
+  launchTimeoutMs = 30_000,
+  launchFence,
+}: {
+  backend: HubBackend
+  bufferLimit?: number
+  model?: string
+  /** Append-only JSONL event log. Enables durability and resume across restarts. */
+  logFile?: string
+  /** Advisory writer lease. Defaults to `<logFile>.lock` when a log is configured. */
+  leaseFile?: string
+  /** Bound on a managed launch that never acknowledges the session. */
+  launchTimeoutMs?: number
+  /**
+   * Optional durable Paperclip claim, taken before the backend is spawned and
+   * released on any failed launch. Additive: the advisory writer lease above is
+   * unchanged and both fences apply.
+   */
+  launchFence?: { fence: DurableLaunchFence; scope: { instanceId: string; runId: string }; launcher: string } | undefined
+}): SessionHub | ConfigError {
+  if (!Number.isSafeInteger(bufferLimit) || bufferLimit < 1) {
+    return new ConfigError({ reason: 'Hub bufferLimit must be a positive integer' })
+  }
+  if (!Number.isSafeInteger(launchTimeoutMs) || launchTimeoutMs < 1) {
+    return new ConfigError({ reason: 'Hub launchTimeoutMs must be a positive integer' })
+  }
+  const leasePath = leaseFile ?? (logFile === undefined ? undefined : `${logFile}.lock`)
+  if (leasePath !== undefined) {
+    const leased = acquireLease(leasePath)
+    if (leased instanceof Error) return leased
+  }
+
+  const restored = logFile === undefined ? [] : readLog(logFile)
+  let seq = restored.length > 0 ? restored[restored.length - 1]!.seq : 0
+  const buffer: HubEvent[] = restored.slice(-bufferLimit)
+  // Acknowledgements survive a restart only when the stream itself is durable.
+  const acksFile = logFile === undefined ? undefined : `${logFile}.acks.json`
+  const persistedAcks = acksFile === undefined ? {} : readAcks(acksFile)
+  const persistAck = (clientId: string, acked: number): void => {
+    if (acksFile === undefined) return
+    const next = { ...persistedAcks, [clientId]: acked }
+    try {
+      fs.mkdirSync(path.dirname(acksFile), { recursive: true })
+      fs.writeFileSync(acksFile, JSON.stringify(next))
+      persistedAcks[clientId] = acked
+    } catch {
+      // Losing the ack file degrades resume, it does not break the stream.
+    }
+  }
+  let started = false
+  let busy = false
+  let closed = false
+  let sessionId: string | null = null
+  let selectedModel: string | null = null
+  const subscribers = new Map<string, { deliver: (event: HubEvent) => void; acked: number }>()
+  const receipts = new Map<string, { characters: number; startedSeq: number }>()
+
+  // A restored log means the session may already exist; reuse its identity.
+  for (const event of restored) {
+    if (event.type === 'session.started') {
+      started = true
+      sessionId = event.sessionId
+      selectedModel = event.model
+    }
+  }
+
+  const persist = (event: HubEvent): void => {
+    if (logFile === undefined) return
+    try {
+      fs.mkdirSync(path.dirname(logFile), { recursive: true })
+      fs.appendFileSync(logFile, `${JSON.stringify(event)}\n`)
+    } catch {
+      // Losing the log must not break a live turn; the stream still flows.
+    }
+  }
+
+  const publish = (make: (seq: number) => HubEvent): HubEvent => {
+    seq += 1
+    const event = make(seq)
+    persist(event)
+    buffer.push(event)
+    while (buffer.length > bufferLimit) buffer.shift()
+    for (const [clientId, subscriber] of subscribers) {
+      try {
+        subscriber.deliver(event)
+      } catch {
+        // A broken client must not stop the turn or the other clients.
+        subscribers.delete(clientId)
+      }
+    }
+    return event
+  }
+
+  // A managed launch can die after the process is spawned but before the session
+  // is acknowledged. Two shapes have to be turned into a failed start:
+  // - a throw/rejection from the backend, preserved so callers see the crash itself
+  // - a wait that never resolves because the exit was not observed (a transport
+  //   still waiting for an ACK from a process that is already gone), bounded here
+  // A launch that never produced a session ID is never a session.
+  const launch = async (): Promise<{ sessionId: string; model: string | null } | Error> => {
+    // Cross-process exclusion first: a competing launcher for this run is refused
+    // here, before any process is spawned, rather than after.
+    const fence = launchFence
+    let fenced: number | undefined
+    if (fence !== undefined) {
+      const claimed = fence.fence.claim({ scope: fence.scope, launcher: fence.launcher })
+      if (claimed instanceof ConfigError) return claimed
+      fenced = claimed.record.generation
+    }
+    // A launch that never produced a session must not keep the run fenced.
+    const release = (): void => {
+      if (fence === undefined || fenced === undefined) return
+      fence.fence.release({ scope: fence.scope, launcher: fence.launcher, generation: fenced })
+      fenced = undefined
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const deadline = new Promise<Error>((resolve) => {
+      timer = setTimeout(() => {
+        resolve(new ConfigError({ reason: `Backend launch did not acknowledge the session within ${launchTimeoutMs}ms` }))
+      }, launchTimeoutMs)
+      timer.unref?.()
+    })
+    try {
+      const outcome = await Promise.race([backend.start(model === undefined ? undefined : { model }), deadline])
+      if (outcome instanceof Error) {
+        release()
+        return outcome
+      }
+      const started = outcome as { sessionId?: unknown; model?: unknown }
+      if (typeof started.sessionId !== 'string' || !started.sessionId.trim()) {
+        release()
+        return new ConfigError({ reason: 'Backend launch returned no session ID before acknowledging the session' })
+      }
+      return { sessionId: started.sessionId, model: typeof started.model === 'string' ? started.model : null }
+    } catch (cause) {
+      release()
+      if (cause instanceof Error) return cause
+      return new ConfigError({ reason: 'Backend launch crashed before acknowledging the session', cause })
+    } finally {
+      if (timer !== undefined) clearTimeout(timer)
+    }
+  }
+
+  const start = async (): Promise<{ sessionId: string; model: string | null } | Error> => {
+    if (closed) return new ConfigError({ reason: 'Hub is closed' })
+    if (started && sessionId) return { sessionId, model: selectedModel }
+    const result = await launch()
+    if (result instanceof Error) return result
+    started = true
+    sessionId = result.sessionId
+    selectedModel = result.model
+    publish((value) => ({ seq: value, type: 'session.started', sessionId: result.sessionId, model: result.model }))
+    return result
+  }
+
+  const snapshot = (): HubSnapshot => ({
+    sessionId,
+    model: selectedModel,
+    busy,
+    seq,
+    subscribers: subscribers.size,
+    clients: [...subscribers].map(([clientId, entry]) => ({ clientId, acked: entry.acked })),
+    durable: logFile !== undefined,
+  })
+
+  const subscribe = ({ cursor, clientId, onEvent }: { cursor?: number; clientId?: string; onEvent: (event: HubEvent) => void }): HubSubscription | Error => {
+    if (typeof onEvent !== 'function') return new ConfigError({ reason: 'Hub subscription needs an onEvent callback' })
+    const wanted = cursor ?? 0
+    if (!Number.isSafeInteger(wanted) || wanted < 0) return new ConfigError({ reason: 'Hub cursor must be a non-negative integer' })
+    if (wanted > seq) return new ConfigError({ reason: 'Hub cursor is ahead of the stream' })
+    const identity = clientId?.trim() ? clientId.trim() : globalThis.crypto.randomUUID()
+    if (subscribers.has(identity)) return new ConfigError({ reason: `Client ${identity} is already attached` })
+    const oldest = buffer.length > 0 ? buffer[0]!.seq : seq + 1
+    const needsDisk = wanted + 1 < oldest
+    let source: HubSubscription['source'] = 'none'
+    let clipped = false
+
+    // Replay oldest first: the log covers what the buffer dropped, then the
+    // buffer covers the rest, so subscribers always see ascending sequence
+    // numbers. Everything replays before registering, so a slow replay cannot
+    // interleave with live events.
+    if (needsDisk) {
+      if (logFile === undefined) {
+        clipped = true
+      } else {
+        for (const event of readLog(logFile)) {
+          if (event.seq > wanted && event.seq < oldest) {
+            onEvent(event)
+            source = 'log'
+          }
+        }
+      }
+    }
+    for (const event of buffer) {
+      if (event.seq > wanted) {
+        onEvent(event)
+        if (source === 'none') source = 'buffer'
+      }
+    }
+
+    const entry = { deliver: onEvent, acked: Math.min(seq, Math.max(wanted, persistedAcks[identity] ?? 0)) }
+    subscribers.set(identity, entry)
+    return {
+      clientId: identity,
+      cursor: seq,
+      clipped,
+      source,
+      unsubscribe: () => {
+        subscribers.delete(identity)
+      },
+    }
+  }
+
+  const ack = ({ clientId, seq: acked }: { clientId: string; seq: number }): { acked: number } | Error => {
+    if (closed) return new ConfigError({ reason: 'Hub is closed' })
+    if (typeof clientId !== 'string' || !clientId.trim()) return new ConfigError({ reason: 'Hub ack needs a client ID' })
+    if (!Number.isSafeInteger(acked) || acked < 0) return new ConfigError({ reason: 'Hub ack cursor must be a non-negative integer' })
+    if (acked > seq) return new ConfigError({ reason: 'Hub ack is ahead of the stream' })
+    const entry = subscribers.get(clientId)
+    if (entry === undefined) return new ConfigError({ reason: `Client ${clientId} is not attached` })
+    // Monotonic: a stale ack from a reconnecting client must not move it backwards.
+    if (acked > entry.acked) {
+      entry.acked = acked
+      persistAck(clientId, acked)
+    }
+    return { acked: entry.acked }
+  }
+
+  const submit = async (text: string, options?: { requestId?: string }): Promise<{ accepted: true; characters: number; duplicate: boolean } | Error> => {
+    if (closed) return new ConfigError({ reason: 'Hub is closed' })
+    if (typeof text !== 'string' || !text.trim()) return new ConfigError({ reason: 'Hub prompt text must be non-empty' })
+    const requestId = options?.requestId?.trim()
+    if (requestId !== undefined && requestId.length > 0) {
+      const seen = receipts.get(requestId)
+      if (seen !== undefined) {
+        // A repeat of the same request refers to the existing receipt rather than
+        // starting a second turn. Different text under one id is a conflict.
+        if (seen.characters !== text.length) {
+          return new ConfigError({ reason: `Request ${requestId} was already admitted with different text` })
+        }
+        return { accepted: true, characters: seen.characters, duplicate: true }
+      }
+    }
+    if (busy) return new ConfigError({ reason: 'A prompt is already running in this session' })
+    const ready = await start()
+    if (ready instanceof Error) return ready
+    busy = true
+    const startedSeq = seq + 1
+    if (requestId !== undefined && requestId.length > 0) receipts.set(requestId, { characters: text.length, startedSeq })
+    publish((value) => ({ seq: value, type: 'prompt.started', characters: text.length }))
+    // The turn runs detached so callers can return immediately and watch events.
+    void (async () => {
+      try {
+        const result = await backend.prompt(text, (chunk) => {
+          publish((value) => ({ seq: value, type: 'prompt.chunk', text: chunk }))
+        })
+        if (result instanceof Error) {
+          publish((value) => ({ seq: value, type: 'prompt.failed', reason: result.message }))
+        } else {
+          publish((value) => ({ seq: value, type: 'prompt.finished', stopReason: result.stopReason, characters: result.text.length }))
+        }
+      } finally {
+        busy = false
+      }
+    })()
+    return { accepted: true, characters: text.length, duplicate: false }
+  }
+
+  const cancel = async (): Promise<Error | undefined> => {
+    if (closed) return new ConfigError({ reason: 'Hub is closed' })
+    if (!busy) return undefined
+    return backend.cancel()
+  }
+
+  const close = async (): Promise<void> => {
+    if (closed) return
+    closed = true
+    subscribers.clear()
+    await backend.close()
+    if (leasePath !== undefined) {
+      try {
+        fs.rmSync(leasePath, { force: true })
+      } catch {
+        // A lease we cannot remove is reported by the next hub, not swallowed here.
+      }
+    }
+  }
+
+  return { capabilities: hubCapabilities, start, submit, cancel, subscribe, ack, snapshot, close }
+}

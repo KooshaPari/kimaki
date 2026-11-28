@@ -10,14 +10,87 @@ import { setTimeout as sleep } from 'node:timers/promises'
 import dedent from 'string-dedent'
 import { wrapJsonSchema, type Goke } from 'goke'
 
+import { BOT_BACKENDS, BOT_BACKEND_CHOICES, DEFAULT_BOT_BACKEND, exportRequiredFailure, legacyOpencodeCheckFailure, shouldCheckOpencode, type BotBackend } from '../backend-selection.ts'
+import { backendPlan } from '../thread-backend.ts'
+export { BOT_BACKENDS, BOT_BACKEND_CHOICES, DEFAULT_BOT_BACKEND, shouldCheckOpencode, type BotBackend } from '../backend-selection.ts'
 import { distCliEntry, removeAutostartScript, stableNodePath, writeAutostartScript } from '../autostart.ts'
 import { parseDisabledPromptSections, parseDisabledSkills, PROMPT_SECTIONS } from '../builtin-skills.ts'
 import { callBot, DEFAULT_LOCK_PORT, RESTART_EXIT_CODE, startLockServer } from '../lock-server.ts'
+import { ConfigError } from '../errors.ts'
 import { parseDuration } from '../duration.ts'
 import { createLogger, setLogFile } from '../logger.ts'
 import { action, DATA_DIR_HELP, dataDirOrDefault, discordApi, fail, openCliDb, printJson } from './shared.ts'
 
 const logger = createLogger('CLI')
+
+// Bot backend types and the OpenCode preflight policy come from
+// backend-selection.ts so tests can import them without this module's heavy graph.
+// The environment half of the selection. A flag wins over it, and a refusal names
+// whichever surface the operator actually used, so a bad env var is not reported as
+// a bad flag.
+export const BOT_BACKEND_ENV = 'KIMAKI_BACKEND'
+
+// Root-command options that only the OpenCode path can honor: they configure
+// OpenCode sessions, their skills and prompts, coordinator threads, or voice
+// (which reads OpenCode credentials and config). The Jcode observer has no
+// equivalent, so passing one with --backend jcode is refused instead of ignored.
+export const OPENCODE_ONLY_OPTIONS = ['--worktrees', '--disable-skills', '--disable-prompt', '--coordinator', '--voice'] as const
+
+// Reads an explicitly passed option without relying on goke's parsed defaults, so
+// an option that defaults to on (--coordinator) only counts when the operator
+// actually typed it. Handles both `--flag value` and `--flag=value`.
+function explicitOption(argv: readonly string[], flag: string): { present: boolean; value?: string } {
+  const prefix = `${flag}=`
+  for (let index = 0; index < argv.length; index++) {
+    const arg = argv[index]
+    if (arg === undefined) continue
+    if (arg === flag) {
+      const next = argv[index + 1]
+      if (next !== undefined && !next.startsWith('-')) return { present: true, value: next }
+      return { present: true }
+    }
+    if (arg.startsWith(prefix)) return { present: true, value: arg.slice(prefix.length) }
+  }
+  return { present: false }
+}
+
+// Pure so the refusal can be tested without spawning a child or touching Discord.
+// Returns the resolved backend, or a ConfigError the caller fails with before any
+// supervisor child, lock port, database or Discord connection starts.
+export function resolveBotBackend({ backend, argv, env = process.env }: {
+  backend: string | undefined
+  argv: readonly string[]
+  env?: Readonly<Record<string, string | undefined>>
+}): ConfigError | { backend: BotBackend; source: 'flag' | 'env' | 'default' } {
+  const fromEnv = env[BOT_BACKEND_ENV]?.trim()
+  const source: 'flag' | 'env' | 'default' = backend !== undefined ? 'flag' : fromEnv !== undefined && fromEnv !== '' ? 'env' : 'default'
+  const requested = backend ?? (source === 'env' ? fromEnv! : DEFAULT_BOT_BACKEND)
+  if (!(BOT_BACKENDS as readonly string[]).includes(requested)) {
+    const surface = source === 'env' ? BOT_BACKEND_ENV : '--backend'
+    return new ConfigError({ reason: `Unknown ${surface} ${JSON.stringify(requested)}. Use one of: ${BOT_BACKEND_CHOICES}` })
+  }
+  if (requested === 'opencode') return { backend: 'opencode', source }
+  const conflicts = OPENCODE_ONLY_OPTIONS.filter((flag) => {
+    const found = explicitOption(argv, flag)
+    if (!found.present) return false
+    // A jcode bot has no coordinator either, so `--coordinator false` asks for
+    // exactly what jcode does. Every other form turns an OpenCode feature on.
+    if (flag === '--coordinator' && found.value === 'false') return false
+    return true
+  })
+  if (conflicts.length > 0) {
+    // Name the surface that actually selected jcode, so a bare start is not told
+    // to "drop --backend jcode" it never passed. The refusal stays loud: a flag
+    // with no jcode equivalent is not silently ignored.
+    const subject = source === 'flag' ? '--backend jcode' : source === 'env' ? `${BOT_BACKEND_ENV}=jcode` : 'The default backend (jcode)'
+    const remove = `Remove ${conflicts.length === 1 ? 'it' : 'them'}`
+    const advice = source === 'flag' ? `${remove}, or drop --backend jcode` : source === 'env' ? `${remove}, or unset ${BOT_BACKEND_ENV} to keep it.` : `${remove}, or pass --backend opencode.`
+    return new ConfigError({
+      reason: `${subject} cannot use ${conflicts.join(', ')}: ${conflicts.length === 1 ? 'it is an OpenCode-only option' : 'they are OpenCode-only options'} with no jcode equivalent. ${advice}`,
+    })
+  }
+  return { backend: 'jcode', source }
+}
 
 // null when the file vanished meanwhile (bot restart).
 async function readRange({ file, start, end }: { file: string; start: number; end: number }): Promise<Buffer | null> {
@@ -83,6 +156,7 @@ async function supervise(): Promise<never> {
 export function registerStartCommand(cli: Goke) {
   cli.command('', 'Start the bot. Runs onboarding on first start')
     .option('--data-dir <path>', DATA_DIR_HELP)
+    .option('--backend <name>', 'Bot backend: jcode (default) or opencode. jcode drives a native Jcode session and needs no OpenCode install; opencode keeps the existing OpenCode path. KIMAKI_BACKEND sets the same choice when the flag is absent')
     .option('-g, --guild <guildId>', 'Server to onboard when the bot is in several')
     .option('--gateway', 'Use the shared Kimaki bot, no Discord app needed')
     .option('--gateway-callback-url <url>', 'Redirect here after the gateway install (appends ?guild_id=<id>)')
@@ -96,9 +170,34 @@ export function registerStartCommand(cli: Goke) {
     .option('--disable-prompt <section>', wrapJsonSchema<string[]>({ type: 'array', items: { type: 'string' }, description: `System prompt section to remove from new sessions (repeatable): ${PROMPT_SECTIONS.join(', ')}` }))
     .option('--no-analytics', 'Disable anonymous usage analytics (same as KIMAKI_STRADA_ENABLED=0)')
     .option('--coordinator [enabled]', wrapJsonSchema<boolean>({ type: 'boolean', default: true, description: 'Channel messages go to one long coordinator session that starts threads for the work. "false" turns it off (/toggle-coordinator sets one channel)' }))
-    .option('--no-autostart', 'Do not open a terminal with the bot when OpenCode starts (for bots run by launchd, systemd or pm2)')
+    .option('--no-autostart', 'Do not open a terminal with the bot when the agent service starts (for bots run by launchd, systemd or pm2)')
     .option('--if-not-running', 'Start only if no bot runs; never stop the running one (used by autostart)')
     .action(async (options) => {
+      // Before the supervisor child (which spawns this same argv) and before any
+      // Discord or database work, so a bad flag never leaves a process behind.
+      const backendChoice = resolveBotBackend({ backend: options.backend, argv: process.argv })
+      if (backendChoice instanceof Error) fail(backendChoice)
+      const backend = backendChoice.backend
+      // Phase 2 gate: before the lock, SQLite and Discord, a jcode start must
+      // prove that persisted OpenCode threads were exported or abandoned. The
+      // records live in kimaki's db, so reading them also migrates the additive
+      // table on this start; no record is ever written by startup itself.
+      const gate = await (async () => {
+        if (backend === 'opencode') return null
+        const { openDb } = await import('../db.ts')
+        const { abandonedNotice, startupOpencodeDisposition } = await import('../opencode-disposition.ts')
+        const opened = await openDb({ dataDir: dataDirOrDefault(options.dataDir), migrate: true })
+        if (opened instanceof Error) return opened
+        const disposition = await startupOpencodeDisposition({ db: opened.db, backend })
+        opened.close()
+        if (disposition instanceof Error) return disposition
+        if (disposition.kind === 'proceed' && disposition.reason === 'abandoned' && disposition.legacyThreadCount > 0) {
+          process.stderr.write(`${abandonedNotice(disposition.legacyThreadCount)}\n`)
+        }
+        return disposition
+      })()
+      if (gate instanceof Error) fail(gate)
+      if (gate?.kind === 'export-required') fail(exportRequiredFailure({ source: backendChoice.source, legacyThreadCount: gate.legacyThreadCount }))
       // The IPC check ignores a KIMAKI_SUPERVISED leaked into a shell by an older bot.
       if (process.env['KIMAKI_SUPERVISED'] !== '1' || !process.connected) return supervise()
       // OpenCode and agent shells inherit process.env: a bot started from a
@@ -179,11 +278,19 @@ export function registerStartCommand(cli: Goke) {
       const opened = await openDb({ dataDir, migrate: true })
       if (opened instanceof Error) failStartup(opened)
 
-      // Before onboarding: without OpenCode the bot cannot start, so fail (or install it) before the Discord install.
-      const opencodeCheck = await ensureOpencode({ serviceFile: process.env['KIMAKI_OPENCODE_SERVICE_FILE'] })
-      if (opencodeCheck instanceof Error) {
-        opened.close()
-        failStartup(opencodeCheck)
+      // Before onboarding: without OpenCode the OpenCode backend cannot start, so fail
+      // (or install it) before the Discord install. The jcode backend needs no OpenCode,
+      // except when persisted threads still belong to OpenCode (Phase 1.5).
+      // Only rows whose backend is opencode need the OpenCode preflight. Counting every
+      // row would make a bot whose threads are all jcode refuse to start over OpenCode.
+      const persistedRows = await opened.db.query.thread_sessions.findMany({ columns: { thread_id: true, backend: true } })
+      const legacyThreadCount = backendPlan(persistedRows).opencodeThreads
+      if (shouldCheckOpencode({ backend, legacyThreadCount })) {
+        const opencodeCheck = await ensureOpencode({ serviceFile: process.env['KIMAKI_OPENCODE_SERVICE_FILE'], legacyThreadCount })
+        if (opencodeCheck instanceof Error) {
+          opened.close()
+          failStartup(legacyOpencodeCheckFailure({ backend, source: backendChoice.source, legacyThreadCount, error: opencodeCheck }))
+        }
       }
 
       startCaffeinate()
@@ -218,7 +325,8 @@ export function registerStartCommand(cli: Goke) {
         discordRestUrl: restApiUrl(credentials),
         lock,
         opencodeServiceFile: process.env['KIMAKI_OPENCODE_SERVICE_FILE'],
-        ensureOpencode: true,
+        ensureOpencode: backend === 'opencode',
+        ...(backend === 'jcode' ? { backend: { kind: 'jcode' as const } } : {}),
         opencodeConfigDir: opencodeConfigDir(),
         opencodeDbFile: opencodeDbFile(),
         analytics: createAnalytics({ dataDir, botMode: credentials.mode, enabled: !options.noAnalytics }),
@@ -229,9 +337,19 @@ export function registerStartCommand(cli: Goke) {
         coordinator: options.coordinator,
       })
       if (bot instanceof Error) failStartup(bot)
+      // Opt-in hub mirror: with no persisted binding this is a no-op, so a plain
+      // start behaves exactly as before. A bad binding is reported, never guessed
+      // at, and leaves the bot running without a view.
+      const { startViewSupervision } = await import('../ops/discord/view-supervision.ts')
+      const view = await startViewSupervision({ dataDir, rest: bot.discord.rest })
+      const viewError = view.error()
+      if (viewError) logger.warn('Discord view not started', viewError)
+      const viewBinding = view.binding()
+      if (viewBinding) logger.info(`discord view mirrors ${viewBinding.baseUrl} into channel ${viewBinding.channelId}`)
+      // The view stops first: it only needs the REST client, which bot.stop() destroys.
       // exit() keeps process.exitCode: the restart route sets RESTART_EXIT_CODE before its SIGTERM.
       const shutdown = () => {
-        void bot.stop().then(() => process.exit())
+        void view.stop().then(() => bot.stop()).then(() => process.exit())
       }
       process.once('SIGTERM', shutdown)
       process.once('SIGINT', shutdown)
@@ -257,6 +375,10 @@ export function registerStartCommand(cli: Goke) {
         if (removed instanceof Error) logger.warn('cannot remove the autostart script', removed)
       } else if (lock.port === DEFAULT_LOCK_PORT) {
         const autostart = await writeAutostartScript({ dataDir, args: [
+          // Always explicit: the script outlives the start that wrote it, so an
+          // opencode bot must not be restarted as the default backend after the
+          // Phase 1 default becomes jcode.
+          '--backend', backend,
           ...(options.worktrees ? ['--worktrees'] : []),
           ...(options.allowAllUsers ? ['--allow-all-users'] : []),
           ...(options.disableSkills ? ['--disable-skills', options.disableSkills] : []),
@@ -273,9 +395,9 @@ export function registerStartCommand(cli: Goke) {
 
 // login, login credential: OpenCode provider credentials through the bot.
 export function registerLoginCommands(cli: Goke) {
-  cli.command('login <provider>', 'Connect a provider using OpenCode integration credentials')
+  cli.command('login <provider>', 'Connect a provider using integration credentials')
     .option('--data-dir <path>', DATA_DIR_HELP)
-    .option('--key <key>', 'API key to store in OpenCode')
+    .option('--key <key>', 'API key to store for the provider')
     .option('--method <id>', 'OAuth method ID; without flags, list login methods')
     .option('--attempt <id>', 'Check or complete this native OAuth attempt')
     .option('--code <code>', 'Authorization code for the attempt')
@@ -286,12 +408,25 @@ export function registerLoginCommands(cli: Goke) {
       } })
     })
 
-  cli.command('login credential <id>', 'Activate, remove, or label an OpenCode credential')
+  cli.command('login credential <id>', 'Activate, remove, or label a provider credential')
     .option('--data-dir <path>', DATA_DIR_HELP)
     .option('--operation <name>', 'activate | remove | label')
     .option('--label <text>', 'Credential label')
     .action(async (id, options) => {
       await action({ route: 'credential', dataDir: options.dataDir, input: { id, operation: options.operation ?? 'activate', label: options.label } })
+    })
+
+  // Read-only view of jcode's own provider auth state. Kimaki neither reads nor
+  // persists credentials here; the JSON output is jcode's status metadata only.
+  cli.command('auth status', 'Read jcode provider auth status as JSON (read-only)')
+    .option('--backend <name>', 'Auth backend: jcode (the only supported backend)')
+    .action(async (options) => {
+      const backend = options.backend ?? 'jcode'
+      if (backend !== 'jcode') fail(new Error(`Unsupported auth backend ${JSON.stringify(backend)}. Use --backend jcode`))
+      const { jcodeAuthStatus } = await import('../ops/jcode-auth.ts')
+      const status = await jcodeAuthStatus({})
+      if (status instanceof Error) fail(status)
+      printJson(status)
     })
 }
 
@@ -345,7 +480,7 @@ export function registerToolCommands(cli: Goke) {
 
 // status, logs, bot token / keys set / install-url
 export function registerBotCommands(cli: Goke) {
-  cli.command('status', 'Bot health: running, pid, uptime, OpenCode URL and version, guilds')
+  cli.command('status', 'Bot health: running, pid, uptime, agent service URL and version, guilds')
     .option('--data-dir <path>', DATA_DIR_HELP)
     .option('--json', 'Output as JSON')
     .action(async (options) => {
@@ -377,7 +512,7 @@ export function registerBotCommands(cli: Goke) {
       await followFile(file)
     })
 
-  cli.command('restart', 'Restart the running bot with the code on disk. Sessions keep running in OpenCode')
+  cli.command('restart', 'Restart the running bot with the code on disk. Sessions keep running in the agent service')
     .option('--data-dir <path>', DATA_DIR_HELP)
     .action(async (options) => {
       const result = await callBot({ dataDir: dataDirOrDefault(options.dataDir), route: 'restart', input: {} })
@@ -439,5 +574,83 @@ export function registerBotCommands(cli: Goke) {
       const { installUrlFor, gatewayUrlsFromEnv } = await import('../credentials.ts')
       const { credentials } = await discordApi(options.dataDir)
       process.stdout.write(`${installUrlFor({ credentials, website: gatewayUrlsFromEnv().website, callbackUrl: options.gatewayCallbackUrl })}\n`)
+    })
+
+  // The bot starts the hub mirror only for a persisted binding. These commands
+  // are explicit: the operator supplies the guild, channel and hub URL, because
+  // nothing about the bot can infer which session should be mirrored where.
+  cli.command('discord-view bind', 'Mirror one hub session into a Discord channel on every bot start')
+    .option('--data-dir <path>', DATA_DIR_HELP)
+    .option('--tenant <id>', 'Guild id the channel must belong to')
+    .option('--surface <id>', 'Channel id to post turns into')
+    .option('--url <url>', 'Hub URL, as printed by kimaki ops jcode serve')
+    .option('--client <id>', 'Client identity in hub presence (default: discord-view-<surface>)')
+    .option('--cursor <n>', 'Start from this cursor when the durable state file is missing')
+    .option('--rebind', 'Follow a live session.started that names a different session (default: refuse)')
+    .example('kimaki discord-view bind --tenant 123 --surface 456 --url http://127.0.0.1:8787')
+    .action(async (options) => {
+      const tenantId = options.tenant?.trim()
+      if (!tenantId) fail(new ConfigError({ reason: 'Supply --tenant <guildId> explicitly. The view never infers a guild' }))
+      const channelId = options.surface?.trim()
+      if (!channelId) fail(new ConfigError({ reason: 'Supply --surface <channelId> explicitly. The view never infers a channel' }))
+      const baseUrl = options.url?.trim()
+      if (!baseUrl) fail(new ConfigError({ reason: 'Supply --url <hubUrl> explicitly. The view never infers a hub' }))
+      const { viewBindingPath, writeViewBinding } = await import('../ops/discord/view-supervision.ts')
+      const dataDir = dataDirOrDefault(options.dataDir)
+      const written = await writeViewBinding({
+        dataDir,
+        binding: {
+          tenantId,
+          channelId,
+          baseUrl,
+          ...(options.client === undefined ? {} : { clientId: options.client }),
+          ...(options.cursor === undefined ? {} : { cursor: Number(options.cursor) }),
+          ...(options.rebind === true ? { rebind: true } : {}),
+        },
+      })
+      if (written instanceof Error) fail(written)
+      process.stdout.write(`Bound the Discord view to channel ${channelId} in guild ${tenantId} (${viewBindingPath(dataDir)}). Start or restart the bot to run it.\n`)
+    })
+
+  cli.command('discord-view unbind', 'Stop mirroring the hub into its channel on the next bot start')
+    .option('--data-dir <path>', DATA_DIR_HELP)
+    .action(async (options) => {
+      const { removeViewBinding, viewBindingPath } = await import('../ops/discord/view-supervision.ts')
+      const dataDir = dataDirOrDefault(options.dataDir)
+      const removed = await removeViewBinding({ dataDir })
+      if (removed instanceof Error) fail(removed)
+      process.stdout.write(removed ? `Removed ${viewBindingPath(dataDir)}\n` : `No Discord view binding at ${viewBindingPath(dataDir)}\n`)
+    })
+
+  cli.command('discord-view status', 'Print the persisted Discord view binding')
+    .option('--data-dir <path>', DATA_DIR_HELP)
+    .option('--json', 'Output as JSON')
+    .action(async (options) => {
+      const { readViewBinding, viewBindingPath, viewStatePath } = await import('../ops/discord/view-supervision.ts')
+      const dataDir = dataDirOrDefault(options.dataDir)
+      const binding = await readViewBinding({ dataDir })
+      if (binding instanceof Error) fail(binding)
+      const status = binding === null
+        ? { bound: false, path: viewBindingPath(dataDir) }
+        : {
+            bound: true,
+            path: viewBindingPath(dataDir),
+            tenantId: binding.tenantId,
+            channelId: binding.channelId,
+            baseUrl: binding.baseUrl,
+            clientId: binding.clientId ?? `discord-view-${binding.channelId}`,
+            statePath: viewStatePath({ dataDir, channelId: binding.channelId }),
+            ...(binding.cursor === undefined ? {} : { cursor: binding.cursor }),
+            rebind: binding.rebind === true,
+          }
+      if (options.json) {
+        printJson(status)
+        return
+      }
+      if (binding === null) {
+        process.stdout.write(`No Discord view binding at ${viewBindingPath(dataDir)}\n`)
+        return
+      }
+      process.stdout.write(`Discord view bound: guild ${binding.tenantId}, channel ${binding.channelId}, hub ${binding.baseUrl}\n`)
     })
 }

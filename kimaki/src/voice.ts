@@ -502,7 +502,7 @@ async function transcribeViaGateway({ audio, mediaType, clientId, clientSecret, 
 // OpenCode's database. Kimaki never refreshes it: refresh tokens rotate, so a refresh here
 // would log OpenCode out. An expired token is skipped until OpenCode refreshes it.
 
-type ChatGPTCredential = { accessToken: string; accountId: string | null }
+export type ChatGPTCredential = { accessToken: string; accountId: string | null; expiresAt?: number | null }
 
 const AUDIO_EXTENSIONS: Record<string, string> = { 'audio/ogg': 'ogg', 'audio/mp4': 'm4a', 'audio/mpeg': 'mp3', 'audio/wav': 'wav' }
 
@@ -520,7 +520,9 @@ function chatGPTAccountId(accessToken: string): string | null {
 const CODEX_METHODS = new Set(['chatgpt-browser', 'chatgpt-headless'])
 
 // The active (else newest) unexpired Codex OAuth credential. null when OpenCode has none.
-export async function chatGPTCredential({ dbFile, now = Date.now() }: { dbFile: string; now?: number }): Promise<TranscriptionError | ChatGPTCredential | null> {
+// expiresAt is carried so the one-time handoff can store it without re-reading the SQL.
+// Read-only: the ATTACH URL uses mode=ro, so importing never writes to OpenCode's db.
+export async function chatGPTCredential({ dbFile, now = Date.now(), includeExpiry = false }: { dbFile: string; now?: number; includeExpiry?: boolean }): Promise<TranscriptionError | ChatGPTCredential | null> {
   if (!fs.existsSync(dbFile)) return null
   const client = createClient({ url: ':memory:' })
   const rows = await client
@@ -540,9 +542,28 @@ export async function chatGPTCredential({ dbFile, now = Date.now() }: { dbFile: 
       logger.log('OpenCode Codex token expired, skipping it until OpenCode refreshes it')
       continue
     }
-    return { accessToken: value['access'], accountId: chatGPTAccountId(value['access']) }
+    const base = { accessToken: value['access'], accountId: chatGPTAccountId(value['access']) }
+    return includeExpiry
+      ? { ...base, expiresAt: typeof value['expires'] === 'number' ? value['expires'] : null }
+      : base
   }
   return null
+}
+
+// Kimaki-owned copy of the Codex credential (imported once via credential-handoff.ts).
+// An expired row degrades exactly like an expired OpenCode token: log and skip, never throw.
+export async function storedCodexCredential({ db, token, now = Date.now() }: { db: KimakiDb; token: string; now?: number }): Promise<DbError | ChatGPTCredential | null> {
+  const row = await db.query.bot_tokens
+    .findFirst({ where: { token }, with: { codex_credential: true } })
+    .catch((cause) => new DbError({ operation: 'read stored Codex credential', cause }))
+  if (row instanceof Error) return row
+  const stored = row?.codex_credential
+  if (!stored) return null
+  if (stored.token_expires_at !== null && stored.token_expires_at <= now + 60_000) {
+    logger.log('imported Codex token expired, skipping it until it is imported again')
+    return null
+  }
+  return { accessToken: stored.access_token, accountId: stored.account_id }
 }
 
 // Multipart `file` (plus `fields`) in, `{ text }` out: ChatGPT dictation and Whisper servers.
@@ -653,29 +674,35 @@ type Transcriber =
   | { kind: 'gateway'; clientId: string; clientSecret: string }
   | { kind: 'local-whisper'; whisper: LocalWhisper }
 
-// Best first: OpenAI key (routing tool call), ChatGPT subscription and Gemini key, then hosted Whisper.
-// ChatGPT and Whisper only transcribe, so the route is always steer.
+// Best first: local Whisper env, kimaki's stored Codex credential, bot_api_keys OpenAI
+// key, bot_api_keys/env Gemini key, OpenCode's Codex credential as a last resort while its
+// db still exists, then hosted Whisper. ChatGPT and Whisper only transcribe, so steer.
 // A local Whisper server is the only one: its failure must not send the audio to the cloud.
 async function transcribers({ db, token, opencodeDbFile }: { db: KimakiDb; token: string; opencodeDbFile: string }): Promise<DbError | Transcriber[]> {
   const whisper = localWhisperFromEnv()
   if (whisper) return [{ kind: 'local-whisper', whisper }]
-  const [row, credential] = await Promise.all([
+  const [row, stored, fallback] = await Promise.all([
     db.query.bot_tokens
       .findFirst({ where: { token }, with: { api_keys: true } })
       .catch((e) => new DbError({ operation: 'read transcription keys', cause: e })),
+    storedCodexCredential({ db, token }),
     chatGPTCredential({ dbFile: opencodeDbFile }),
   ])
   if (row instanceof Error) return row
-  if (credential instanceof Error) logger.warn('ChatGPT credential not readable', credential)
+  if (stored instanceof Error) logger.warn('Stored Codex credential not readable', stored)
+  if (fallback instanceof Error) logger.warn('ChatGPT credential not readable', fallback)
   const keys = audioKeyCandidates(row?.api_keys)
   const openai = keys.find((key) => key.provider === 'openai')
   const gemini = keys.find((key) => key.provider === 'gemini')
   const credentials = row ? credentialsFromRow(row) : null
   const [clientId, clientSecret] = credentials?.mode === 'gateway' ? credentials.token.split(':') : []
+  const storedCredential = stored && !(stored instanceof Error) ? stored : null
+  const fallbackCredential = fallback && !(fallback instanceof Error) ? fallback : null
   return [
+    ...(storedCredential ? [{ kind: 'chatgpt' as const, credential: storedCredential }] : []),
     ...(openai ? [{ kind: 'openai' as const, apiKey: openai.apiKey }] : []),
-    ...(credential && !(credential instanceof Error) ? [{ kind: 'chatgpt' as const, credential }] : []),
     ...(gemini ? [{ kind: 'gemini' as const, apiKey: gemini.apiKey }] : []),
+    ...(fallbackCredential ? [{ kind: 'chatgpt' as const, credential: fallbackCredential }] : []),
     ...(clientId && clientSecret ? [{ kind: 'gateway' as const, clientId, clientSecret }] : []),
   ]
 }

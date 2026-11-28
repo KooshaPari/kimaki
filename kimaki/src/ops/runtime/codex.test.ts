@@ -1,0 +1,705 @@
+import { describe, expect, it } from 'vitest'
+import { createCodexController, createCodexObserver } from './codex.js'
+import type { CodexApprovalPolicy, CodexApprovalRequest, CodexControlMethod, CodexNotification } from './codex.js'
+
+type Call = { method: CodexControlMethod; params: Record<string, unknown> }
+
+function harness(handler: (call: Call) => Promise<unknown> | unknown = () => ({})) {
+  const calls: Call[] = []
+  const listeners = new Set<(notification: CodexNotification) => void>()
+  let unsubscribed = 0
+  const controller = createCodexController({
+    hostId: 'host',
+    endpointId: 'endpoint',
+    request: (method, params) => {
+      const call = { method, params }
+      calls.push(call)
+      return Promise.resolve().then(() => handler(call))
+    },
+    subscribe: (listener) => {
+      listeners.add(listener)
+      return () => {
+        listeners.delete(listener)
+        unsubscribed++
+      }
+    },
+    timeoutMs: 50,
+    turnTimeoutMs: 50,
+  })
+  if (controller instanceof Error) throw controller
+  return {
+    controller,
+    calls,
+    unsubscribed: () => unsubscribed,
+    emit: (method: string, params: unknown) => { for (const listener of [...listeners]) listener({ method, params }) },
+  }
+}
+
+const flush = () => new Promise<void>((resolve) => setTimeout(resolve, 0))
+const delta = (threadId: string, turnId: string, text: string) => ({ threadId, turnId, itemId: 'item-1', delta: text })
+const completed = (threadId: string, turnId: string, status = 'completed', extra: Record<string, unknown> = {}) => ({
+  threadId,
+  turn: { id: turnId, status, items: [], error: null, ...extra },
+})
+
+describe('Codex control surface', () => {
+  it('declares only what the protocol and client can actually do', () => {
+    const { controller } = harness()
+    expect(controller.capabilities).toMatchObject({
+      version: 1,
+      streaming: { kind: 'supported' },
+      control: { create: { kind: 'supported' }, submit: { kind: 'supported' }, interrupt: { kind: 'supported' } },
+    })
+    expect(controller.capabilities.control.answerApproval.kind).toBe('unsupported')
+    expect('reason' in controller.capabilities.control.answerApproval).toBe(true)
+  })
+
+  it('starts a thread with an explicit cwd and returns only the key', async () => {
+    const { controller, calls } = harness((call) => call.method === 'thread/start'
+      ? { thread: { id: 'thread-1', preview: 'private prompt', cwd: 'private path' }, model: 'private' }
+      : {})
+    const started = await controller.startThread({ cwd: 'C:/work' })
+    expect(started).toEqual({
+      threadId: 'thread-1',
+      key: { hostId: 'host', endpointId: 'endpoint', backendKind: 'codex', nativeSessionId: 'thread-1' },
+    })
+    expect(JSON.stringify(started)).not.toContain('private')
+    expect(calls).toEqual([{ method: 'thread/start', params: { cwd: 'C:/work' } }])
+  })
+
+  it('resumes an existing thread in a new app-server process', async () => {
+    const { controller, calls } = harness((call) => call.method === 'thread/resume'
+      ? { thread: { id: 'thread-9', preview: 'private prompt' }, model: 'm' }
+      : {})
+    // turn/start rejects a thread that the fresh process has not resumed.
+    expect(await controller.resumeThread({ threadId: 'thread-9', cwd: 'C:/work' })).toEqual({
+      threadId: 'thread-9',
+      key: { hostId: 'host', endpointId: 'endpoint', backendKind: 'codex', nativeSessionId: 'thread-9' },
+    })
+    expect(calls).toEqual([{ method: 'thread/resume', params: { threadId: 'thread-9', cwd: 'C:/work' } }])
+  })
+
+  it('refuses a resume that answers with a different thread', async () => {
+    const { controller } = harness(() => ({ thread: { id: 'thread-other' } }))
+    const resumed = await controller.resumeThread({ threadId: 'thread-9' })
+    expect(resumed).toBeInstanceOf(Error)
+    expect((resumed as Error).message).toMatch(/different thread/i)
+  })
+
+  it('reads a thread as user and agent messages using the observed item shapes', async () => {
+    const { controller, calls } = harness(() => ({
+      thread: {
+        id: 'thread-9',
+        turns: [
+          {
+            id: 'turn-1',
+            status: 'completed',
+            items: [
+              { type: 'userMessage', content: [{ type: 'text', text: 'first ' }, { type: 'text', text: 'ask' }] },
+              { type: 'agentMessage', text: 'first answer' },
+              { type: 'reasoning', text: 'private reasoning' },
+            ],
+          },
+          { id: 'turn-2', status: 'interrupted', items: [{ type: 'agentMessage', text: '' }] },
+        ],
+      },
+    }))
+    const read = await controller.readThread({ threadId: 'thread-9' })
+    expect(read).toMatchObject({
+      threadId: 'thread-9',
+      turns: [
+        { id: 'turn-1', status: 'completed', messages: [{ role: 'user', text: 'first ask' }, { role: 'agent', text: 'first answer' }] },
+        { id: 'turn-2', status: 'interrupted', messages: [] },
+      ],
+    })
+    expect(JSON.stringify(read)).not.toContain('private reasoning')
+    // Reading must never resume: resume takes the native writer lock and would
+    // block the session this reader is observing.
+    expect(calls).toEqual([{ method: 'thread/read', params: { threadId: 'thread-9', includeTurns: true } }])
+  })
+
+  it('refuses a read that answers about another thread', async () => {
+    const { controller } = harness(() => ({ thread: { id: 'thread-other', turns: [] } }))
+    const read = await controller.readThread({ threadId: 'thread-9' })
+    expect(read).toBeInstanceOf(Error)
+  })
+
+  it('starts a thread with an explicit cwd and returns only the key', async () => {
+    const { controller, calls } = harness((call) => call.method === 'thread/start'
+      ? { thread: { id: 'thread-1', preview: 'private prompt', cwd: 'private path' }, model: 'private' }
+      : {})
+    const started = await controller.startThread({ cwd: 'C:/work' })
+    expect(started).toEqual({
+      threadId: 'thread-1',
+      key: { hostId: 'host', endpointId: 'endpoint', backendKind: 'codex', nativeSessionId: 'thread-1' },
+    })
+    expect(JSON.stringify(started)).not.toContain('private')
+    expect(calls).toEqual([{ method: 'thread/start', params: { cwd: 'C:/work' } }])
+    expect(await controller.startThread()).toEqual({
+      threadId: 'thread-1',
+      key: { hostId: 'host', endpointId: 'endpoint', backendKind: 'codex', nativeSessionId: 'thread-1' },
+    })
+    expect(calls[1]).toEqual({ method: 'thread/start', params: {} })
+  })
+
+  it('rejects malformed thread starts, blank cwd and timeouts instead of throwing', async () => {
+    const malformedHarness = harness(() => ({ thread: { id: '' } }))
+    expect(await malformedHarness.controller.startThread()).toBeInstanceOf(Error)
+    expect(await malformedHarness.controller.startThread({ cwd: '   ' })).toBeInstanceOf(Error)
+    // The malformed response was requested once; the blank cwd never reached the transport.
+    expect(malformedHarness.calls).toEqual([{ method: 'thread/start', params: {} }])
+
+    const hanging = harness(() => new Promise<never>(() => {}))
+    const timedOut = await hanging.controller.startThread()
+    expect(timedOut).toBeInstanceOf(Error)
+    expect(String((timedOut as Error).cause)).toContain('Timed out')
+
+    const throwing = harness(() => { throw new Error('socket closed') })
+    expect(await throwing.controller.startThread()).toBeInstanceOf(Error)
+  })
+
+  it('streams deltas and resolves the completed turn text', async () => {
+    const seen: string[] = []
+    const { controller, emit } = harness((call) => call.method === 'turn/start' ? { turn: { id: 'turn-1' } } : {})
+    const pending = controller.sendTurn({ threadId: 'thread-1', text: 'hello', onDelta: (event) => { seen.push(event.text) } })
+    await flush()
+    emit('item/agentMessage/delta', delta('thread-1', 'turn-1', 'Hel'))
+    emit('item/agentMessage/delta', delta('thread-1', 'turn-1', 'lo'))
+    emit('turn/completed', completed('thread-1', 'turn-1'))
+    expect(await pending).toEqual({ threadId: 'thread-1', turnId: 'turn-1', status: 'completed', text: 'Hello' })
+    expect(seen).toEqual(['Hel', 'lo'])
+  })
+
+  it('sends the documented turn/start payload and ignores other threads and turns', async () => {
+    const seen: string[] = []
+    const { controller, calls, emit } = harness((call) => call.method === 'turn/start' ? { turn: { id: 'turn-1' } } : {})
+    const pending = controller.sendTurn({ threadId: 'thread-1', text: 'hello' })
+    await flush()
+    emit('item/agentMessage/delta', delta('other-thread', 'turn-1', 'private'))
+    emit('item/agentMessage/delta', delta('thread-1', 'other-turn', 'private'))
+    emit('item/agentMessage/delta', delta('thread-1', 'turn-1', 'ok'))
+    emit('turn/completed', completed('thread-1', 'turn-1'))
+    const result = await pending
+    expect(result).toEqual({ threadId: 'thread-1', turnId: 'turn-1', status: 'completed', text: 'ok' })
+    expect(JSON.stringify(result)).not.toContain('private')
+    expect(calls).toEqual([{
+      method: 'turn/start',
+      params: { threadId: 'thread-1', input: [{ type: 'text', text: 'hello', text_elements: [] }] },
+    }])
+    expect(seen).toEqual([])
+  })
+
+  it('falls back to the completed agent message when no delta arrived', async () => {
+    const { controller, emit } = harness((call) => call.method === 'turn/start' ? { turn: { id: 'turn-1' } } : {})
+    const pending = controller.sendTurn({ threadId: 'thread-1', text: 'hello' })
+    await flush()
+    emit('turn/completed', completed('thread-1', 'turn-1', 'completed', {
+      items: [
+        { type: 'reasoning', id: 'r1', summary: [], content: [] },
+        { type: 'agentMessage', id: 'a1', text: 'final answer' },
+      ],
+    }))
+    expect(await pending).toMatchObject({ status: 'completed', text: 'final answer' })
+  })
+
+  it('returns an Error for failed turns, rejected requests, malformed responses and turn timeouts', async () => {
+    const failed = harness((call) => call.method === 'turn/start' ? { turn: { id: 'turn-1' } } : {})
+    const failedTurn = failed.controller.sendTurn({ threadId: 'thread-1', text: 'hello' })
+    await flush()
+    failed.emit('turn/completed', completed('thread-1', 'turn-1', 'failed', { error: { message: 'quota exhausted' } }))
+    const failure = await failedTurn
+    expect(failure).toBeInstanceOf(Error)
+    expect(String((failure as Error).cause)).toContain('quota exhausted')
+
+    const rejected = harness(() => Promise.reject(new Error('app-server returned an error')))
+    expect(await rejected.controller.sendTurn({ threadId: 'thread-1', text: 'hello' })).toBeInstanceOf(Error)
+
+    const malformed = harness(() => ({ turn: { id: '' } }))
+    expect(await malformed.controller.sendTurn({ threadId: 'thread-1', text: 'hello' })).toBeInstanceOf(Error)
+
+    const timedOut = harness(() => ({ turn: { id: 'turn-1' } }))
+    const pending = timedOut.controller.sendTurn({ threadId: 'thread-1', text: 'hello' })
+    expect(await pending).toBeInstanceOf(Error)
+    expect(String((await pending as Error).cause)).toContain('Timed out')
+  })
+
+  it('rejects blank text and concurrent turns on one thread', async () => {
+    const { controller, calls } = harness(() => new Promise<never>(() => {}))
+    expect(await controller.sendTurn({ threadId: 'thread-1', text: '   ' })).toBeInstanceOf(Error)
+    expect(calls).toHaveLength(0)
+    void controller.sendTurn({ threadId: 'thread-1', text: 'first' })
+    await flush()
+    expect(await controller.sendTurn({ threadId: 'thread-1', text: 'second' })).toBeInstanceOf(Error)
+    controller.close()
+  })
+
+  it('interrupts the tracked active turn and never guesses a turn id', async () => {
+    const { controller, calls, emit } = harness((call) => {
+      if (call.method === 'turn/start') return { turn: { id: 'turn-1' } }
+      return {}
+    })
+    expect(await controller.cancel({ threadId: 'thread-1' })).toBeInstanceOf(Error)
+    const pending = controller.sendTurn({ threadId: 'thread-1', text: 'hello' })
+    await flush()
+    expect(await controller.cancel({ threadId: 'thread-1' })).toEqual({ threadId: 'thread-1', turnId: 'turn-1' })
+    emit('turn/completed', completed('thread-1', 'turn-1', 'interrupted'))
+    expect(await pending).toEqual({ threadId: 'thread-1', turnId: 'turn-1', status: 'interrupted', text: '' })
+    expect(calls.filter((call) => call.method === 'turn/interrupt')).toEqual([
+      { method: 'turn/interrupt', params: { threadId: 'thread-1', turnId: 'turn-1' } },
+    ])
+    expect(await controller.cancel({ threadId: 'thread-1', turnId: 'explicit' })).toEqual({ threadId: 'thread-1', turnId: 'explicit' })
+  })
+
+  it('settles in-flight turns and unsubscribes on close', async () => {
+    const { controller, emit, unsubscribed } = harness(() => ({ turn: { id: 'turn-1' } }))
+    const pending = controller.sendTurn({ threadId: 'thread-1', text: 'hello' })
+    await flush()
+    controller.close()
+    expect(await pending).toBeInstanceOf(Error)
+    expect(unsubscribed()).toBe(1)
+    controller.close()
+    expect(unsubscribed()).toBe(1)
+    emit('turn/completed', completed('thread-1', 'turn-1'))
+  })
+
+  it('propagates subscription failures as Errors', () => {
+    const failed = createCodexController({
+      hostId: 'host',
+      endpointId: 'endpoint',
+      request: async () => ({}),
+      subscribe: () => new Error('no notification channel'),
+    })
+    expect(failed).toBeInstanceOf(Error)
+    const threw = createCodexController({
+      hostId: 'host',
+      endpointId: 'endpoint',
+      request: async () => ({}),
+      subscribe: () => { throw new Error('closed') },
+    })
+    expect(threw).toBeInstanceOf(Error)
+  })
+})
+
+// A transport stand-in that behaves like `startCodexAppServer` with
+// holdServerRequests: a request id stays open until exactly one answer is
+// written, and a second write reports false instead of being silently dropped.
+function approvalHarness(policy?: CodexApprovalPolicy, withApprovals = true) {
+  const listeners = new Set<(notification: CodexNotification) => void>()
+  const open = new Set<number>()
+  const results: Array<{ id: number; result: unknown }> = []
+  const failures: Array<{ id: number; code: number; message: string }> = []
+  const requests: CodexApprovalRequest[] = []
+  const controller = createCodexController({
+    hostId: 'host',
+    endpointId: 'endpoint',
+    request: async () => ({}),
+    subscribe: (listener) => {
+      listeners.add(listener)
+      return () => { listeners.delete(listener) }
+    },
+    timeoutMs: 50,
+    turnTimeoutMs: 50,
+    // The stand-in transport below holds a server request until exactly one answer
+    // is written, which is exactly what the option declares.
+    holdsServerRequests: true,
+    serverRequests: {
+      result: (id, result) => {
+        if (!open.delete(id)) return false
+        results.push({ id, result })
+        return true
+      },
+      error: (id, code, message) => {
+        if (!open.delete(id)) return false
+        failures.push({ id, code, message })
+        return true
+      },
+    },
+    ...(withApprovals ? { approvals: { policy, onRequest: (request: CodexApprovalRequest) => { requests.push(request) } } } : {}),
+  })
+  if (controller instanceof Error) throw controller
+  // Mirrors the transport: an id is open before its request is delivered, so an
+  // answer to it is forwarded exactly once.
+  const request = (id: number, method: string, params: Record<string, unknown> = {}) => {
+    open.add(id)
+    for (const listener of [...listeners]) {
+      listener({ id, method, params })
+    }
+  }
+  const ask = (id: number, params: Record<string, unknown> = {}) =>
+    request(id, 'item/commandExecution/requestApproval', { threadId: 'thread-1', turnId: 'turn-1', itemId: 'item-1', command: 'rm -rf /tmp/x', ...params })
+  // Simulates the transport losing an id, which is what a closed connection does.
+  const drop = (id: number) => { open.delete(id) }
+  return { controller, requests, results, failures, ask, drop, request }
+}
+
+// The digest a reviewer would have read from pendingApprovals before answering.
+const digestOf = (controller: ReturnType<typeof approvalHarness>['controller'], requestId: number): string => {
+  const request = controller.pendingApprovals().find((candidate) => candidate.requestId === requestId)
+  if (!request) throw new Error(`approval ${requestId} is not pending`)
+  return request.digest
+}
+
+describe('Codex approval surface', () => {
+  it('declares answerApproval supported only when an approval channel exists', () => {
+    const { controller } = approvalHarness(undefined, false)
+    expect(controller.capabilities.control.answerApproval.kind).toBe('unsupported')
+    expect(controller.answerApproval({ requestId: 1, decision: 'accept' })).toBeInstanceOf(Error)
+    const configured = approvalHarness(() => 'accept')
+    expect(configured.controller.capabilities.control.answerApproval).toMatchObject({
+      kind: 'supported',
+      methods: ['item/commandExecution/requestApproval', 'item/fileChange/requestApproval'],
+    })
+  })
+
+  it('refuses an approval surface without a transport that holds server requests', () => {
+    const base = {
+      hostId: 'host',
+      endpointId: 'endpoint',
+      request: async () => ({}),
+      subscribe: () => () => {},
+      serverRequests: { result: () => true, error: () => true },
+      approvals: { policy: () => 'accept' as const },
+    }
+    const missing = createCodexController(base)
+    expect(missing).toBeInstanceOf(Error)
+    expect((missing as Error).message).toMatch(/holds server requests/)
+    const refused = createCodexController({ ...base, holdsServerRequests: false })
+    expect(refused).toBeInstanceOf(Error)
+    expect((refused as Error).message).toMatch(/holds server requests/)
+  })
+
+  it('refuses an approval surface without a result and error channel', () => {
+    const controller = createCodexController({
+      hostId: 'host',
+      endpointId: 'endpoint',
+      request: async () => ({}),
+      subscribe: () => () => {},
+      approvals: { policy: () => 'accept' },
+    })
+    expect(controller).toBeInstanceOf(Error)
+    expect((controller as Error).message).toMatch(/result and an error channel/)
+  })
+
+  it('answers a policy-approved command once and surfaces the request', () => {
+    const { controller, results, requests, ask } = approvalHarness(() => 'accept')
+    ask(41)
+    expect(requests).toHaveLength(1)
+    expect(requests[0]).toMatchObject({ requestId: 41, method: 'item/commandExecution/requestApproval', command: 'rm -rf /tmp/x', threadId: 'thread-1', turnId: 'turn-1' })
+    expect(requests[0]?.digest).toMatch(/^sha256:[0-9a-f]{64}$/)
+    expect(results).toEqual([{ id: 41, result: { decision: 'accept' } }])
+    expect(controller.pendingApprovals()).toEqual([])
+  })
+
+  it('leaves a request open without a policy and then answers it by id', () => {
+    const { controller, results, ask } = approvalHarness()
+    ask(7)
+    expect(controller.pendingApprovals()).toHaveLength(1)
+    expect(results).toEqual([])
+    expect(controller.answerApproval({ requestId: 7, decision: 'decline' })).toEqual({ requestId: 7, decision: 'decline' })
+    expect(results).toEqual([{ id: 7, result: { decision: 'decline' } }])
+    expect(controller.pendingApprovals()).toEqual([])
+  })
+
+  it('refuses a replayed answer instead of forwarding it twice', () => {
+    const { controller, results, ask } = approvalHarness()
+    ask(9)
+    expect(controller.answerApproval({ requestId: 9, decision: 'accept', expectedDigest: digestOf(controller, 9) })).toEqual({ requestId: 9, decision: 'accept' })
+    const replay = controller.answerApproval({ requestId: 9, decision: 'decline' })
+    expect(replay).toBeInstanceOf(Error)
+    expect((replay as Error).message).toMatch(/already answered/)
+    expect(results).toEqual([{ id: 9, result: { decision: 'accept' } }])
+  })
+
+  it('gives the first of two racing answers the request and refuses the loser', () => {
+    const { controller, results, ask } = approvalHarness()
+    ask(11)
+    const expectedDigest = digestOf(controller, 11)
+    const first = controller.answerApproval({ requestId: 11, decision: 'accept', expectedDigest })
+    const second = controller.answerApproval({ requestId: 11, decision: 'acceptForSession', expectedDigest })
+    expect(first).toEqual({ requestId: 11, decision: 'accept' })
+    expect(second).toBeInstanceOf(Error)
+    expect(results).toHaveLength(1)
+  })
+
+  it('refuses an id that was never issued and an id the app-server dropped', () => {
+    const { controller, results } = approvalHarness()
+    const unknown = controller.answerApproval({ requestId: 99, decision: 'accept', expectedDigest: `sha256:${'0'.repeat(64)}` })
+    expect(unknown).toBeInstanceOf(Error)
+    expect((unknown as Error).message).toMatch(/no approval request with this id is open/)
+    // The transport can lose the id first (closed connection); the answer then
+    // reports that instead of pretending it was delivered.
+    const losing = approvalHarness()
+    losing.ask(5)
+    const expectedDigest = digestOf(losing.controller, 5)
+    losing.drop(5)
+    const dropped = losing.controller.answerApproval({ requestId: 5, decision: 'accept', expectedDigest })
+    expect(dropped).toBeInstanceOf(Error)
+    expect((dropped as Error).message).toMatch(/no longer had this request open/)
+    expect(results).toEqual([])
+  })
+
+  it('fails an unexpected server request rather than leaving the turn hanging', () => {
+    const { failures, request } = approvalHarness()
+    request(12, 'item/tool/requestUserInput', { threadId: 'thread-1' })
+    expect(failures).toEqual([{ id: 12, code: -32601, message: 'Server-initiated request item/tool/requestUserInput unsupported' }])
+  })
+
+  it('answers the first request of a connection, whose id is zero', () => {
+    const { controller, results, ask } = approvalHarness()
+    // A real codex 0.169 app-server numbers its first server request 0, so a
+    // positive-only id check made the very first approval unanswerable and left
+    // the turn stalled.
+    ask(0)
+    const digest = digestOf(controller, 0)
+    expect(controller.answerApproval({ requestId: 0, decision: 'accept', expectedDigest: digest })).toEqual({ requestId: 0, decision: 'accept' })
+    expect(results).toEqual([{ id: 0, result: { decision: 'accept' } }])
+    const negative = controller.answerApproval({ requestId: -1, decision: 'accept' })
+    expect(negative).toBeInstanceOf(Error)
+    expect((negative as Error).message).toMatch(/non-negative/)
+  })
+
+  it('surfaces command approval scope to the policy', () => {
+    const seen: CodexApprovalRequest[] = []
+    const { ask } = approvalHarness((request) => { seen.push(request); return 'accept' })
+    ask(21, { cwd: 'E:/work', kind: 'command', approvalId: 'apr-1', startedAtMs: 1_700_000_000_000 })
+    expect(seen).toHaveLength(1)
+    const firstRequest = seen[0]
+    if (!firstRequest) throw new Error('expected one command approval request')
+    const { digest, ...artifact } = firstRequest
+    expect(artifact).toEqual({
+      requestId: 21,
+      method: 'item/commandExecution/requestApproval',
+      threadId: 'thread-1',
+      turnId: 'turn-1',
+      itemId: 'item-1',
+      command: 'rm -rf /tmp/x',
+      reason: null,
+      grantRoot: null,
+      cwd: 'E:/work',
+      kind: 'command',
+      approvalId: 'apr-1',
+      startedAtMs: 1_700_000_000_000,
+    })
+    expect(digest).toMatch(/^sha256:[0-9a-f]{64}$/)
+  })
+
+  it('surfaces a file-change grant root to the policy', () => {
+    const seen: CodexApprovalRequest[] = []
+    const { request } = approvalHarness((approval) => { seen.push(approval); return 'accept' })
+    request(22, 'item/fileChange/requestApproval', {
+      threadId: 'thread-1',
+      turnId: 'turn-1',
+      itemId: 'item-2',
+      grantRoot: 'E:/work/repo',
+      reason: 'write outside workspace',
+    })
+    expect(seen).toHaveLength(1)
+    const firstRequest = seen[0]
+    if (!firstRequest) throw new Error('expected one file-change approval request')
+    const { digest, ...artifact } = firstRequest
+    expect(artifact).toEqual({
+      requestId: 22,
+      method: 'item/fileChange/requestApproval',
+      threadId: 'thread-1',
+      turnId: 'turn-1',
+      itemId: 'item-2',
+      command: null,
+      reason: 'write outside workspace',
+      grantRoot: 'E:/work/repo',
+      cwd: null,
+      kind: null,
+      approvalId: null,
+      startedAtMs: null,
+    })
+    expect(digest).toMatch(/^sha256:[0-9a-f]{64}$/)
+  })
+
+  it('drops blank scope fields and non-finite timestamps', () => {
+    const { requests, ask, request } = approvalHarness(() => 'accept')
+    ask(23, { cwd: '   ', approvalId: ' ', startedAtMs: Number.POSITIVE_INFINITY })
+    // A command approval with no kind reported is a plain command, not unknown.
+    expect(requests[0]).toMatchObject({ cwd: null, approvalId: null, startedAtMs: null, kind: 'command' })
+    request(24, 'item/fileChange/requestApproval', { threadId: 'thread-1', kind: '  ', grantRoot: '   ', cwd: '' })
+    expect(requests[1]).toMatchObject({ method: 'item/fileChange/requestApproval', kind: null, grantRoot: null, cwd: null })
+  })
+
+  it('refuses item/permissions/requestApproval and never holds it', () => {
+    const { controller, failures, request } = approvalHarness(() => 'accept')
+    request(15, 'item/permissions/requestApproval', { threadId: 'thread-1' })
+    expect(failures).toEqual([
+      { id: 15, code: -32601, message: 'Server-initiated request item/permissions/requestApproval unsupported' },
+    ])
+    expect(controller.pendingApprovals()).toEqual([])
+  })
+
+  it('fails closed when a policy returns a decision outside the protocol set', () => {
+    const invalid = (() => 'grant') as unknown as CodexApprovalPolicy
+    const { results, ask } = approvalHarness(invalid)
+    ask(31)
+    expect(results).toEqual([{ id: 31, result: { decision: 'decline' } }])
+  })
+
+  it('refuses acceptForSession for a humanCommand and fails closed to decline', () => {
+    // A policy that reaches for the session answer gets a refusal, not a grant.
+    const policy = approvalHarness(() => 'acceptForSession')
+    policy.ask(41, { kind: 'humanCommand' })
+    expect(policy.results).toEqual([{ id: 41, result: { decision: 'decline' } }])
+
+    // An explicit answer is refused by name and leaves the request open, so a
+    // valid answer can still be given afterwards.
+    const explicit = approvalHarness()
+    explicit.ask(42, { kind: 'humanCommand' })
+    const digest = digestOf(explicit.controller, 42)
+    const refused = explicit.controller.answerApproval({ requestId: 42, decision: 'acceptForSession', expectedDigest: digest })
+    expect(refused).toBeInstanceOf(Error)
+    expect((refused as Error).message).toMatch(/humanCommand/)
+    expect(explicit.results).toEqual([])
+    expect(explicit.controller.pendingApprovals()).toHaveLength(1)
+    expect(explicit.controller.answerApproval({ requestId: 42, decision: 'accept', expectedDigest: digest })).toEqual({ requestId: 42, decision: 'accept' })
+    expect(explicit.results).toEqual([{ id: 42, result: { decision: 'accept' } }])
+
+    // Other command kinds still admit the session answer.
+    const plain = approvalHarness(() => 'acceptForSession')
+    plain.ask(43)
+    expect(plain.results).toEqual([{ id: 43, result: { decision: 'acceptForSession' } }])
+  })
+
+  it('declines when a policy throws instead of granting by accident', () => {
+    const { results, ask } = approvalHarness(() => { throw new Error('policy bug') })
+    ask(13)
+    expect(results).toEqual([{ id: 13, result: { decision: 'decline' } }])
+  })
+
+  it('answers an accept only for the digest that was actually read', () => {
+    const { controller, results, ask } = approvalHarness()
+    ask(51, { cwd: 'E:/work', approvalId: 'apr-51' })
+    const [pending] = controller.pendingApprovals()
+    if (!pending) throw new Error('expected one pending approval')
+    expect(pending.digest).toMatch(/^sha256:[0-9a-f]{64}$/)
+    expect(controller.answerApproval({ requestId: 51, decision: 'accept', expectedDigest: pending.digest })).toEqual({ requestId: 51, decision: 'accept' })
+    expect(results).toEqual([{ id: 51, result: { decision: 'accept' } }])
+  })
+
+  it('refuses a mismatched digest and forwards nothing', () => {
+    const { controller, results, ask } = approvalHarness()
+    ask(52)
+    const [pending] = controller.pendingApprovals()
+    if (!pending) throw new Error('expected one pending approval')
+    const refused = controller.answerApproval({ requestId: 52, decision: 'accept', expectedDigest: `sha256:${'0'.repeat(64)}` })
+    expect(refused).toBeInstanceOf(Error)
+    expect((refused as Error).message).toMatch(/digest/)
+    expect(results).toEqual([])
+    expect(controller.pendingApprovals()).toHaveLength(1)
+    // The refusal consumed nothing, so the digest that was read still answers.
+    expect(controller.answerApproval({ requestId: 52, decision: 'accept', expectedDigest: pending.digest })).toEqual({ requestId: 52, decision: 'accept' })
+    expect(results).toEqual([{ id: 52, result: { decision: 'accept' } }])
+  })
+
+  it('requires a digest for accept and acceptForSession', () => {
+    const { controller, results, ask } = approvalHarness()
+    ask(53)
+    const accepted = controller.answerApproval({ requestId: 53, decision: 'accept' })
+    expect(accepted).toBeInstanceOf(Error)
+    expect((accepted as Error).message).toMatch(/digest/)
+    const session = controller.answerApproval({ requestId: 53, decision: 'acceptForSession' })
+    expect(session).toBeInstanceOf(Error)
+    expect((session as Error).message).toMatch(/digest/)
+    expect(results).toEqual([])
+    expect(controller.pendingApprovals()).toHaveLength(1)
+  })
+
+  it('answers decline and cancel without a digest but refuses a wrong one', () => {
+    const { controller, results, ask } = approvalHarness()
+    ask(54)
+    expect(controller.answerApproval({ requestId: 54, decision: 'decline' })).toEqual({ requestId: 54, decision: 'decline' })
+    ask(55)
+    expect(controller.answerApproval({ requestId: 55, decision: 'cancel' })).toEqual({ requestId: 55, decision: 'cancel' })
+    ask(56)
+    const wrong = controller.answerApproval({ requestId: 56, decision: 'decline', expectedDigest: `sha256:${'1'.repeat(64)}` })
+    expect(wrong).toBeInstanceOf(Error)
+    expect((wrong as Error).message).toMatch(/digest/)
+    expect(results).toEqual([
+      { id: 54, result: { decision: 'decline' } },
+      { id: 55, result: { decision: 'cancel' } },
+    ])
+  })
+
+  it('refuses an answer whose artifact changed under the same request id', () => {
+    const { controller, results, ask } = approvalHarness()
+    ask(57)
+    const stale = digestOf(controller, 57)
+    // Same transport id, different artifact: the command the runtime now wants.
+    ask(57, { command: 'rm -rf /' })
+    const changed = digestOf(controller, 57)
+    expect(changed).not.toBe(stale)
+    const refused = controller.answerApproval({ requestId: 57, decision: 'accept', expectedDigest: stale })
+    expect(refused).toBeInstanceOf(Error)
+    expect((refused as Error).message).toMatch(/digest/)
+    expect(results).toEqual([])
+    expect(controller.answerApproval({ requestId: 57, decision: 'accept', expectedDigest: changed })).toEqual({ requestId: 57, decision: 'accept' })
+    expect(results).toEqual([{ id: 57, result: { decision: 'accept' } }])
+  })
+
+  it('digests the artifact and not the transport envelope', () => {
+    const { controller, ask } = approvalHarness()
+    ask(61, { startedAtMs: 1 })
+    const first = digestOf(controller, 61)
+    // requestId and startedAtMs differ; the artifact is identical.
+    ask(62, { startedAtMs: 2 })
+    expect(digestOf(controller, 62)).toBe(first)
+    ask(63, { command: 'rm -rf /tmp/y' })
+    expect(digestOf(controller, 63)).not.toBe(first)
+  })
+})
+
+describe('Codex passive observer', () => {
+  it('never returns native preview, path, transcript or unknown fields', async () => {
+    const secret = { id: 'thread-1', preview: 'private prompt', path: 'private path', turns: ['private transcript'], unknown: 'private' }
+    const observer = createCodexObserver({ hostId: 'host', endpointId: 'endpoint', request: async (method) => method === 'thread/list'
+      ? { data: [secret], nextCursor: null }
+      : { thread: secret } })
+    if (observer instanceof Error) throw observer
+    const discovered = await observer.discover()
+    const read = await observer.readSnapshot({ key: { hostId: 'host', endpointId: 'endpoint', backendKind: 'codex', nativeSessionId: 'thread-1' } })
+    expect(JSON.stringify([discovered, read])).not.toContain('private')
+  })
+  it('uses state-db-only discovery and preserves pagination', async () => {
+    const calls: unknown[] = []
+    const observer = createCodexObserver({ hostId: 'host', endpointId: 'endpoint', request: async (method, params) => {
+      calls.push([method, params])
+      return { data: [{ id: 'thread-1', status: { type: 'notLoaded' } }], nextCursor: 'next', backwardsCursor: null }
+    } })
+    expect(observer).not.toBeInstanceOf(Error)
+    if (observer instanceof Error) return
+    expect(await observer.discover({ limit: 10 })).toMatchObject({ sessions: [{ key: { nativeSessionId: 'thread-1', backendKind: 'codex' } }], cursor: 'next' })
+    expect(calls).toEqual([['thread/list', { limit: 10, useStateDbOnly: true }]])
+    expect(observer.capabilities.observe.kind).toBe('unsupported')
+  })
+
+  it('reads metadata without resuming and rejects mismatched keys', async () => {
+    const calls: unknown[] = []
+    const observer = createCodexObserver({ hostId: 'host', endpointId: 'endpoint', request: async (method, params) => {
+      calls.push([method, params])
+      return { thread: { id: 'thread-1', status: { type: 'notLoaded' } } }
+    } })
+    if (observer instanceof Error) throw observer
+    const key = { hostId: 'host', endpointId: 'endpoint', backendKind: 'codex', nativeSessionId: 'thread-1' }
+    expect(await observer.readSnapshot({ key })).toMatchObject({ session: { id: 'thread-1' } })
+    expect(await observer.readSnapshot({ key: { ...key, endpointId: 'other' } })).toBeInstanceOf(Error)
+    expect(calls).toEqual([['thread/read', { threadId: 'thread-1', includeTurns: false }]])
+  })
+
+  it('does not return extra caller-supplied key properties', async () => {
+    const observer = createCodexObserver({ hostId: 'host', endpointId: 'endpoint', request: async () => ({ thread: { id: 'thread-1' } }) })
+    if (observer instanceof Error) throw observer
+    const key = { hostId: 'host', endpointId: 'endpoint', backendKind: 'codex', nativeSessionId: 'thread-1', secret: 'private-key-field' }
+    expect(JSON.stringify(await observer.readSnapshot({ key }))).not.toContain('private-key-field')
+  })
+
+  it('rejects malformed responses and mismatched native identity', async () => {
+    const observer = createCodexObserver({ hostId: 'host', endpointId: 'endpoint', request: async () => ({ thread: { id: 'other' } }) })
+    if (observer instanceof Error) throw observer
+    expect(await observer.readSnapshot({ key: { hostId: 'host', endpointId: 'endpoint', backendKind: 'codex', nativeSessionId: 'thread-1' } })).toBeInstanceOf(Error)
+    expect(await observer.discover()).toBeInstanceOf(Error)
+  })
+})

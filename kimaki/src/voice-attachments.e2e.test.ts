@@ -3,11 +3,12 @@
 // are transcribed by Gemini (a local fake here, same HTTP API) with a tool
 // call that also picks the route: steer, queue, btw or new-session.
 
-import fs from 'node:fs'
+import path from 'node:path'
 import type { DeterministicMatcher } from 'opencode-deterministic-provider'
 import { afterAll, beforeAll, expect, test } from 'vitest'
 
 import type { BotHandle } from './main.ts'
+import { removeDataDir } from './test/cleanup.ts'
 import { TRANSCRIPTION_KEY_MODAL } from './voice.ts'
 import {
   TEST_USER_ID,
@@ -35,7 +36,10 @@ function reply(marker: string, text: string): DeterministicMatcher {
 }
 
 const matchers: DeterministicMatcher[] = [
-  slowTextMatcher({ marker: 'slow-marker', text: 'slow-done', delayMs: 2_000 }),
+  // Longer than the btw fork and the new-session run that this test starts while the
+  // session is busy, so their messages are always posted before this reply: the
+  // thread snapshot then has one arrival order on every machine speed.
+  slowTextMatcher({ marker: 'slow-marker', text: 'slow-done', delayMs: 8_000 }),
   {
     id: 'image',
     priority: 500,
@@ -89,7 +93,7 @@ afterAll(async () => {
   await twin?.stop()
   await server?.stop()
   await gemini?.stop()
-  fs.rmSync(dataDir, { recursive: true, force: true })
+  await removeDataDir(dataDir)
 })
 
 async function newThread(send: () => Promise<unknown>) {
@@ -144,7 +148,13 @@ test('image and text attachments reach the model as files', async () => {
   // OpenCode drops binary files: the model gets their local paths from metadata, the stored text stays clean.
   expect(user?.type === 'user' && user.text).toBe('What is this image-marker')
   const discord = user?.type === 'user' ? user.metadata?.['discord'] : null
-  expect(JSON.stringify(discord).replaceAll(dataDir, '<data>').replace(/\/\d+\//g, '/<message>/').replace(/\d{6,}/g, 'ID')).toMatchInlineSnapshot(`"{"userId":"ID","username":"tommy","messageId":"ID","threadId":"ID","threadName":"What is this image-marker","attachments":[{"name":"dot.png","path":"<data>/attachments/<message>/0-dot.png","inline":true},{"name":"notes.txt","path":"<data>/attachments/<message>/1-notes.txt","inline":false},{"name":"archive.zip","path":"<data>/attachments/<message>/2-archive.zip","inline":false}]}"`)
+  // JSON escapes the Windows separator as `\\`: normalise that to `/` before
+  // replacing the data dir, so the snapshot is the same on every platform.
+  expect(JSON.stringify(discord)
+    .replaceAll('\\\\', '/')
+    .replaceAll(dataDir.split(path.sep).join('/'), '<data>')
+    .replace(/\/\d+\//g, '/<message>/')
+    .replace(/\d{6,}/g, 'ID')).toMatchInlineSnapshot(`"{"userId":"ID","username":"tommy","messageId":"ID","threadId":"ID","threadName":"What is this image-marker","attachments":[{"name":"dot.png","path":"<data>/attachments/<message>/0-dot.png","inline":true},{"name":"notes.txt","path":"<data>/attachments/<message>/1-notes.txt","inline":false},{"name":"archive.zip","path":"<data>/attachments/<message>/2-archive.zip","inline":false}]}"`)
 })
 
 test('voice in a channel starts a session with the transcription and the spoken agent', async () => {

@@ -1,0 +1,1253 @@
+// Local operations inventory only. Lazy imports preserve normal CLI startup.
+import type { Goke } from 'goke'
+import type { ViewClaim } from '../ops/discord/view.ts'
+import { DATA_DIR_HELP, dataDirOrDefault, fail, openCliDb, printJson } from './shared.ts'
+import { ConfigError } from '../errors.ts'
+import type { DurableLaunchFence } from '../ops/paperclip/launch-fence-durable.ts'
+
+function required(value: string | undefined, flag: string): string {
+  if (!value?.trim()) fail(new ConfigError({ reason: `Supply --${flag} explicitly. These commands never infer session or tenant authority` }))
+  return value
+}
+
+// A serve command that names a run takes the durable Paperclip claim *at
+// startup*, not at the first prompt: a second launcher for the same
+// (instance, run) is refused by name before it builds a hub or touches a
+// backend. The same fence is then handed to the hub so its own launch claims
+// idempotently under the same launcher.
+type ServeLaunchFence = {
+  launchFence: { fence: DurableLaunchFence; scope: { instanceId: string; runId: string }; launcher: string }
+  close: () => void
+}
+
+async function openServeLaunchFence({ runId, instance, dataDir }: {
+  runId: string | undefined
+  instance: string | undefined
+  dataDir: string | undefined
+}): Promise<ServeLaunchFence | ConfigError | undefined> {
+  if (runId === undefined) return undefined
+  const run = runId.trim()
+  if (run === '') return new ConfigError({ reason: '--run-id must not be blank' })
+  const instanceId = (instance ?? 'local').trim()
+  if (instanceId === '') return new ConfigError({ reason: '--instance must not be blank' })
+  const { dbPath } = await import('../db.ts')
+  const { openLaunchFenceStore } = await import('../ops/paperclip/launch-fence-store.ts')
+  const { createDurableLaunchFence } = await import('../ops/paperclip/launch-fence-durable.ts')
+  const storePath = dbPath({ dataDir: dataDirOrDefault(dataDir) })
+  const store = openLaunchFenceStore({ dbPath: storePath })
+  if (store instanceof ConfigError) return store
+  const fence = createDurableLaunchFence({ store })
+  if (fence instanceof ConfigError) {
+    store.close()
+    return fence
+  }
+  const scope = { instanceId, runId: run }
+  // The pid distinguishes two live launchers; the fence itself decides the winner.
+  const launcher = `kimaki-cli-serve:${process.pid}`
+  const claimed = fence.claim({ scope, launcher })
+  if (claimed instanceof ConfigError) {
+    store.close()
+    return claimed
+  }
+  const generation = claimed.record.generation
+  return {
+    launchFence: { fence, scope, launcher },
+    close: () => {
+      fence.release({ scope, launcher, generation })
+      store.close()
+    },
+  }
+}
+
+// A runtime profile decides which executable, store and environment a Jcode
+// family command runs under. An unknown id is refused here, so no command can
+// fall back to the stock binary just because a name looked plausible.
+async function resolveProfileOption(value: string | undefined) {
+  const { RUNTIME_PROFILES, RUNTIME_PROFILE_IDS, STOCK_JCODE_PROFILE } = await import('../ops/contracts.ts')
+  if (value === undefined) return STOCK_JCODE_PROFILE
+  const chosen = (RUNTIME_PROFILES as Record<string, typeof STOCK_JCODE_PROFILE | undefined>)[value]
+  if (chosen === undefined) return new ConfigError({ reason: `--profile must be ${RUNTIME_PROFILE_IDS.join(' or ')}, not ${value}` })
+  return chosen
+}
+
+// An explicit approval policy is opt-in: without it the client keeps refusing
+// server-initiated approval requests, so nothing is granted by default.
+function approvalDecision(value: string | undefined): 'accept' | 'acceptForSession' | 'decline' | 'cancel' | undefined {
+  if (value === undefined) return undefined
+  if (value === 'accept' || value === 'acceptForSession' || value === 'decline' || value === 'cancel') return value
+  return fail(new ConfigError({ reason: '--approval must be accept, acceptForSession, decline or cancel' }))
+}
+
+// The observer already classifies every candidate record as consistent or
+// transient and counts the ones it skipped. A skipped transient means the file
+// was mid-write at read time, not that no session exists, so the verdict is
+// printed beside the JSON document rather than left implicit.
+export function discoverHealthLine({ source, health, skippedTransient, sessions, cursor }: {
+  source: string
+  health: 'consistent' | 'transient'
+  skippedTransient: number
+  sessions: number
+  cursor: string | null
+}): string {
+  const reason = health === 'transient'
+    ? `${skippedTransient} record(s) were mid-write (unstable, unparsable or mismatched) and skipped, not treated as absent`
+    : 'every candidate record was read consistently'
+  return `${source} discovery: health=${health} skippedTransient=${skippedTransient} (${reason}); sessions=${sessions} cursor=${cursor ?? 'null'}`
+}
+
+// The observer refuses an unknown profile before publication, so the follow
+// notice can forward the same id without re-validating it here. Keeping this
+// pure makes the CLI wiring unit-testable without spawning the full command.
+export function followNoticeInput(profile: string | undefined) {
+  return {
+    backend: 'jcode' as const,
+    ...(profile === undefined ? {} : { profile: profile as 'jcode' | 'kcode' }),
+  }
+}
+
+export function registerOpsCommands(cli: Goke) {
+  cli.command('ops codex turn', 'Run one explicit Codex app-server turn and stream text deltas')
+    .option('--binary <path>', 'Explicit Codex executable')
+    .option('--codex-home <dir>', 'Explicit isolated Codex state directory')
+    .option('--prompt <text>', 'Text for one turn')
+    .option('--cwd <dir>', 'Working directory for the new thread')
+    .option('--timeout-ms <n>', 'Request and turn timeout in milliseconds')
+    .option('--cancel-after <ms>', 'Interrupt the turn after this many milliseconds')
+    .option('--thread <id>', 'Send this turn on an existing thread instead of starting one')
+    .option('--approval <decision>', 'Answer approval requests: accept, acceptForSession, decline or cancel (default: refuse them)')
+    .option('--approval-policy <policy>', 'Codex approval policy for the new thread: untrusted, on-request or never')
+    .action(async (options) => {
+      const binary = required(options.binary, 'binary')
+      const codexHome = required(options.codexHome, 'codex-home')
+      const prompt = required(options.prompt, 'prompt')
+      const timeoutMs = options.timeoutMs === undefined ? undefined : Number(options.timeoutMs)
+      if (timeoutMs !== undefined && (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1)) fail(new ConfigError({ reason: '--timeout-ms must be a positive integer' }))
+      const cancelAfter = options.cancelAfter === undefined ? undefined : Number(options.cancelAfter)
+      if (cancelAfter !== undefined && (!Number.isSafeInteger(cancelAfter) || cancelAfter < 1)) fail(new ConfigError({ reason: '--cancel-after must be a positive integer in milliseconds' }))
+      const approval = approvalDecision(options.approval)
+      const approvalPolicy = options.approvalPolicy === undefined
+        ? undefined
+        : (['untrusted', 'on-request', 'never'] as const).find((policy) => policy === options.approvalPolicy)
+      if (options.approvalPolicy !== undefined && approvalPolicy === undefined) fail(new ConfigError({ reason: '--approval-policy must be untrusted, on-request or never' }))
+      const { startCodexAppServer } = await import('../ops/runtime/codex-app-server.ts')
+      const { createCodexController } = await import('../ops/runtime/codex.ts')
+      const server = await startCodexAppServer({ binary, codexHome, timeoutMs, holdServerRequests: approval !== undefined })
+      if (server instanceof Error) fail(server)
+      try {
+        const controller = createCodexController({
+          hostId: 'local',
+          endpointId: 'explicit-app-server',
+          request: server.request,
+          subscribe: server.subscribe,
+          timeoutMs,
+          turnTimeoutMs: timeoutMs,
+          holdsServerRequests: approval !== undefined,
+          ...(approval === undefined ? {} : {
+            serverRequests: { result: server.respond, error: server.respondError },
+            approvals: {
+              policy: () => approval,
+              onRequest: (request: { requestId: number; method: string; command: string | null; reason: string | null; digest: string }) => printJson({
+                kind: 'approval-request',
+                requestId: request.requestId,
+                method: request.method,
+                command: request.command,
+                reason: request.reason,
+                digest: request.digest,
+                decision: approval,
+              }),
+            },
+          }),
+        })
+        if (controller instanceof Error) fail(controller)
+        try {
+          const started = options.thread === undefined
+            ? await controller.startThread({
+                ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
+                ...(approvalPolicy === undefined ? {} : { approvalPolicy }),
+              })
+            : await controller.resumeThread({
+                threadId: options.thread,
+                ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
+                ...(approvalPolicy === undefined ? {} : { approvalPolicy }),
+              })
+          if (started instanceof Error) fail(started)
+          const interrupt = cancelAfter === undefined ? null : setTimeout(() => {
+            const cancelled = controller.cancel({ threadId: started.threadId })
+            if (cancelled instanceof Error) printJson({ kind: 'cancel-failed', reason: cancelled.message })
+            else printJson({ kind: 'cancel-requested', afterMs: cancelAfter })
+          }, cancelAfter)
+          const result = await controller.sendTurn({ threadId: started.threadId, text: prompt, onDelta: ({ text }) => printJson({ kind: 'delta', text }) })
+          if (interrupt) clearTimeout(interrupt)
+          if (result instanceof Error) fail(result)
+          printJson({ kind: 'turn', status: result.status, threadId: result.threadId, turnId: result.turnId, text: result.text })
+        } finally { controller.close() }
+      } finally { await server.close() }
+    })
+
+  cli.command('ops follow', 'Follow one explicitly authorized OpenCode or Jcode session and publish fixed metadata')
+    .option('--source <kind>', 'Runtime source: opencode (default) or jcode')
+    .option('--service-file <path>', 'Explicit running OpenCode service file')
+    .option('--jcode-home <path>', 'Explicit Jcode home for polling observation')
+    .option('--profile <id>', 'Runtime profile: jcode (stock, default) or kcode; a mismatched identity is refused')
+    .option('--host <id>', 'Explicit runtime host identity')
+    .option('--endpoint <id>', 'Explicit runtime endpoint identity')
+    .option('--native-session <id>', 'Explicit native session ID')
+    .option('--tenant <id>', 'Explicit Discord guild ID')
+    .option('--surface <id>', 'Explicit Discord channel ID')
+    .option('--token <token>', 'Discord bot token (or KIMAKI_BOT_TOKEN)')
+    .option('--consent', 'Explicitly authorize metadata publication')
+    .option('--timeout <ms>', 'Maximum follow duration in milliseconds (default: 60000)')
+    .action(async (options) => {
+      if (options.consent !== true) fail(new ConfigError({ reason: 'Supply --consent to authorize this publication' }))
+      const source = options.source ?? 'opencode'
+      if (!['opencode', 'jcode'].includes(source)) fail(new ConfigError({ reason: 'Supply --source opencode or jcode' }))
+      const backendKind = source === 'jcode' ? 'jcode' as const : 'opencode' as const
+      const target = {
+        tenantId: required(options.tenant, 'tenant'),
+        surfaceId: required(options.surface, 'surface'),
+        session: { hostId: required(options.host, 'host'), endpointId: required(options.endpoint, 'endpoint'), backendKind, nativeSessionId: required(options.nativeSession, 'native-session') },
+      }
+      const token = required(options.token ?? process.env['KIMAKI_BOT_TOKEN'], 'token')
+      const timeout = options.timeout === undefined ? 60_000 : Number(options.timeout)
+      if (!Number.isSafeInteger(timeout) || timeout < 1 || timeout > 2_147_483_647) fail(new ConfigError({ reason: '--timeout must be a positive integer in milliseconds' }))
+      // At-most-once delivery: a 429 must surface as a failure, never be retried silently.
+      const rest = new (await import('discord.js')).REST({ ...(process.env['KIMAKI_DISCORD_REST_URL'] ? { api: process.env['KIMAKI_DISCORD_REST_URL'] } : {}), version: '10', retries: 0, rejectOnRateLimit: () => true }).setToken(token)
+      const counts = { sent: 0, denied: 0, ignored: 0 }
+      const grant = { ...target, publication: 'metadata' as const, consent: true }
+      const controller = new AbortController()
+      // The deadline stops observation and new publications. A Discord request
+      // already in flight cannot be cancelled and may still complete.
+      const timer = setTimeout(() => controller.abort(), timeout)
+      try {
+        if (source === 'jcode') {
+          const jcodeHome = required(options.jcodeHome, 'jcode-home')
+          if (options.serviceFile !== undefined) fail(new ConfigError({ reason: '--service-file does not apply to jcode' }))
+          const fs = await import('node:fs/promises')
+          const { createJcodeObserver } = await import('../ops/runtime/jcode.ts')
+          const { publishMetadataNotice } = await import('../ops/discord/publication.ts')
+          const observer = createJcodeObserver({
+            jcodeHome, profile: options.profile, hostId: target.session.hostId, endpointId: target.session.endpointId,
+            readDir: (path) => fs.readdir(path),
+            readFile: (path) => fs.readFile(path, 'utf8'),
+          })
+          if (observer instanceof Error) fail(observer)
+          let pending: Promise<void> | undefined
+          const observation = await observer.observe({ key: target.session, signal: controller.signal, onEvent: (event) => {
+            // Only a rename justifies a notice. Appends stay counted, not published.
+            if (event.type !== 'session.renamed') { counts.ignored++; return }
+            pending = (async () => {
+              // The observer refuses an unknown profile before this runs; the helper keeps
+              // the notice label aligned with the profile that served the session.
+              const result = await publishMetadataNotice({ rest, target, grant, ...followNoticeInput(options.profile) })
+              if (result instanceof Error) throw result
+              counts[result.kind]++
+            })()
+            return pending
+          } })
+          if (observation instanceof Error) fail(observation)
+          const { createLogger } = await import('../logger.ts')
+          createLogger('OPS').info('Follow subscription ready')
+          const result = await observation.done
+          await pending
+          if (result instanceof Error) fail(result)
+          printJson(counts)
+          return
+        }
+        const serviceFile = required(options.serviceFile, 'service-file')
+        if (options.jcodeHome !== undefined) fail(new ConfigError({ reason: '--jcode-home applies only to jcode' }))
+        const { resolveOpencode } = await import('../opencode-server.ts')
+        const { createOpenCodeObserver } = await import('../ops/runtime/opencode.ts')
+        const { publishObservedMetadata } = await import('../ops/discord/publication.ts')
+        const endpoint = await resolveOpencode({ serviceFile, ensure: false })
+        if (endpoint instanceof Error) fail(endpoint)
+        if (controller.signal.aborted) fail(new ConfigError({ reason: 'Follow timed out before subscription' }))
+        const observer = createOpenCodeObserver({ endpoint, hostId: target.session.hostId, endpointId: target.session.endpointId })
+        if (observer instanceof Error) fail(observer)
+        let pending: Promise<void> | undefined
+        const observation = await observer.observe({ key: target.session, signal: controller.signal, onEvent: (observed) => {
+          if (observed.raw.type !== 'session.renamed') { counts.ignored++; return }
+          pending = (async () => {
+            const result = await publishObservedMetadata({ rest, target, observed, grant })
+            if (result instanceof Error) throw result
+            counts[result.kind]++
+          })()
+          return pending
+        } })
+        if (observation instanceof Error) fail(observation)
+        const { createLogger } = await import('../logger.ts')
+        createLogger('OPS').info('Follow subscription ready')
+        const result = await observation.done
+        await pending
+        if (result instanceof Error) fail(result)
+        printJson(counts)
+      } finally {
+        clearTimeout(timer)
+        controller.abort()
+      }
+    })
+
+  cli.command('ops publish', 'Publish one explicitly authorized OpenCode metadata event to Discord')
+    .option('--tenant <id>', 'Explicit Discord guild ID')
+    .option('--surface <id>', 'Explicit Discord channel ID')
+    .option('--host <id>', 'Explicit runtime host identity')
+    .option('--endpoint <id>', 'Explicit runtime endpoint identity')
+    .option('--native-session <id>', 'Explicit OpenCode session ID')
+    .option('--event-file <path>', 'JSON file containing one OpenCodeObservedEvent')
+    .option('--token <token>', 'Discord bot token (or KIMAKI_BOT_TOKEN)')
+    .option('--consent', 'Explicitly authorize this one metadata publication')
+    .action(async (options) => {
+      if (options.consent !== true) fail(new ConfigError({ reason: 'Supply --consent to authorize this publication' }))
+      const target = {
+        tenantId: required(options.tenant, 'tenant'),
+        surfaceId: required(options.surface, 'surface'),
+        session: { hostId: required(options.host, 'host'), endpointId: required(options.endpoint, 'endpoint'), backendKind: 'opencode', nativeSessionId: required(options.nativeSession, 'native-session') },
+      }
+      const eventFile = required(options.eventFile, 'event-file')
+      const token = required(options.token ?? process.env['KIMAKI_BOT_TOKEN'], 'token')
+      const fs = await import('node:fs/promises')
+      const errore = await import('errore')
+      const text = await fs.readFile(eventFile, 'utf8').catch((cause) => new ConfigError({ reason: 'Cannot read --event-file', cause }))
+      if (text instanceof Error) fail(text)
+      const observed = errore.try(() => JSON.parse(text) as import('../ops/runtime/opencode.ts').OpenCodeObservedEvent, (cause) => new ConfigError({ reason: 'Invalid JSON in --event-file', cause }))
+      if (observed instanceof Error) fail(observed)
+      if (!observed || typeof observed !== 'object' || !observed.key || typeof observed.key !== 'object' || !observed.source || typeof observed.source !== 'object' || !observed.raw || typeof observed.raw !== 'object' || !observed.raw.data || typeof observed.raw.data !== 'object' || Array.isArray(observed.raw.data)) fail(new ConfigError({ reason: 'Invalid OpenCode observed event in --event-file' }))
+      const { REST } = await import('discord.js')
+      const { publishObservedMetadata } = await import('../ops/discord/publication.ts')
+      const rest = new REST({ ...(process.env['KIMAKI_DISCORD_REST_URL'] ? { api: process.env['KIMAKI_DISCORD_REST_URL'] } : {}), version: '10', retries: 0, rejectOnRateLimit: () => true }).setToken(token)
+      const result = await publishObservedMetadata({ rest, target, observed, grant: { ...target, publication: 'metadata', consent: true } })
+      if (result instanceof Error) fail(result)
+      if (result.kind === 'denied') fail(new ConfigError({ reason: 'Publication denied: event and Discord surface must match the explicit scope' }))
+      printJson(result)
+    })
+
+  cli.command('ops discover', 'Read metadata-only herdr, opencode, codex or jcode inventory, never transcripts or terminal input')
+    .option('--source <kind>', 'Inventory source: herdr (default), opencode, codex or jcode')
+    .option('--service-file <path>', 'Explicit running OpenCode service file, never start a service')
+    .option('--codex-home <path>', 'Explicit Codex state directory for the app-server, never the default home')
+    .option('--jcode-home <path>', 'Explicit Jcode home directory, never the default home')
+    .option('--profile <id>', 'Runtime profile: jcode (stock, default) or kcode; a mismatched identity is refused')
+    .option('--limit <n>', 'Page size for jcode discovery (default: 50)')
+    .option('--cursor <offset>', 'Opaque cursor from a previous jcode page')
+    .option('--json', 'Print only the JSON document; the human-readable health summary goes to stderr by default')
+    .option('--pid-map <path>', 'Explicit JSON file mapping discovered session IDs to {pid, birthMarker?}; enables one live process enumeration comparison')
+    .option('--host <id>', 'Explicit native runtime host identity')
+    .option('--endpoint <id>', 'Explicit native runtime endpoint identity')
+    .option('--binary <path>', 'Explicit herdr or Codex executable (default: herdr on PATH)')
+    .option('--herdr-session <name>', 'Explicit herdr session scope')
+    .option('--timeout <ms>', 'Bounded inventory timeout in milliseconds (default: 5000)')
+    .action(async (options) => {
+      const source = options.source ?? 'herdr'
+      if (!['herdr', 'opencode', 'codex', 'jcode'].includes(source)) fail(new ConfigError({ reason: 'Supply --source herdr, opencode, codex or jcode' }))
+      if (source === 'jcode') {
+        const jcodeHome = required(options.jcodeHome, 'jcode-home')
+        const hostId = required(options.host, 'host')
+        const endpointId = required(options.endpoint, 'endpoint')
+        if (options.serviceFile !== undefined || options.herdrSession !== undefined || options.codexHome !== undefined) fail(new ConfigError({ reason: '--service-file, --herdr-session and --codex-home do not apply to jcode' }))
+        const fs = await import('node:fs/promises')
+        const { createJcodeObserver } = await import('../ops/runtime/jcode.ts')
+        const observer = createJcodeObserver({
+          jcodeHome,
+          profile: options.profile,
+          hostId,
+          endpointId,
+          readDir: (path) => fs.readdir(path),
+          readFile: (path) => fs.readFile(path, 'utf8'),
+        })
+        if (observer instanceof Error) fail(observer)
+        const limit = options.limit === undefined ? undefined : Number(options.limit)
+        if (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 1)) fail(new ConfigError({ reason: '--limit must be a positive integer' }))
+        const page = await observer.discover({ limit, cursor: options.cursor })
+        if (page instanceof Error) fail(page)
+        const { discoverIdentity, discoverIdentityLine } = await import('./discover-identity.ts')
+        const identity = await discoverIdentity({ source: 'jcode', sessionIds: page.sessions.map(({ key }) => key.nativeSessionId), pidMapPath: options.pidMap })
+        if (identity instanceof Error) fail(identity)
+        // observation.health and skippedTransient are what separate a settled
+        // page from one where torn records were skipped. Both ride in the JSON
+        // document and the named verdict is echoed for a human reader.
+        if (options.json !== true) process.stderr.write(`${discoverHealthLine({
+          source: 'jcode',
+          health: page.observation.health,
+          skippedTransient: page.observation.skippedTransient,
+          sessions: page.sessions.length,
+          cursor: page.cursor,
+        })}\n${discoverIdentityLine('jcode', identity)}\n`)
+        printJson({ source: 'jcode', observedAt: new Date().toISOString(), coverage: 'explicit-jcode-home-metadata-page', endpoint: page.source, health: page.observation.health, skippedTransient: page.observation.skippedTransient, sessions: page.sessions.map(({ key, title }) => ({ key, title })), cursor: page.cursor, identity })
+        return
+      }
+      if (source === 'codex') {
+        const binary = required(options.binary, 'binary')
+        const codexHome = required(options.codexHome, 'codex-home')
+        const hostId = required(options.host, 'host')
+        const endpointId = required(options.endpoint, 'endpoint')
+        if (options.serviceFile !== undefined || options.herdrSession !== undefined) fail(new ConfigError({ reason: '--service-file and --herdr-session do not apply to codex' }))
+        const { startCodexAppServer } = await import('../ops/runtime/codex-app-server.ts')
+        const { createCodexObserver } = await import('../ops/runtime/codex.ts')
+        const server = await startCodexAppServer({ binary, codexHome, timeoutMs: options.timeout === undefined ? undefined : Number(options.timeout) })
+        if (server instanceof Error) fail(server)
+        try {
+          const observer = createCodexObserver({ hostId, endpointId, request: server.request })
+          if (observer instanceof Error) fail(observer)
+          const page = await observer.discover()
+          if (page instanceof Error) fail(page)
+          const { discoverIdentity, discoverIdentityLine } = await import('./discover-identity.ts')
+          const identity = await discoverIdentity({ source: 'codex', sessionIds: page.sessions.map(({ key }) => key.nativeSessionId), pidMapPath: options.pidMap })
+          if (identity instanceof Error) fail(identity)
+          if (options.json !== true) process.stderr.write(`${discoverIdentityLine('codex', identity)}\n`)
+          printJson({ source: 'codex', observedAt: new Date().toISOString(), coverage: 'explicit-app-server-state-db-page', endpoint: page.source, sessions: page.sessions.map(({ key }) => key), cursor: page.cursor, identity })
+        } finally {
+          await server.close()
+        }
+        return
+      }
+      if (source === 'opencode') {
+        const serviceFile = required(options.serviceFile, 'service-file')
+        const hostId = required(options.host, 'host')
+        const endpointId = required(options.endpoint, 'endpoint')
+        if (options.binary !== undefined || options.herdrSession !== undefined || options.timeout !== undefined) fail(new ConfigError({ reason: '--binary, --herdr-session and --timeout apply only to herdr. Native requests have a fixed bounded timeout' }))
+        const { resolveOpencode } = await import('../opencode-server.ts')
+        const { createOpenCodeObserver } = await import('../ops/runtime/opencode.ts')
+        const endpoint = await resolveOpencode({ serviceFile, ensure: false })
+        if (endpoint instanceof Error) fail(endpoint)
+        const observer = createOpenCodeObserver({ endpoint, hostId, endpointId })
+        if (observer instanceof Error) fail(observer)
+        const page = await observer.discover()
+        if (page instanceof Error) fail(page)
+        const { discoverIdentity, discoverIdentityLine } = await import('./discover-identity.ts')
+        const identity = await discoverIdentity({ source: 'opencode', sessionIds: page.sessions.map(({ key }) => key.nativeSessionId), pidMapPath: options.pidMap })
+        if (identity instanceof Error) fail(identity)
+        if (options.json !== true) process.stderr.write(`${discoverIdentityLine('opencode', identity)}\n`)
+        printJson({ source: 'opencode', observedAt: new Date().toISOString(), coverage: 'explicit-native-endpoint-page', endpoint: page.source, sessions: page.sessions.map(({ key, native }) => ({ key, title: native.title })), cursor: page.cursor, identity })
+        return
+      }
+      if (options.serviceFile !== undefined || options.host !== undefined || options.endpoint !== undefined || options.codexHome !== undefined || options.jcodeHome !== undefined) fail(new ConfigError({ reason: '--service-file, --host, --endpoint, --codex-home and --jcode-home apply only to opencode, codex or jcode' }))
+      const { discoverHerdr } = await import('../ops/discovery/herdr.ts')
+      const result = await discoverHerdr({ binary: options.binary, session: options.herdrSession, timeoutMs: options.timeout === undefined ? undefined : Number(options.timeout) })
+      if (result instanceof Error) fail(result)
+      // herdr carries no native session key, so a pid map is keyed by the
+      // reported candidate value when present, else the herdr pane id.
+      const { discoverIdentity, discoverIdentityLine } = await import('./discover-identity.ts')
+      const identity = await discoverIdentity({
+        source: 'herdr',
+        sessionIds: result.agents.map((agent) => agent.sessionCandidate?.value ?? agent.terminal_id),
+        pidMapPath: options.pidMap,
+      })
+      if (identity instanceof Error) fail(identity)
+      if (options.json !== true) process.stderr.write(`${discoverIdentityLine('herdr', identity)}\n`)
+      printJson({ ...result, identity })
+    })
+
+  cli.command('ops paperclip run', 'Read one Paperclip run as metadata only, never transcript, logs or control')
+    .option('--base-url <url>', 'Explicit Paperclip instance base URL, for example http://127.0.0.1:3199')
+    .option('--run-id <id>', 'Explicit Paperclip heartbeat run ID')
+    .option('--company <id>', 'Expected company scope; a different company is refused')
+    .option('--agent <id>', 'Expected agent scope; a different agent is refused')
+    .option('--timeout <ms>', 'Bounded read timeout in milliseconds (default: 10000)')
+    .action(async (options) => {
+      const baseUrl = required(options.baseUrl, 'base-url')
+      const runId = required(options.runId, 'run-id')
+      const timeout = options.timeout === undefined ? undefined : Number(options.timeout)
+      if (timeout !== undefined && (!Number.isSafeInteger(timeout) || timeout < 1)) fail(new ConfigError({ reason: '--timeout must be a positive integer in milliseconds' }))
+      const { readPaperclipRun } = await import('../ops/paperclip/observe.ts')
+      const result = await readPaperclipRun({
+        baseUrl,
+        runId,
+        expected: { companyId: options.company, agentId: options.agent },
+        timeoutMs: timeout,
+      })
+      if (result instanceof Error) fail(result)
+      printJson(result)
+    })
+
+  cli.command('ops bind', 'Register metadata-only observe association. No transcript publishing or runtime control')
+    .option('--data-dir <path>', DATA_DIR_HELP)
+    .option('--host <id>', 'Explicit runtime host identity')
+    .option('--endpoint <id>', 'Explicit runtime endpoint identity, not a herdr pane')
+    .option('--backend <kind>', 'Native runtime kind, for example codex or jcode')
+    .option('--native-session <id>', 'Explicit native session ID, not a cwd or reported path')
+    .option('--tenant <id>', 'Service tenant, for example Discord guild ID')
+    .option('--service <kind>', 'Outward service kind (default: discord)')
+    .option('--surface <id>', 'Outward conversation/surface ID')
+    .option('--request <id>', 'Stable idempotency ID for this binding intent')
+    .action(async (options) => {
+      const session = {
+        hostId: required(options.host, 'host'),
+        endpointId: required(options.endpoint, 'endpoint'),
+        backendKind: required(options.backend, 'backend'),
+        nativeSessionId: required(options.nativeSession, 'native-session'),
+      }
+      const tenantId = required(options.tenant, 'tenant')
+      const surfaceId = required(options.surface, 'surface')
+      const idempotencyKey = required(options.request, 'request')
+      const { bindSurface } = await import('../ops/bindings.ts')
+      const opened = await openCliDb(options.dataDir)
+      const result = await bindSurface({ db: opened.db, session, tenantId, surfaceId, idempotencyKey, serviceKind: options.service ?? 'discord' })
+      opened.close()
+      if (result instanceof Error) fail(result)
+      printJson(result)
+    })
+
+  cli.command('ops bindings', 'List local metadata-only associations in an explicit tenant, including detached rows')
+    .option('--data-dir <path>', DATA_DIR_HELP)
+    .option('--tenant <id>', 'Explicit service tenant ID')
+    .option('--service <kind>', 'Outward service kind (default: discord)')
+    .action(async (options) => {
+      const tenantId = required(options.tenant, 'tenant')
+      const { listBindings } = await import('../ops/bindings.ts')
+      const opened = await openCliDb(options.dataDir)
+      const result = await listBindings({ db: opened.db, tenantId, serviceKind: options.service ?? 'discord' })
+      opened.close()
+      if (result instanceof Error) fail(result)
+      printJson(result)
+    })
+
+  cli.command('ops detach <binding-id>', 'Detach metadata association only. Never stop, resume or interrupt the agent')
+    .option('--data-dir <path>', DATA_DIR_HELP)
+    .option('--tenant <id>', 'Explicit service tenant ID')
+    .option('--service <kind>', 'Outward service kind (default: discord)')
+    .action(async (bindingId, options) => {
+      const tenantId = required(options.tenant, 'tenant')
+      const { detachBinding } = await import('../ops/bindings.ts')
+      const opened = await openCliDb(options.dataDir)
+      const result = await detachBinding({ db: opened.db, bindingId, tenantId, serviceKind: options.service ?? 'discord' })
+      opened.close()
+      if (result instanceof Error) fail(result)
+      printJson(result)
+    })
+
+  cli.command('ops jcode run', 'Run one prompt through the Jcode backend over ACP and stream its text')
+    .option('--cwd <path>', 'Working directory for the Jcode ACP session')
+    .option('--prompt <text>', 'Prompt text sent as one ACP session/prompt')
+    .option('--binary <path>', 'Explicit Jcode executable; without it the profile resolves one')
+    .option('--profile <id>', 'Runtime profile: jcode (stock, default) or kcode; a mismatched identity is refused')
+    .option('--model <id>', 'Model selected for the ACP session instead of the agent default')
+    .option('--tool-profile <kind>', 'Jcode tool profile: none (default), minimal or full')
+    .option('--timeout <ms>', 'Per-request ACP deadline in milliseconds')
+    .option('--json', 'Print the final summary as JSON')
+    .action(async (options) => {
+      const cwd = required(options.cwd, 'cwd')
+      const prompt = required(options.prompt, 'prompt')
+      const model = options.model?.trim() ? options.model : undefined
+      const toolProfile = options.toolProfile ?? 'none'
+      if (!['none', 'minimal', 'full'].includes(toolProfile)) fail(new ConfigError({ reason: 'Supply --tool-profile none, minimal or full' }))
+      const timeoutMs = options.timeout === undefined ? undefined : Number(options.timeout)
+      if (timeoutMs !== undefined && (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1)) fail(new ConfigError({ reason: '--timeout must be a positive integer in milliseconds' }))
+      const { createJcodeBackend } = await import('../backend/jcode.ts')
+      const backend = createJcodeBackend({ binary: options.binary, profile: options.profile, cwd, model, toolProfile: toolProfile as 'none' | 'minimal' | 'full', timeoutMs })
+      const started = await backend.start()
+      if (started instanceof Error) {
+        await backend.close()
+        fail(started)
+      }
+      // With --json the summary owns stdout, so streamed chunks are suppressed
+      // rather than glued in front of the document.
+      const stream = options.json === true ? undefined : (text: string) => { process.stdout.write(text) }
+      const result = await backend.prompt(prompt, stream)
+      await backend.close()
+      if (result instanceof Error) fail(result)
+      if (options.json) printJson({
+        sessionId: started.sessionId,
+        model: started.model,
+        stopReason: result.stopReason,
+        updateCount: result.updateCount,
+        characters: result.text.length,
+        ...(result.usage === undefined ? {} : { usage: result.usage }),
+      })
+      else process.stdout.write(`\n${result.stopReason}\n`)
+    })
+
+  cli.command('ops jcode serve', 'Serve one Jcode session on loopback so several clients can watch the same turns')
+    .option('--cwd <path>', 'Working directory for the Jcode ACP session')
+    .option('--binary <path>', 'Explicit Jcode executable; without it the profile resolves one')
+    .option('--profile <id>', 'Runtime profile: jcode (stock, default) or kcode; a mismatched identity is refused')
+    .option('--model <id>', 'Model selected for the ACP session instead of the agent default')
+    .option('--tool-profile <kind>', 'Jcode tool profile: none (default), minimal or full')
+    .option('--port <n>', 'Loopback port (default: 0, an ephemeral port)')
+    .option('--token <token>', 'Optional shared token required in the x-kimaki-hub header')
+    .option('--log <path>', 'Append-only JSONL event log; enables resume across restarts and takes a writer lease')
+    .option('--timeout <ms>', 'Per-request ACP deadline in milliseconds')
+    .option('--buffer <n>', 'In-memory replay buffer size in events (default: 500)')
+    .option('--data-dir <path>', DATA_DIR_HELP)
+    .option('--run-id <id>', 'Paperclip run ID for the durable launch fence; a second launcher for the same run is refused')
+    .option('--instance <id>', 'Paperclip instance ID for the launch fence (default: local)')
+    .action(async (options) => {
+      const cwd = required(options.cwd, 'cwd')
+      const toolProfile = options.toolProfile ?? 'none'
+      if (!['none', 'minimal', 'full'].includes(toolProfile)) fail(new ConfigError({ reason: 'Supply --tool-profile none, minimal or full' }))
+      const port = options.port === undefined ? 0 : Number(options.port)
+      if (!Number.isSafeInteger(port) || port < 0 || port > 65535) fail(new ConfigError({ reason: '--port must be an integer between 0 and 65535' }))
+      const timeoutMs = options.timeout === undefined ? undefined : Number(options.timeout)
+      if (timeoutMs !== undefined && (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1)) fail(new ConfigError({ reason: '--timeout must be a positive integer in milliseconds' }))
+      const model = options.model?.trim() ? options.model : undefined
+      const buffer = options.buffer === undefined ? undefined : Number(options.buffer)
+      if (buffer !== undefined && (!Number.isSafeInteger(buffer) || buffer < 1)) fail(new ConfigError({ reason: '--buffer must be a positive integer' }))
+      // The fence is taken before any hub or backend exists, so a refused claim
+      // exits here having spawned nothing.
+      const launch = await openServeLaunchFence({ runId: options.runId, instance: options.instance, dataDir: options.dataDir })
+      if (launch instanceof ConfigError) fail(launch)
+      const { createJcodeBackend } = await import('../backend/jcode.ts')
+      const { createSessionHub } = await import('../backend/hub.ts')
+      const { startHubServer } = await import('../backend/hub-server.ts')
+      const backend = createJcodeBackend({ binary: options.binary, profile: options.profile, cwd, model, toolProfile: toolProfile as 'none' | 'minimal' | 'full', timeoutMs })
+      const hub = createSessionHub({
+        backend,
+        model,
+        logFile: options.log,
+        ...(buffer === undefined ? {} : { bufferLimit: buffer }),
+        ...(launch === undefined ? {} : { launchFence: launch.launchFence }),
+      })
+      if (hub instanceof Error) {
+        await backend.close()
+        launch?.close()
+        fail(hub)
+      }
+      const server = await startHubServer({ hub, port, token: options.token })
+      if (server instanceof Error) {
+        await hub.close()
+        launch?.close()
+        fail(server)
+      }
+      // One line so a supervising client can attach without guessing the port.
+      printJson({ url: server.url, port: server.port, capabilities: hub.capabilities })
+      const shutdown = async (): Promise<void> => {
+        await server.close()
+        await hub.close()
+        launch?.close()
+        process.exit(0)
+      }
+      process.once('SIGINT', () => { void shutdown() })
+      process.once('SIGTERM', () => { void shutdown() })
+      // Stay attached until a signal arrives.
+      await new Promise<void>(() => {})
+    })
+
+  cli.command('ops jcode attach', 'Attach to a running hub, stream its events, optionally prompt and acknowledge')
+    .option('--url <url>', 'Explicit hub URL, as printed by ops jcode serve')
+    .option('--client <id>', 'Client identity to register in hub presence')
+    .option('--cursor <n>', 'Start from this cursor (default: 0)')
+    .option('--prompt <text>', 'Submit one prompt after attaching')
+    .option('--request-id <id>', 'Idempotency id for the prompt; a repeat refers to the existing receipt')
+    .option('--ack', 'Acknowledge the last sequence once a turn finishes')
+    .option('--watch <ms>', 'Stream without prompting for at most this long, then detach')
+    .option('--timeout <ms>', 'Maximum attach duration in milliseconds (default: 120000)')
+    .option('--json', 'Print a JSON summary instead of streamed text')
+    .action(async (options) => {
+      const url = required(options.url, 'url')
+      const requestedCursor = options.cursor === undefined ? undefined : Number(options.cursor)
+      if (requestedCursor !== undefined && (!Number.isSafeInteger(requestedCursor) || requestedCursor < 0)) fail(new ConfigError({ reason: '--cursor must be a non-negative integer' }))
+      const timeout = options.timeout === undefined ? 120_000 : Number(options.timeout)
+      if (!Number.isSafeInteger(timeout) || timeout < 1) fail(new ConfigError({ reason: '--timeout must be a positive integer in milliseconds' }))
+      const { openHubStream, promptHub, ackHub, readHubState } = await import('../backend/hub-client.ts')
+
+      const state = await readHubState({ baseUrl: url })
+      if (state instanceof Error) fail(state)
+      // With --prompt, replaying older turns first makes this client report the
+      // previous turn's result and exit before its own turn finishes. Attach at
+      // the current sequence so the summary describes the turn just submitted;
+      // replay-only callers still default to 0.
+      const cursor = requestedCursor ?? (options.prompt === undefined ? 0 : state.seq)
+
+      const controller = new AbortController()
+      const deadline = setTimeout(() => controller.abort(), timeout)
+      const chunks: string[] = []
+      const events: Array<{ seq: number; type: string }> = []
+      let ready: { cursor: number; clipped: boolean; source: string } | undefined
+      let lastSeq = cursor
+      let outcome: { stopReason?: string; error?: string } = {}
+      let settle: (() => void) | undefined
+      const finished = new Promise<void>((resolve) => {
+        settle = resolve
+      })
+
+      const attach = openHubStream({
+        baseUrl: url,
+        clientId: options.client,
+        cursor,
+        signal: controller.signal,
+        // A clipped replay means the hub cannot serve what this client missed.
+        // Say so instead of presenting a partial tail as the whole stream.
+        onReady: (frame) => {
+          ready = { cursor: frame.cursor, clipped: frame.clipped, source: frame.source }
+          // The frame's cursor is the one we asked for, not the oldest retained
+          // event, so name the condition rather than inventing a sequence.
+          if (frame.clipped && !options.json) process.stderr.write('replay clipped: the hub no longer retains every event after the requested cursor\n')
+        },
+        onEvent: (event) => {
+          lastSeq = event.seq
+          events.push({ seq: event.seq, type: event.type })
+          if (event.type === 'prompt.chunk') {
+            chunks.push(event.text)
+            if (!options.json) process.stdout.write(event.text)
+          }
+          if (event.type === 'prompt.finished') {
+            outcome = { stopReason: event.stopReason }
+            settle?.()
+          }
+          if (event.type === 'prompt.failed') {
+            outcome = { error: event.reason }
+            settle?.()
+          }
+        },
+      })
+
+      // Give the subscription a moment to register before prompting.
+      await new Promise((resolve) => setTimeout(resolve, 200))
+      // `openHubStream` resolves an Error when the hub refuses the attachment (for
+      // example a cursor ahead of the stream). Ignoring it made a refused attach look
+      // like a successful empty replay.
+      const settled = async (): Promise<void> => {
+        const result = await attach
+        if (result instanceof Error) {
+          clearTimeout(deadline)
+          fail(result)
+        }
+      }
+      const watch = options.watch === undefined ? undefined : Number(options.watch)
+      if (watch !== undefined && (!Number.isSafeInteger(watch) || watch < 1)) {
+        controller.abort()
+        await settled()
+        clearTimeout(deadline)
+        fail(new ConfigError({ reason: '--watch must be a positive integer in milliseconds' }))
+      }
+      if (options.prompt === undefined && watch === undefined) {
+        // Nothing to wait for: report the hub state and detach.
+        controller.abort()
+        await settled()
+        clearTimeout(deadline)
+        // `ready` carries the hub's own statement about whether the replay is
+        // complete, so a caller never has to infer it from the event list.
+        if (options.json) printJson({ state, events, ready })
+        else process.stdout.write(`attached to ${url} at seq ${state.seq}\n`)
+        return
+      }
+
+      if (options.prompt !== undefined) {
+        const submitted = await promptHub({ baseUrl: url, text: options.prompt, requestId: options.requestId })
+        if (submitted instanceof Error) {
+          controller.abort()
+          await settled()
+          clearTimeout(deadline)
+          fail(submitted)
+        }
+      }
+
+      if (watch === undefined) {
+        await finished
+      } else {
+        await Promise.race([finished, new Promise<void>((resolve) => setTimeout(resolve, watch))])
+      }
+
+      // Acknowledge before detaching: presence ends with the connection, so an
+      // ack sent after the stream closes is correctly unroutable.
+      let acked: number | undefined
+      if (options.ack && options.client !== undefined) {
+        const result = await ackHub({ baseUrl: url, clientId: options.client, seq: lastSeq })
+        if (result instanceof Error) {
+          controller.abort()
+          await settled()
+          clearTimeout(deadline)
+          fail(result)
+        }
+        acked = result.acked
+      }
+
+      controller.abort()
+      await settled()
+      clearTimeout(deadline)
+
+      if (options.json) {
+        printJson({ events, characters: chunks.join('').length, stopReason: outcome.stopReason, error: outcome.error, acked, cursor: lastSeq, ready })
+      } else {
+        process.stdout.write(`\n${outcome.error ?? outcome.stopReason ?? 'no result'}\n`)
+      }
+      if (outcome.error !== undefined) fail(new ConfigError({ reason: outcome.error }))
+    })
+
+  cli.command('ops jcode watch', 'Follow a live native Jcode session by polling session/load and emitting new messages')
+    .option('--session <id>', 'ACP session id to follow')
+    .option('--cwd <path>', 'Working directory the session belongs to')
+    .option('--binary <path>', 'Explicit Jcode executable; without it the profile resolves one')
+    .option('--profile <id>', 'Runtime profile: jcode (stock, default) or kcode; a mismatched identity is refused')
+    .option('--interval <ms>', 'Polling interval in milliseconds (default: 2000)')
+    .option('--iterations <n>', 'Stop after this many polls; 0 keeps polling (default: 0)')
+    .option('--emit-existing', 'Emit history already present at attach time')
+    .option('--allow-empty', 'Accept a session whose first poll replays no history')
+    .option('--tenant <id>', 'Discord guild ID')
+    .option('--surface <id>', 'Discord channel ID')
+    .option('--token <token>', 'Bot token (default: KIMAKI_BOT_TOKEN)')
+    .option('--state <path>', 'Durable native message cursor file')
+    .action(async (options) => {
+      const session = required(options.session, 'session')
+      const cwd = required(options.cwd, 'cwd')
+      const interval = options.interval === undefined ? 2000 : Number(options.interval)
+      if (!Number.isSafeInteger(interval) || interval < 100) fail(new ConfigError({ reason: '--interval must be an integer of at least 100ms' }))
+      const iterations = options.iterations === undefined ? 0 : Number(options.iterations)
+      if (!Number.isSafeInteger(iterations) || iterations < 0) fail(new ConfigError({ reason: '--iterations must be zero or a positive integer' }))
+      const { createAcpClient } = await import('../backend/acp/client.ts')
+      const profile = await resolveProfileOption(options.profile)
+      if (profile instanceof Error) fail(profile)
+      const command = options.binary ?? profile.executable
+      const discordRequested = [options.tenant, options.surface, options.state, options.token].some((value) => value !== undefined)
+      if (discordRequested && (!options.tenant?.trim() || !options.surface?.trim() || !options.state?.trim() || !(options.token ?? process.env['KIMAKI_BOT_TOKEN'])?.trim())) fail(new ConfigError({ reason: 'Discord watch requires --tenant, --surface, --state and --token (or KIMAKI_BOT_TOKEN) together' }))
+      let mirror: Exclude<Awaited<ReturnType<typeof import('../ops/discord/watch.ts').openNativeDiscordWatch>>, Error> | undefined
+      if (discordRequested) {
+        const { REST } = await import('discord.js')
+        const { openNativeDiscordWatch } = await import('../ops/discord/watch.ts')
+        const rest = new REST({ ...(process.env['KIMAKI_DISCORD_REST_URL'] ? { api: process.env['KIMAKI_DISCORD_REST_URL'] } : {}), version: '10', retries: 0, rejectOnRateLimit: () => true }).setToken(options.token ?? process.env['KIMAKI_BOT_TOKEN']!)
+        const opened = await openNativeDiscordWatch({ rest, tenantId: options.tenant!, channelId: options.surface!, statePath: options.state!, sessionId: session })
+        if (opened instanceof Error) fail(opened)
+        mirror = opened
+      }
+      // jcode 0.99.1 does not stream another client's turn into an attached ACP
+      // session (observed: zero updates while `jcode run --resume` wrote to the
+      // same session), and a second `session/load` on the same connection returns
+      // the history it replays at first load. A fresh ACP connection per poll
+      // therefore replays the current history, and only unseen messages are
+      // emitted, which is the honest way to follow native input.
+      let watermark = options.emitExisting === true ? 0 : null as number | null
+      let seen = 0
+      let polls = 0
+      let failure: Error | undefined
+      for (;;) {
+        const client = createAcpClient({ command, args: ['acp'], cwd, expectedIdentity: profile.expectedIdentity, identityLabel: profile.id })
+        const initialized = await client.initialize()
+        if (initialized instanceof Error) {
+          await client.close()
+          failure = initialized
+          break
+        }
+        const loaded = await client.loadSession({ sessionId: session, cwd })
+        await client.close()
+        if (loaded instanceof Error) {
+          failure = loaded
+          break
+        }
+        // jcode answers session/load successfully for an id that does not exist
+        // and replays nothing, so an empty first poll is ambiguous: following it
+        // would poll forever and never report anything. Refuse it explicitly.
+        if (polls === 0 && loaded.history.length === 0 && options.allowEmpty !== true) {
+          failure = new ConfigError({ reason: 'The agent replayed no history on the first poll; jcode 0.99.1 also returns success for an unknown session id, so this is refused unless --allow-empty is given' })
+          break
+        }
+        if (watermark === null) {
+          // First poll establishes the baseline unless --emit-existing is set.
+          watermark = options.emitExisting === true ? 0 : loaded.history.length
+        }
+        if (loaded.history.length < watermark) {
+          // The native client truncated or forked the history; restart from zero
+          // rather than inventing continuity.
+          watermark = 0
+        }
+        if (mirror) {
+          const published = await mirror.publish(loaded.history)
+          if (published instanceof Error) { failure = published; break }
+          seen += published
+        } else {
+          for (const message of loaded.history.slice(watermark)) {
+            printJson({ kind: 'native', role: message.role, text: message.text, index: seen })
+            seen += 1
+          }
+        }
+        watermark = loaded.history.length
+        polls += 1
+        if (iterations !== 0 && polls >= iterations) break
+        await new Promise((resolve) => setTimeout(resolve, interval))
+      }
+      if (failure) fail(failure)
+      printJson({ kind: 'stopped', polls, messages: seen })
+    })
+
+  cli.command('ops codex serve', 'Serve one Codex thread on loopback so several clients can watch the same turns')
+    .option('--binary <path>', 'Explicit Codex executable')
+    .option('--codex-home <dir>', 'Explicit isolated Codex state directory')
+    .option('--cwd <path>', 'Working directory for the thread')
+    .option('--thread <id>', 'Resume this thread instead of starting a new one')
+    .option('--port <n>', 'Loopback port (default: 0, an ephemeral port)')
+    .option('--token <token>', 'Optional shared token required in the x-kimaki-hub header')
+    .option('--log <path>', 'Append-only JSONL event log; enables resume across restarts and takes a writer lease')
+    .option('--timeout-ms <n>', 'Request and turn timeout in milliseconds')
+    .option('--approval <decision>', 'Answer approval requests on the served thread: accept, acceptForSession, decline or cancel')
+    .option('--approval-policy <policy>', 'Codex approval policy for the served thread: untrusted, on-request or never')
+    .action(async (options) => {
+      const binary = required(options.binary, 'binary')
+      const codexHome = required(options.codexHome, 'codex-home')
+      const cwd = required(options.cwd, 'cwd')
+      const port = options.port === undefined ? 0 : Number(options.port)
+      if (!Number.isSafeInteger(port) || port < 0 || port > 65535) fail(new ConfigError({ reason: '--port must be an integer between 0 and 65535' }))
+      const timeoutMs = options.timeoutMs === undefined ? undefined : Number(options.timeoutMs)
+      if (timeoutMs !== undefined && (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1)) fail(new ConfigError({ reason: '--timeout-ms must be a positive integer' }))
+      const approval = approvalDecision(options.approval)
+      const approvalPolicy = options.approvalPolicy === undefined
+        ? undefined
+        : (['untrusted', 'on-request', 'never'] as const).find((policy) => policy === options.approvalPolicy)
+      if (options.approvalPolicy !== undefined && approvalPolicy === undefined) fail(new ConfigError({ reason: '--approval-policy must be untrusted, on-request or never' }))
+      const { startCodexAppServer } = await import('../ops/runtime/codex-app-server.ts')
+      const { createCodexController } = await import('../ops/runtime/codex.ts')
+      const { createCodexHubBackend } = await import('../ops/runtime/codex-hub.ts')
+      const { createSessionHub } = await import('../backend/hub.ts')
+      const { startHubServer } = await import('../backend/hub-server.ts')
+      const server = await startCodexAppServer({ binary, codexHome, timeoutMs, holdServerRequests: approval !== undefined })
+      if (server instanceof Error) fail(server)
+      const controller = createCodexController({
+        hostId: 'local',
+        endpointId: 'explicit-app-server',
+        request: server.request,
+        subscribe: server.subscribe,
+        timeoutMs,
+        turnTimeoutMs: timeoutMs,
+        holdsServerRequests: approval !== undefined,
+        ...(approval === undefined ? {} : {
+          serverRequests: { result: server.respond, error: server.respondError },
+          approvals: {
+            policy: () => approval,
+            onRequest: (request: { requestId: number; method: string; command: string | null; reason: string | null; digest: string }) => printJson({
+              kind: 'approval-request',
+              requestId: request.requestId,
+              method: request.method,
+              command: request.command,
+              reason: request.reason,
+              digest: request.digest,
+              decision: approval,
+            }),
+          },
+        }),
+      })
+      if (controller instanceof Error) {
+        await server.close()
+        fail(controller)
+      }
+      // A resumed thread is the runtime's single writer, so the hub's single
+      // writer rule matches what Codex already enforces.
+      const backend = createCodexHubBackend({
+        controller,
+        cwd,
+        ...(options.thread === undefined ? {} : { resumeThreadId: options.thread }),
+        ...(approvalPolicy === undefined ? {} : { approvalPolicy }),
+      })
+      const hub = createSessionHub({ backend, logFile: options.log })
+      if (hub instanceof Error) {
+        controller.close()
+        await server.close()
+        fail(hub)
+      }
+      // A durable log restores the session id, but the backend still has to be
+      // reattached to it. Without this the hub replays history and then refuses
+      // every prompt, which is exactly what happened before this check existed.
+      const restored = hub.snapshot().sessionId
+      if (restored !== null) {
+        if (options.thread !== restored) {
+          await hub.close()
+          controller.close()
+          await server.close()
+          fail(new ConfigError({ reason: `The log belongs to thread ${restored}; pass --thread ${restored} to resume it` }))
+        }
+        const attached = await backend.start()
+        if (attached instanceof Error) {
+          await hub.close()
+          controller.close()
+          await server.close()
+          fail(attached)
+        }
+        if (attached.sessionId !== restored) {
+          await hub.close()
+          controller.close()
+          await server.close()
+          fail(new ConfigError({ reason: `The backend resumed ${attached.sessionId}, not the logged thread ${restored}` }))
+        }
+      }
+      const started = await startHubServer({ hub, port, token: options.token })
+      if (started instanceof Error) {
+        await hub.close()
+        controller.close()
+        await server.close()
+        fail(started)
+      }
+      printJson({ url: started.url, port: started.port, capabilities: hub.capabilities })
+      const shutdown = async (): Promise<void> => {
+        await started.close()
+        await hub.close()
+        controller.close()
+        await server.close()
+        process.exit(0)
+      }
+      process.once('SIGINT', () => { void shutdown() })
+      process.once('SIGTERM', () => { void shutdown() })
+      await new Promise<void>(() => {})
+    })
+
+  cli.command('ops codex history', 'Read an existing Codex thread through the app-server and print its messages')
+    .option('--binary <path>', 'Explicit Codex executable')
+    .option('--codex-home <dir>', 'Explicit isolated Codex state directory')
+    .option('--thread <id>', 'Thread id to read')
+    .option('--timeout-ms <n>', 'Request timeout in milliseconds')
+    .option('--json', 'Print one JSON document instead of one line per message')
+    .action(async (options) => {
+      const binary = required(options.binary, 'binary')
+      const codexHome = required(options.codexHome, 'codex-home')
+      const threadId = required(options.thread, 'thread')
+      const timeoutMs = options.timeoutMs === undefined ? undefined : Number(options.timeoutMs)
+      if (timeoutMs !== undefined && (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1)) fail(new ConfigError({ reason: '--timeout-ms must be a positive integer' }))
+      const { startCodexAppServer } = await import('../ops/runtime/codex-app-server.ts')
+      const { createCodexController } = await import('../ops/runtime/codex.ts')
+      const server = await startCodexAppServer({ binary, codexHome, timeoutMs })
+      if (server instanceof Error) fail(server)
+      try {
+        const controller = createCodexController({ hostId: 'local', endpointId: 'explicit-app-server', request: server.request, subscribe: server.subscribe, timeoutMs, turnTimeoutMs: timeoutMs })
+        if (controller instanceof Error) fail(controller)
+        try {
+          const read = await controller.readThread({ threadId })
+          if (read instanceof Error) fail(read)
+          const messages = read.turns.flatMap((turn) => turn.messages.map((message) => ({ ...message, turnId: turn.id, status: turn.status })))
+          if (messages.length === 0 && options.json !== true) {
+            fail(new ConfigError({ reason: 'The thread contains no readable user or agent messages' }))
+          }
+          if (options.json) printJson({ threadId: read.threadId, turns: read.turns.length, messages })
+          else {
+            for (const message of messages) process.stdout.write(`${message.role}: ${message.text}\n`)
+            process.stdout.write(`\n${read.turns.length} turns, ${messages.length} messages\n`)
+          }
+        } finally { controller.close() }
+      } finally { await server.close() }
+    })
+
+  cli.command('ops jcode history', 'Load an existing Jcode session over ACP and print its replayed native history')
+    .option('--session <id>', 'ACP session id to load')
+    .option('--cwd <path>', 'Working directory the session belongs to')
+    .option('--binary <path>', 'Explicit Jcode executable; without it the profile resolves one')
+    .option('--profile <id>', 'Runtime profile: jcode (stock, default) or kcode; a mismatched identity is refused')
+    .option('--timeout <ms>', 'Per-request ACP deadline in milliseconds')
+    .option('--allow-empty', 'Accept a session that replays no history')
+    .option('--json', 'Print one JSON document instead of one line per message')
+    .action(async (options) => {
+      const session = required(options.session, 'session')
+      const cwd = required(options.cwd, 'cwd')
+      const timeoutMs = options.timeout === undefined ? undefined : Number(options.timeout)
+      if (timeoutMs !== undefined && (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1)) fail(new ConfigError({ reason: '--timeout must be a positive integer in milliseconds' }))
+      const { createAcpClient } = await import('../backend/acp/client.ts')
+      const profile = await resolveProfileOption(options.profile)
+      if (profile instanceof Error) fail(profile)
+      const client = createAcpClient({ command: options.binary ?? profile.executable, args: ['acp'], cwd, timeoutMs, expectedIdentity: profile.expectedIdentity, identityLabel: profile.id })
+      const initialized = await client.initialize()
+      if (initialized instanceof Error) {
+        await client.close()
+        fail(initialized)
+      }
+      const loaded = await client.loadSession({ sessionId: session, cwd })
+      await client.close()
+      if (loaded instanceof Error) fail(loaded)
+      // jcode 0.99.1 answers session/load successfully for an id that does not
+      // exist and replays nothing, so an empty replay is ambiguous. Refuse it
+      // rather than let an operator read "0 messages" as a real session.
+      if (loaded.history.length === 0 && options.allowEmpty !== true) {
+        fail(new ConfigError({ reason: 'The agent replayed no history; jcode 0.99.1 also returns success for an unknown session id, so this is refused unless --allow-empty is given' }))
+      }
+      // Replayed input is what the native client sent, so it is the only proof
+      // that a session outside kimaki is being observed rather than invented.
+      if (options.json) printJson({ sessionId: loaded.sessionId, model: loaded.model, history: loaded.history })
+      else {
+        for (const message of loaded.history) process.stdout.write(`${message.role}: ${message.text}\n`)
+        process.stdout.write(`\n${loaded.history.length} messages, model ${loaded.model ?? 'unknown'}\n`)
+      }
+    })
+
+  cli.command('ops discord view', 'Mirror one hub session into a Discord channel, resuming from a durable cursor')
+    .option('--url <url>', 'Explicit hub URL, as printed by ops jcode serve')
+    .option('--tenant <id>', 'Guild id the channel must belong to')
+    .option('--surface <id>', 'Channel id to post turns into')
+    .option('--token <token>', 'Bot token (default: KIMAKI_BOT_TOKEN)')
+    .option('--state <path>', 'Durable cursor file; a restart posts nothing twice')
+    .option('--client <id>', 'Client identity to register in hub presence (default: discord-view-<surface>, which refuses a second view of the same channel)')
+    .option('--host <id>', 'Consumer host identity; with --endpoint, --backend and --native-session the view claims its surface binding before every post')
+    .option('--endpoint <id>', 'Consumer endpoint identity, naming the binding row this view holds')
+    .option('--backend <kind>', 'Consumer runtime kind recorded on its binding')
+    .option('--native-session <id>', 'Consumer native session recorded on its binding')
+    .option('--service <kind>', 'Outward service kind of the claimed surface (default: discord)')
+    .option('--data-dir <path>', DATA_DIR_HELP)
+    .option('--cursor <n>', 'Start from this cursor when the state file is missing')
+    .option('--rebind', 'Follow a live session.started that names a different session instead of failing closed (default: refuse)')
+    .option('--timeout <ms>', 'Maximum viewing duration in milliseconds (default: 0, unbounded)')
+    .action(async (options) => {
+      const url = required(options.url, 'url')
+      const tenant = required(options.tenant, 'tenant')
+      const surface = required(options.surface, 'surface')
+      const token = required(options.token ?? process.env['KIMAKI_BOT_TOKEN'], 'token')
+      const statePath = required(options.state, 'state')
+      const cursor = options.cursor === undefined ? undefined : Number(options.cursor)
+      if (cursor !== undefined && (!Number.isSafeInteger(cursor) || cursor < 0)) fail(new ConfigError({ reason: '--cursor must be a non-negative integer' }))
+      const timeout = options.timeout === undefined ? 0 : Number(options.timeout)
+      if (!Number.isSafeInteger(timeout) || timeout < 0) fail(new ConfigError({ reason: '--timeout must be zero or a positive integer in milliseconds' }))
+      // All four consumer flags or none: a partial identity would claim a row it
+      // cannot name, and no flags keeps the pre-cutover mirror behavior exactly.
+      const consumerFlags = [options.host, options.endpoint, options.backend, options.nativeSession]
+      const suppliedConsumerFlags = consumerFlags.filter((value) => typeof value === 'string' && value.trim() !== '')
+      if (suppliedConsumerFlags.length !== 0 && suppliedConsumerFlags.length !== consumerFlags.length) {
+        fail(new ConfigError({ reason: 'Supply --host, --endpoint, --backend and --native-session together to claim the surface before posting, or none of them to mirror without a claim' }))
+      }
+      let closeDb: (() => void) | undefined
+      let viewClaim: ViewClaim | undefined
+      if (suppliedConsumerFlags.length === consumerFlags.length) {
+        // The claim is the binding row that names this consumer, so it lives in
+        // the same store a cutover moves. Opening it here also refuses a view
+        // whose metadata database was never created.
+        const opened = await openCliDb(options.dataDir)
+        const { createCutoverLedger } = await import('../ops/cutover.ts')
+        closeDb = opened.close
+        viewClaim = {
+          db: opened.db,
+          ledger: createCutoverLedger(),
+          consumer: {
+            hostId: required(options.host, 'host'),
+            endpointId: required(options.endpoint, 'endpoint'),
+            backendKind: required(options.backend, 'backend'),
+            nativeSessionId: required(options.nativeSession, 'native-session'),
+          },
+          ...(options.service === undefined ? {} : { serviceKind: options.service }),
+          onClaim: (result) => printJson({ kind: 'claim', ...result }),
+        }
+      }
+      const { REST } = await import('discord.js')
+      const { openDiscordView, defaultViewClientId } = await import('../ops/discord/view.ts')
+      const rest = new REST({ ...(process.env['KIMAKI_DISCORD_REST_URL'] ? { api: process.env['KIMAKI_DISCORD_REST_URL'] } : {}), version: '10', retries: 0, rejectOnRateLimit: () => true }).setToken(token)
+      const controller = new AbortController()
+      const deadline = timeout === 0 ? null : setTimeout(() => controller.abort(), timeout)
+      const failure = await openDiscordView({
+        rest,
+        tenantId: tenant,
+        channelId: surface,
+        // The hub refuses a duplicate client id, so the default is scoped to the
+        // channel instead of the process: a second view on the same channel is
+        // refused (one post per turn) while another channel keeps its own id.
+        clientId: options.client ?? defaultViewClientId(surface),
+        cursor,
+        statePath,
+        baseUrl: url,
+        signal: controller.signal,
+        rebind: options.rebind === true,
+        onPosted: (seq) => printJson({ kind: 'posted', seq }),
+        ...(viewClaim === undefined ? {} : { claim: viewClaim }),
+      })
+      if (deadline) clearTimeout(deadline)
+      // `fail` exits through process.exit, but a live view holds a SQLite handle
+      // and open REST sockets; exiting from under them asserts inside libuv on
+      // Windows (UV_HANDLE_CLOSING) instead of returning the refusal code. Report
+      // the same message chain, keep the code, and let the handles drain.
+      const stop = (error: Error): void => {
+        const lines = [error.message]
+        for (let cause = error.cause; cause instanceof Error; cause = cause.cause) lines.push(`  caused by: ${cause.message}`)
+        process.stderr.write(`${lines.join('\n')}\n`)
+        process.exitCode = 1
+      }
+      if (failure instanceof Error) {
+        closeDb?.()
+        stop(failure)
+        return
+      }
+      closeDb?.()
+      printJson({ kind: 'closed' })
+    })
+
+  // Enrolment is only ever written by this explicit action: every field the
+  // record carries is supplied here, including the literal surface, mode,
+  // publication policy and canonical timestamp. A widened value reaches the
+  // module and is refused by it, so the command never grants more than the
+  // module's fixed observe/none boundary.
+  cli.command('ops paperclip enroll', 'Explicitly enroll one observed session into the Paperclip surface')
+    .option('--action <action>', 'The explicit operator action; must be exactly "enroll"')
+    .option('--host <id>', 'Explicit runtime host identity')
+    .option('--endpoint <id>', 'Explicit runtime endpoint identity, not a surface or thread id')
+    .option('--backend <kind>', 'Native runtime kind, for example opencode or codex')
+    .option('--native-session <id>', 'Explicit native session ID')
+    .option('--runtime-backend-kind <kind>', 'Runtime backend kind; must match --backend')
+    .option('--runtime-endpoint <id>', 'Runtime endpoint identity; must match --endpoint')
+    .option('--runtime-version <version>', 'Optional runtime version metadata; never widens authority')
+    .option('--surface <surface>', 'Enrolled surface; must be paperclip')
+    .option('--mode <mode>', 'Enrolled mode; must be observe')
+    .option('--publication <policy>', 'Publication policy; must be none')
+    .option('--created-at <iso>', 'Explicit canonical ISO 8601 enrollment timestamp')
+    .option('--existing <path>', 'JSON file holding existing enrollment records; a different record for the same session is refused')
+    .action(async (options) => {
+      const existing = options.existing === undefined ? [] : await readExplicitJson(options.existing, 'existing')
+      if (!Array.isArray(existing)) fail(new ConfigError({ reason: '--existing must hold one JSON array of enrollment records' }))
+      const { enrollSession } = await import('../ops/paperclip/enrollment.ts')
+      const outcome = enrollSession({
+        action: required(options.action, 'action'),
+        session: {
+          hostId: required(options.host, 'host'),
+          endpointId: required(options.endpoint, 'endpoint'),
+          backendKind: required(options.backend, 'backend'),
+          nativeSessionId: required(options.nativeSession, 'native-session'),
+        },
+        runtime: {
+          backendKind: required(options.runtimeBackendKind, 'runtime-backend-kind'),
+          endpointId: required(options.runtimeEndpoint, 'runtime-endpoint'),
+          ...(options.runtimeVersion === undefined ? {} : { version: options.runtimeVersion }),
+        },
+        surface: required(options.surface, 'surface'),
+        mode: required(options.mode, 'mode'),
+        publication: required(options.publication, 'publication'),
+        createdAt: required(options.createdAt, 'created-at'),
+      }, existing)
+      if (outcome instanceof Error) fail(outcome)
+      printJson(outcome.record)
+    })
+
+  // Projection reads an enrollment that already carries its own digest, so the
+  // record always comes from a file. Session fields name the observed session
+  // explicitly and the module refuses one that is not the enrolled session.
+  cli.command('ops paperclip project', 'Project one explicitly enrolled session into its observed Paperclip entity')
+    .option('--file <path>', 'JSON file holding the full projection input: enrollment, session and optional metadata')
+    .option('--enrollment <path>', 'JSON file holding one enrollment record, when not using --file')
+    .option('--host <id>', 'Explicit observed runtime host identity')
+    .option('--endpoint <id>', 'Explicit observed runtime endpoint identity')
+    .option('--backend <kind>', 'Observed native runtime kind')
+    .option('--native-session <id>', 'Explicit observed native session ID')
+    .option('--runtime-version <version>', 'Observed runtime version metadata')
+    .option('--observed-at <iso>', 'Explicit canonical ISO 8601 observation timestamp')
+    .action(async (options) => {
+      const { projectObservedSession } = await import('../ops/paperclip/project.ts')
+      let input: unknown
+      if (options.file !== undefined) {
+        const alongside = [options.enrollment, options.host, options.endpoint, options.backend, options.nativeSession, options.runtimeVersion, options.observedAt]
+        if (alongside.some((value) => value !== undefined)) {
+          fail(new ConfigError({ reason: '--file supplies the whole projection input; do not combine it with --enrollment or session flags' }))
+        }
+        input = await readExplicitJson(options.file, 'file')
+      } else {
+        const enrollment = await readExplicitJson(required(options.enrollment, 'enrollment'), 'enrollment')
+        const metadata = {
+          ...(options.runtimeVersion === undefined ? {} : { runtimeVersion: options.runtimeVersion }),
+          ...(options.observedAt === undefined ? {} : { observedAt: options.observedAt }),
+        }
+        input = {
+          enrollment,
+          session: {
+            hostId: required(options.host, 'host'),
+            endpointId: required(options.endpoint, 'endpoint'),
+            backendKind: required(options.backend, 'backend'),
+            nativeSessionId: required(options.nativeSession, 'native-session'),
+          },
+          ...(Object.keys(metadata).length === 0 ? {} : { metadata }),
+        }
+      }
+      const entity = projectObservedSession(input)
+      if (entity instanceof Error) fail(entity)
+      printJson(entity)
+    })
+}
+
+// Reads an explicitly provided JSON document for the Paperclip commands. A
+// missing or unparsable file is a CLI input error, not a Paperclip record, so it
+// is refused here before the module sees anything.
+async function readExplicitJson(filePath: string, flag: string): Promise<unknown> {
+  const { readFileSync } = await import('node:fs')
+  let text: string
+  try {
+    text = readFileSync(filePath, 'utf8')
+  } catch (cause) {
+    return fail(new ConfigError({ reason: `Cannot read --${flag} file ${filePath}: ${(cause as Error).message}` }))
+  }
+  try {
+    return JSON.parse(text) as unknown
+  } catch (cause) {
+    return fail(new ConfigError({ reason: `--${flag} file ${filePath} is not valid JSON: ${(cause as Error).message}` }))
+  }
+}

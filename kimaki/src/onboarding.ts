@@ -79,26 +79,49 @@ export async function chooseGuild({
   return discord.guilds.cache.get(picked) ?? new ConfigError({ reason: `Unknown server ${picked}` })
 }
 
+// The sentence that says WHY OpenCode is being installed (step 1.5 in
+// docs/opencode-removal.md). The opencode backend requires it by definition, so the
+// original wording is kept unchanged there. A jcode start runs this check only for
+// legacy compatibility: persisted threads that were created with OpenCode.
+export function opencodeInstallReason({ legacyThreadCount }: { legacyThreadCount: number }): string {
+  if (legacyThreadCount <= 0) return 'Kimaki requires OpenCode 2'
+  const subject =
+    legacyThreadCount === 1
+      ? '1 existing Discord thread was created with OpenCode and still needs it'
+      : `${legacyThreadCount} existing Discord threads were created with OpenCode and still need it`
+  return `Kimaki needs OpenCode 2 because ${subject} (new threads do not)`
+}
+
 // Before the Discord install: a running OpenCode service, or a V2 binary to
 // start one. When OpenCode is missing it installs V2 with the official script,
 // like V1 installed its tools (asks first in a terminal). An OpenCode 1 or an
 // old V2 is never replaced: the error tells the user how to install V2.
+//
+// `legacyThreadCount` is 0 for the opencode backend (it requires OpenCode) and the
+// number of persisted OpenCode threads for a jcode start (legacy compatibility).
 export async function ensureOpencode({
   serviceFile,
+  legacyThreadCount = 0,
 }: {
   serviceFile?: string
+  legacyThreadCount?: number
 }): Promise<OpenCodeMissingError | OpenCodeV1Error | OpenCodeVersionError | ConfigError | void> {
   const checked = await checkOpencode({ serviceFile })
   if (checked instanceof Error) return checked
   if (checked === 'ready') return
   const missing = new OpenCodeMissingError({ install: OPENCODE_INSTALL_COMMAND })
+  const reason = opencodeInstallReason({ legacyThreadCount })
   // The script is bash-only; OPENCODE_PATH points at a binary the user chose.
   if (process.platform === 'win32' || process.env['OPENCODE_PATH']) return missing
+  // Not every host has `/bin/bash` (NixOS keeps bash only on PATH). An install that
+  // cannot start would surface a bare ENOENT, so return the documented error instead:
+  // it names the command the user can run themselves.
+  if (!fs.existsSync('/bin/bash')) return missing
   if (process.stdin.isTTY) {
-    const confirmed = await clack.confirm({ message: `Kimaki requires OpenCode 2. Install it now with \`${OPENCODE_INSTALL_COMMAND}\`?` })
+    const confirmed = await clack.confirm({ message: `${reason}. Install it now with \`${OPENCODE_INSTALL_COMMAND}\`?` })
     if (clack.isCancel(confirmed) || !confirmed) return missing
   } else {
-    logger.log(`OpenCode 2 not found, installing: ${OPENCODE_INSTALL_COMMAND}`)
+    logger.log(`${reason}, installing: ${OPENCODE_INSTALL_COMMAND}`)
   }
   // Script output goes to stderr: stdout is for `data:` events (logging rules in AGENTS.md).
   const exitCode = await new Promise<number | ConfigError>((resolve) => {
@@ -145,6 +168,8 @@ export function onboardingPrompt(): string {
     3. Show the folders as a numbered list and ask the user to reply with the numbers to add.
     4. Add each chosen folder with its absolute path: \`kimaki project add <absolute-directory>\`
        The command prints the new channel as a mention like <#123>. Reply with the list of new channels.
+    5. If a command fails or prints no <#...> mention, say which channels were added and which were not.
+       Never report a channel as added without the mention the command printed.
 
     Never add a channel the user did not choose. Keep every message short.
   `

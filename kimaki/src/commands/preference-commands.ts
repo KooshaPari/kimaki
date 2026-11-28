@@ -32,6 +32,7 @@ import { verbosityFromV1, verbosityToV1, type Verbosity } from '../db.ts'
 import { ConfigError, DbError } from '../errors.ts'
 import { button, buttonRow, paginate, selectedPage, selectRow, type UiMessage } from '../format-parts.ts'
 import { replyError, resolveTarget, type InteractionRoutes, type InteractionTarget } from '../interaction-context.ts'
+import { jcodeConnectionRefusal, jcodeSurfaceRefusal } from '../jcode-surfaces.ts'
 import * as schema from '../schema.ts'
 import { agentSelection, primaryAgents, switchAgent } from '../sessions.ts'
 
@@ -65,6 +66,11 @@ function modelLabel(model: { providerID: string; id: string; variant?: string | 
 
 // From the next step of the session.
 export async function switchModel(bot: Bot, { sessionId, model }: { sessionId: string; model: ModelChoice }) {
+  // The session's own thread row decides when it has one: a legacy OpenCode thread
+  // on a jcode bot keeps its /model through OpenCode (jcode-surfaces.ts).
+  const threadId = bot.store.getState().sessionThreads[sessionId]
+  const refused = threadId ? jcodeSurfaceRefusal(bot, threadId, 'model') : jcodeConnectionRefusal(bot, 'model')
+  if (refused) return refused
   const choice = { providerID: model.providerID, id: model.id, ...(model.variant && { variant: model.variant }) }
   const result = await oc(bot, 'session.switchModel', (client) => client.session.switchModel({ sessionID: sessionId, model: choice }))
   if (result instanceof Error) return result
@@ -212,6 +218,8 @@ async function resetButtons(bot: Bot, { target, hash }: { target: InteractionTar
 }
 
 async function enabledModels(bot: Bot, directory: string) {
+  const refused = jcodeConnectionRefusal(bot, 'model')
+  if (refused) return refused
   const location = { directory }
   const load = () =>
     Promise.all([

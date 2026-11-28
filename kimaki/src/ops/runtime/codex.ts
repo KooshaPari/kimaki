@@ -1,0 +1,670 @@
+// Two surfaces, both over a caller-owned initialized app-server connection:
+// passive metadata reads and an explicit turn control surface. Neither the
+// observer nor the controller launches a process, reads credentials, or
+// resumes a historical thread. Streaming requires the caller to forward the
+// transport's notification stream; see `createCodexController`.
+import { createHash } from 'node:crypto'
+import * as errore from 'errore'
+import { ConfigError } from '../../errors.js'
+import type { SessionKey } from '../contracts.js'
+import { passiveCapabilities, sessionKeyId } from '../registry.js'
+
+export class CodexRuntimeError extends errore.createTaggedError({
+  name: 'CodexRuntimeError',
+  message: 'Codex app-server request $operation failed',
+}) {}
+
+// Approval refusals are user-facing: the reason has to survive into the message,
+// because "turn/start failed" cannot tell an operator whether an answer was a
+// replay, a stale id, or a gate.
+export class CodexApprovalError extends errore.createTaggedError({
+  name: 'CodexApprovalError',
+  message: 'Approval request $requestId refused: $reason',
+}) {}
+
+type Request = (method: 'thread/list' | 'thread/read', params: Record<string, unknown>) => Promise<unknown>
+type NativeThread = Record<string, unknown> & { id: string }
+const record = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value)
+const thread = (value: unknown): value is NativeThread => record(value) && typeof value.id === 'string' && value.id.trim().length > 0
+
+// Exact request methods accepted by `codex app-server` (Codex 0.167.2),
+// taken from `codex app-server generate-json-schema`/`generate-ts`:
+//   thread/start    -> { cwd?, model?, approvalPolicy?, sandbox? } => { thread: { id } }
+//   turn/start      -> { threadId, input: UserInput[] }           => { turn: { id } }
+//   turn/interrupt  -> { threadId, turnId }                       => {}
+// Streamed server notifications used here:
+//   item/agentMessage/delta -> { threadId, turnId, itemId, delta }
+//   turn/completed          -> { threadId, turn: { id, status, items, error } }
+// Server-initiated approval requests (item/commandExecution/requestApproval,
+// item/fileChange/requestApproval) are held for an approval channel when one is
+// configured; otherwise they are refused with -32601. `answerApproval` is
+// therefore unsupported unless the controller was started with `approvals`.
+// Other server requests, such as item/tool/requestUserInput, remain refused.
+export type CodexControlMethod = 'thread/start' | 'thread/resume' | 'thread/read' | 'turn/start' | 'turn/interrupt'
+// `AskForApproval` in the generated schema, minus the granular variant this
+// client does not configure.
+export type CodexApprovalPolicyName = 'untrusted' | 'on-request' | 'never'
+const approvalPolicyNames: readonly string[] = ['untrusted', 'on-request', 'never']
+export type CodexControlRequest = (method: CodexControlMethod, params: Record<string, unknown>) => Promise<unknown>
+export type CodexNotification = { method: string; params?: unknown; id?: number }
+export type CodexNotificationListener = (notification: CodexNotification) => void
+export type CodexSubscribe = (listener: CodexNotificationListener) => (() => void) | Error
+
+// A supported capability may name the protocol methods it actually answers, so a
+// caller can distinguish "this client answers approvals" from "this client
+// answers the two approval methods the runtime documents".
+export type CodexCapability = { kind: 'supported'; methods?: string[] } | { kind: 'unsupported'; reason: string }
+// The only server requests this controller can answer when an approval channel is
+// configured. `item/permissions/requestApproval` is deliberately absent: it has no
+// defined answer here, so it is refused instead of being held open.
+export const codexApprovalMethods = ['item/commandExecution/requestApproval', 'item/fileChange/requestApproval'] as const
+export type CodexControlCapabilities = {
+  version: 1
+  discovery: { kind: 'supported' }
+  streaming: CodexCapability
+  control: {
+    create: CodexCapability
+    submit: CodexCapability
+    interrupt: CodexCapability
+    answerApproval: CodexCapability
+  }
+}
+
+export const codexControlCapabilities = {
+  version: 1,
+  discovery: { kind: 'supported' },
+  streaming: { kind: 'supported' },
+  control: {
+    create: { kind: 'supported' },
+    submit: { kind: 'supported' },
+    interrupt: { kind: 'supported' },
+    answerApproval: {
+      kind: 'unsupported',
+      reason: 'Server-initiated approval requests are answered with a JSON-RPC error, so an approval-gated action fails instead of being granted',
+    },
+  },
+} as const satisfies CodexControlCapabilities
+
+export type CodexTurnDelta = { threadId: string; turnId: string; itemId: string; text: string }
+export type CodexTurnResult = { threadId: string; turnId: string; status: 'completed' | 'interrupted'; text: string }
+
+// Approval requests the app-server raises mid-turn. Shapes are from
+// `codex app-server generate-ts` for 0.169: the answer is the JSON-RPC result
+// `{ decision }`, where command decisions also admit `acceptForSession` and
+// both variants admit `cancel`.
+export type CodexApprovalDecision = 'accept' | 'acceptForSession' | 'decline' | 'cancel'
+const approvalDecisions: readonly string[] = ['accept', 'acceptForSession', 'decline', 'cancel']
+// A policy is caller code, so its answer is data on the wire and must be checked
+// at the boundary instead of trusted from its declared type.
+const isApprovalDecision = (value: unknown): value is CodexApprovalDecision =>
+  typeof value === 'string' && approvalDecisions.includes(value)
+// `humanCommand` has no session-wide grant to extend, so `acceptForSession` is
+// not an answer the runtime accepts for it.
+const isDecisionValidFor = (request: CodexApprovalRequest, decision: CodexApprovalDecision): boolean =>
+  !(request.kind === 'humanCommand' && decision === 'acceptForSession')
+export type CodexApprovalRequest = {
+  requestId: number
+  method: 'item/commandExecution/requestApproval' | 'item/fileChange/requestApproval'
+  threadId: string
+  turnId: string | null
+  itemId: string | null
+  /** The command under review, when the runtime names one. */
+  command: string | null
+  reason: string | null
+  /**
+   * File-change approvals name the root a session-wide grant would cover. Without
+   * it an `acceptForSession` answer would silently widen to an unseen path.
+   */
+  grantRoot: string | null
+  /** Working directory the runtime reports for the action under review. */
+  cwd: string | null
+  /** Runtime-reported classification of the change being approved. */
+  kind: string | null
+  /** Stable runtime id for this approval, when one is supplied. */
+  approvalId: string | null
+  /**
+   * SHA-256 of the approval payload this client actually read, so an answer can
+   * prove it approves the artifact it saw instead of whatever occupies the id
+   * now. `requestId` and `startedAtMs` are excluded: they describe the transport
+   * envelope, not the artifact under review.
+   */
+  digest: string
+  /** When the runtime started the approval clock, in epoch milliseconds. */
+  startedAtMs: number | null
+}
+export type CodexApprovalPolicy = (request: CodexApprovalRequest) => CodexApprovalDecision | null
+type TurnSettlement = CodexTurnResult | Error
+
+// The digest field order is fixed here instead of being inherited from object
+// insertion order, and the payload is an ordered list of [name, value] pairs, so
+// a `null` field cannot collide with the string "null" and two processes agree
+// on the same bytes for the same artifact.
+const approvalDigestFields = ['method', 'threadId', 'turnId', 'itemId', 'command', 'cwd', 'kind', 'grantRoot', 'approvalId', 'reason'] as const
+const approvalDigest = (approval: Omit<CodexApprovalRequest, 'digest'>): string => {
+  const payload = approvalDigestFields.map((name) => [name, approval[name]])
+  return `sha256:${createHash('sha256').update(JSON.stringify(payload), 'utf8').digest('hex')}`
+}
+
+type PendingTurn = {
+  state: {
+    turnId: string | null
+    provisionalTurnId: string | null
+    text: string
+    onDelta: ((delta: CodexTurnDelta) => void) | undefined
+  }
+  settle: (settlement: TurnSettlement) => void
+}
+
+const malformed = (operation: CodexControlMethod) =>
+  new CodexRuntimeError({ operation, cause: new Error('Malformed response') })
+
+// Resolves an Error instead of throwing or hanging. The losing branch of the
+// race keeps its handler attached, so a late rejection is never unhandled.
+async function bounded(
+  operation: CodexControlMethod,
+  timeoutMs: number,
+  start: () => Promise<unknown>,
+  unwrap: (value: unknown) => unknown,
+): Promise<unknown | Error> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const expiry = new Promise<Error>((resolve) => {
+    timer = setTimeout(
+      () => resolve(new CodexRuntimeError({ operation, cause: new Error(`Timed out after ${timeoutMs}ms`) })),
+      timeoutMs,
+    )
+  })
+  try {
+    const attempt = Promise.resolve().then(start).then(
+      (value) => unwrap(value),
+      (cause) => new CodexRuntimeError({ operation, cause }),
+    )
+    return await Promise.race([attempt, expiry])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+export function createCodexController({
+  hostId,
+  endpointId,
+  request,
+  subscribe,
+  timeoutMs = 30_000,
+  turnTimeoutMs = 600_000,
+  serverRequests,
+  approvals,
+  holdsServerRequests,
+}: {
+  hostId: string
+  endpointId: string
+  request: CodexControlRequest
+  subscribe: CodexSubscribe
+  timeoutMs?: number
+  turnTimeoutMs?: number
+  /**
+   * Declares that the transport was started with `holdServerRequests`, so a
+   * server-initiated request stays open until this client answers it. An approval
+   * surface is meaningless without it: the transport would answer first.
+   */
+  holdsServerRequests?: boolean
+  /**
+   * Delivers the two possible JSON-RPC answers to a server-initiated request.
+   * Required for any approval surface: the transport must be started with
+   * `holdServerRequests` so this client, not the transport, owns the answer.
+   */
+  serverRequests?: {
+    result: (requestId: number, result: unknown) => boolean
+    error: (requestId: number, code: number, message: string) => boolean
+  }
+  approvals?: {
+    /** Automatic answer. `null` leaves the request open for a client. */
+    policy?: CodexApprovalPolicy
+    onRequest?: (request: CodexApprovalRequest) => void
+  }
+}) {
+  const valid = sessionKeyId({ hostId, endpointId, backendKind: 'codex', nativeSessionId: 'validation' })
+  if (valid instanceof Error) return valid
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return new ConfigError({ reason: 'timeoutMs must be a positive number' })
+  if (!Number.isFinite(turnTimeoutMs) || turnTimeoutMs <= 0) return new ConfigError({ reason: 'turnTimeoutMs must be a positive number' })
+  if (approvals !== undefined && (typeof serverRequests?.result !== 'function' || typeof serverRequests?.error !== 'function')) {
+    return new ConfigError({ reason: 'An approval surface needs a result and an error channel for server-initiated requests' })
+  }
+  if (approvals !== undefined && holdsServerRequests !== true) {
+    return new ConfigError({ reason: 'An approval surface requires a transport that holds server requests' })
+  }
+  const source = Object.freeze({ hostId, endpointId, backendKind: 'codex' as const })
+  const keyFor = (nativeSessionId: string): SessionKey => ({ ...source, nativeSessionId })
+  const pending = new Map<string, PendingTurn>()
+
+  // Approvals are keyed by the JSON-RPC request id, which the runtime allocates
+  // and never reuses within a connection. `settled` is what makes a replay
+  // visible: an id that has been answered reports that, instead of looking like
+  // an id that never existed.
+  const openApprovals = new Map<number, CodexApprovalRequest>()
+  const settledApprovals = new Set<number>()
+
+  const approvalFrom = (notification: CodexNotification): CodexApprovalRequest | null => {
+    if (typeof notification.id !== 'number') return null
+    const params = notification.params
+    if (!record(params) || typeof params.threadId !== 'string') return null
+    // Only the two documented methods are held. `item/permissions/requestApproval`
+    // has no answer shape here, so it must fall through to the refusal path rather
+    // than entering the pending set.
+    if (notification.method !== 'item/commandExecution/requestApproval' && notification.method !== 'item/fileChange/requestApproval') return null
+    const text = (value: unknown): string | null => (typeof value === 'string' && value.trim().length > 0 ? value : null)
+    // The schema admits `command | writeStdin | humanCommand` and older servers
+    // omit it entirely, which means a plain command.
+    const kind = text(params.kind) ?? (notification.method === 'item/commandExecution/requestApproval' ? 'command' : null)
+    const approval = {
+      requestId: notification.id,
+      // The two method checks above already proved this literal union.
+      method: notification.method as CodexApprovalRequest['method'],
+      threadId: params.threadId,
+      turnId: text(params.turnId),
+      itemId: text(params.itemId),
+      command: text(params.command),
+      reason: text(params.reason),
+      grantRoot: text(params.grantRoot),
+      cwd: text(params.cwd),
+      kind,
+      approvalId: text(params.approvalId),
+      startedAtMs: typeof params.startedAtMs === 'number' && Number.isFinite(params.startedAtMs) ? params.startedAtMs : null,
+    }
+    return { ...approval, digest: approvalDigest(approval) }
+  }
+
+  // One place answers, so "first answer wins" is a property of the code and not
+  // of whichever caller happens to run first.
+  const settleApproval = (
+    requestId: number,
+    decision: CodexApprovalDecision,
+    expectedDigest?: string,
+  ): Error | { requestId: number; decision: CodexApprovalDecision } => {
+    // Defence in depth: `answerApproval` already validates, but this is the only
+    // function that writes an answer, so it never forwards an unchecked value.
+    if (!isApprovalDecision(decision)) {
+      return new CodexApprovalError({ requestId: String(requestId), reason: `the decision ${String(decision)} is not one of ${approvalDecisions.join(', ')}` })
+    }
+    const request = openApprovals.get(requestId)
+    if (!request) {
+      return settledApprovals.has(requestId)
+        ? new CodexApprovalError({ requestId: String(requestId), reason: 'it was already answered, so a repeated answer cannot change the decision' })
+        : new CodexApprovalError({ requestId: String(requestId), reason: 'no approval request with this id is open' })
+    }
+    // The id survives a payload swap, so an answer that would move the runtime
+    // has to name the artifact it read. A mismatch is checked before the answer
+    // is forwarded, which is what closes "the artifact changed after approval".
+    if (expectedDigest !== undefined && (typeof expectedDigest !== 'string' || !expectedDigest.trim())) {
+      return new CodexApprovalError({ requestId: String(requestId), reason: 'the supplied digest is not a nonblank string' })
+    }
+    if ((decision === 'accept' || decision === 'acceptForSession') && expectedDigest === undefined) {
+      return new CodexApprovalError({
+        requestId: String(requestId),
+        reason: `an ${decision} needs the payload digest from pendingApprovals, because the answer must name the artifact it approves`,
+      })
+    }
+    if (expectedDigest !== undefined && expectedDigest !== request.digest) {
+      return new CodexApprovalError({
+        requestId: String(requestId),
+        reason: `the supplied digest ${expectedDigest} does not match the payload now under review (${request.digest}), so it changed after it was read`,
+      })
+    }
+    // A human command has no session-wide grant to extend, so the runtime's
+    // session answer is not a valid decision for it.
+    if (!isDecisionValidFor(request, decision)) {
+      return new CodexApprovalError({ requestId: String(requestId), reason: `the decision ${decision} is not valid for a ${request.kind} approval` })
+    }
+    if (!serverRequests!.result(requestId, { decision })) {
+      openApprovals.delete(requestId)
+      return new CodexApprovalError({ requestId: String(requestId), reason: 'the app-server no longer had this request open' })
+    }
+    openApprovals.delete(requestId)
+    settledApprovals.add(requestId)
+    return { requestId, decision }
+  }
+
+  const onNotification = (notification: CodexNotification) => {
+    if (!record(notification) || typeof notification.method !== 'string') return
+    // Server-initiated requests arrive with an id and are not thread events: the
+    // app-server is waiting on this client, so an unanswerable one is failed
+    // rather than left to hang the turn.
+    if (typeof notification.id === 'number') {
+      const approval = approvalFrom(notification)
+      if (!approval) {
+        if (serverRequests) serverRequests.error(notification.id, -32601, `Server-initiated request ${notification.method} unsupported`)
+        return
+      }
+      openApprovals.set(approval.requestId, approval)
+      try {
+        approvals?.onRequest?.(approval)
+      } catch {
+        // A consumer callback must not break the stream.
+      }
+      const policy = approvals?.policy
+      if (!policy) return
+      let decision: CodexApprovalDecision | null = null
+      try {
+        decision = policy(approval)
+      } catch {
+        decision = 'decline'
+      }
+      // A policy can return anything at runtime. `null` means "leave it open";
+      // every other unrecognised value fails closed instead of reaching the wire.
+      if (decision !== null && (!isApprovalDecision(decision) || !isDecisionValidFor(approval, decision))) decision = 'decline'
+      // The policy path answers through the same settle function with the digest
+      // of the request it was handed, so it cannot answer a changed payload.
+      if (decision !== null) settleApproval(approval.requestId, decision, approval.digest)
+      return
+    }
+    const params = notification.params
+    if (!record(params) || typeof params.threadId !== 'string') return
+    const entry = pending.get(params.threadId)
+    if (!entry) return
+    const { state } = entry
+    const eventTurnId = typeof params.turnId === 'string' && params.turnId ? params.turnId : null
+    // Without the authoritative turn id yet, adopt the first one seen and
+    // reject a second, different one instead of mixing turns.
+    if (state.turnId === null && eventTurnId !== null) {
+      if (state.provisionalTurnId === null) state.provisionalTurnId = eventTurnId
+      else if (state.provisionalTurnId !== eventTurnId) return
+    }
+    if (state.turnId !== null && eventTurnId !== null && eventTurnId !== state.turnId) return
+
+    if (notification.method === 'item/agentMessage/delta') {
+      if (typeof params.delta !== 'string') return
+      state.text += params.delta
+      if (typeof params.itemId === 'string' && state.onDelta) {
+        try {
+          state.onDelta({ threadId: params.threadId, turnId: eventTurnId ?? state.turnId ?? '', itemId: params.itemId, text: params.delta })
+        } catch {
+          // A consumer callback must not break the stream.
+        }
+      }
+      return
+    }
+    if (notification.method !== 'turn/completed') return
+
+    const turn = record(params.turn) ? params.turn : null
+    const status = turn && typeof turn.status === 'string' ? turn.status : null
+    const turnId = turn && typeof turn.id === 'string' && turn.id ? turn.id : eventTurnId ?? state.turnId ?? state.provisionalTurnId
+    if (turnId === null || turnId === '') {
+      pending.delete(params.threadId)
+      entry.settle(new CodexRuntimeError({ operation: 'turn/start', cause: new Error('Turn completion carried no turn id') }))
+      return
+    }
+    const text = state.text || completedAgentText(turn)
+    pending.delete(params.threadId)
+    if (status === 'completed' || status === 'interrupted') entry.settle({ threadId: params.threadId, turnId, status, text })
+    else if (status === 'failed') {
+      const message = turn && record(turn.error) && typeof turn.error.message === 'string' ? turn.error.message : 'Turn failed'
+      entry.settle(new CodexRuntimeError({ operation: 'turn/start', cause: new Error(message) }))
+    } else entry.settle(new CodexRuntimeError({ operation: 'turn/start', cause: new Error('Turn completed without a recognised status') }))
+  }
+
+  let unsubscribe: (() => void) | null = null
+  try {
+    const subscription = subscribe(onNotification)
+    if (subscription instanceof Error) return subscription
+    unsubscribe = subscription
+  } catch (cause) {
+    return new CodexRuntimeError({ operation: 'turn/start', cause })
+  }
+
+  const close = () => {
+    for (const [threadId, entry] of pending) {
+      pending.delete(threadId)
+      entry.settle(new ConfigError({ reason: 'Codex controller closed before the turn completed' }))
+    }
+    openApprovals.clear()
+    unsubscribe?.()
+    unsubscribe = null
+  }
+
+  const validateThreadId = (threadId: unknown): string | ConfigError => {
+    if (typeof threadId !== 'string' || !threadId.trim()) return new ConfigError({ reason: 'Thread id must be a nonblank string' })
+    const checked = sessionKeyId(keyFor(threadId))
+    return checked instanceof Error ? checked : threadId
+  }
+
+  // The declared surface follows what this instance can actually do: an approval
+  // channel turns `answerApproval` from a documented refusal into a real operation.
+  const capabilities: CodexControlCapabilities = approvals === undefined
+    ? codexControlCapabilities
+    : {
+        ...codexControlCapabilities,
+        control: {
+          ...codexControlCapabilities.control,
+          answerApproval: { kind: 'supported', methods: [...codexApprovalMethods] },
+        },
+      }
+
+  return {
+    capabilities,
+    source,
+    keyFor,
+    /** Approvals that are still waiting for an answer, oldest first. */
+    pendingApprovals: () => [...openApprovals.values()],
+    async startThread(input: { cwd?: string; approvalPolicy?: CodexApprovalPolicyName } = {}) {
+      if (input.cwd !== undefined && (typeof input.cwd !== 'string' || !input.cwd.trim())) {
+        return new ConfigError({ reason: 'Thread cwd must be a nonblank string' })
+      }
+      if (input.approvalPolicy !== undefined && !approvalPolicyNames.includes(input.approvalPolicy)) {
+        return new ConfigError({ reason: `approvalPolicy must be one of ${approvalPolicyNames.join(', ')}` })
+      }
+      const params: Record<string, unknown> = {}
+      if (input.cwd !== undefined) params['cwd'] = input.cwd
+      if (input.approvalPolicy !== undefined) params['approvalPolicy'] = input.approvalPolicy
+      const result = await bounded(
+        'thread/start',
+        timeoutMs,
+        () => request('thread/start', params),
+        (value) => value,
+      )
+      if (result instanceof Error) return result
+      if (!record(result) || !thread(result.thread)) return malformed('thread/start')
+      return { threadId: result.thread.id, key: keyFor(result.thread.id) }
+    },
+    // A thread lives on disk but not in a fresh app-server process, so a second
+    // process must resume it before turn/start will accept the id.
+    async resumeThread(input: { threadId: string; cwd?: string; approvalPolicy?: CodexApprovalPolicyName }) {
+      const checked = validateThreadId(input.threadId)
+      if (checked instanceof Error) return checked
+      if (input.cwd !== undefined && (typeof input.cwd !== 'string' || !input.cwd.trim())) {
+        return new ConfigError({ reason: 'Thread cwd must be a nonblank string' })
+      }
+      if (input.approvalPolicy !== undefined && !approvalPolicyNames.includes(input.approvalPolicy)) {
+        return new ConfigError({ reason: `approvalPolicy must be one of ${approvalPolicyNames.join(', ')}` })
+      }
+      const params: Record<string, unknown> = { threadId: input.threadId }
+      if (input.cwd !== undefined) params['cwd'] = input.cwd
+      if (input.approvalPolicy !== undefined) params['approvalPolicy'] = input.approvalPolicy
+      const result = await bounded(
+        'thread/resume',
+        timeoutMs,
+        () => request('thread/resume', params),
+        (value) => value,
+      )
+      if (result instanceof Error) return result
+      if (!record(result) || !thread(result.thread)) return malformed('thread/resume')
+      if (result.thread.id !== input.threadId) return new ConfigError({ reason: 'The agent resumed a different thread than the one requested' })
+      return { threadId: result.thread.id, key: keyFor(result.thread.id) }
+    },
+    // The only read surface codex offers for a thread this process did not start.
+    // Shapes verified against codex 0.169: userMessage content is an array of
+    // { type: 'text', text }, agentMessage text is a plain string.
+    async readThread(input: { threadId: string; includeTurns?: boolean }) {
+      const checked = validateThreadId(input.threadId)
+      if (checked instanceof Error) return checked
+      const params: Record<string, unknown> = { threadId: input.threadId, includeTurns: input.includeTurns !== false }
+      const result = await bounded(
+        'thread/read',
+        timeoutMs,
+        () => request('thread/read', params),
+        (value) => value,
+      )
+      if (result instanceof Error) return result
+      if (!record(result) || !record(result.thread)) return malformed('thread/read')
+      const readThread = result.thread
+      if (typeof readThread.id !== 'string' || readThread.id !== input.threadId) return malformed('thread/read')
+      const turns: Array<{ id: string; status: string; messages: Array<{ role: 'user' | 'agent'; text: string }> }> = []
+      const rawTurns = Array.isArray(readThread.turns) ? readThread.turns : []
+      for (const rawTurn of rawTurns) {
+        if (!record(rawTurn) || typeof rawTurn.id !== 'string') continue
+        const messages: Array<{ role: 'user' | 'agent'; text: string }> = []
+        for (const rawItem of Array.isArray(rawTurn.items) ? rawTurn.items : []) {
+          if (!record(rawItem)) continue
+          if (rawItem.type === 'userMessage') {
+            const parts = Array.isArray(rawItem.content) ? rawItem.content : []
+            let text = ''
+            for (const part of parts) {
+              if (record(part) && part.type === 'text' && typeof part.text === 'string') text += part.text
+            }
+            if (text) messages.push({ role: 'user', text })
+          } else if (rawItem.type === 'agentMessage' && typeof rawItem.text === 'string' && rawItem.text) {
+            messages.push({ role: 'agent', text: rawItem.text })
+          }
+        }
+        turns.push({ id: rawTurn.id, status: typeof rawTurn.status === 'string' ? rawTurn.status : 'unknown', messages })
+      }
+      return { threadId: readThread.id, turns, key: keyFor(readThread.id) }
+    },
+    async sendTurn({ threadId, text, onDelta }: { threadId: string; text: string; onDelta?: (delta: CodexTurnDelta) => void }) {
+      const checked = validateThreadId(threadId)
+      if (checked instanceof Error) return checked
+      if (typeof text !== 'string' || !text.trim()) return new ConfigError({ reason: 'Turn text must be a nonblank string' })
+      if (onDelta !== undefined && typeof onDelta !== 'function') return new ConfigError({ reason: 'Turn onDelta must be a function' })
+      if (pending.has(threadId)) return new ConfigError({ reason: `Thread ${threadId} already has an active turn` })
+
+      let settle!: (settlement: TurnSettlement) => void
+      const completion = new Promise<TurnSettlement>((resolve) => { settle = resolve })
+      pending.set(threadId, {
+        state: { turnId: null, provisionalTurnId: null, text: '', onDelta },
+        settle: (settlement) => { pending.delete(threadId); settle(settlement) },
+      })
+
+      const started = await bounded(
+        'turn/start',
+        timeoutMs,
+        () => request('turn/start', { threadId, input: [{ type: 'text', text, text_elements: [] }] }),
+        (value) => value,
+      )
+      if (started instanceof Error) {
+        pending.delete(threadId)
+        return started
+      }
+      if (!record(started) || !thread(started.turn)) {
+        pending.delete(threadId)
+        return malformed('turn/start')
+      }
+      const entry = pending.get(threadId)
+      if (!entry) return new ConfigError({ reason: 'Turn settled before it started' })
+      entry.state.turnId = started.turn.id
+      // Events buffered before the id was known belong to a different turn.
+      if (entry.state.provisionalTurnId !== null && entry.state.provisionalTurnId !== started.turn.id) entry.state.text = ''
+
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const expiry = new Promise<Error>((resolve) => {
+        timer = setTimeout(() => {
+          pending.delete(threadId)
+          resolve(new CodexRuntimeError({ operation: 'turn/start', cause: new Error(`Timed out after ${turnTimeoutMs}ms`) }))
+        }, turnTimeoutMs)
+      })
+      try {
+        return await Promise.race([completion, expiry])
+      } finally {
+        clearTimeout(timer)
+        pending.delete(threadId)
+      }
+    },
+    async cancel({ threadId, turnId }: { threadId: string; turnId?: string }) {
+      const checked = validateThreadId(threadId)
+      if (checked instanceof Error) return checked
+      if (turnId !== undefined && (typeof turnId !== 'string' || !turnId.trim())) {
+        return new ConfigError({ reason: 'Turn id must be a nonblank string' })
+      }
+      const entry = pending.get(threadId)
+      const resolvedTurnId = turnId ?? entry?.state.turnId ?? entry?.state.provisionalTurnId ?? null
+      if (resolvedTurnId === null) return new ConfigError({ reason: `No active turn for thread ${threadId}` })
+      const result = await bounded(
+        'turn/interrupt',
+        timeoutMs,
+        () => request('turn/interrupt', { threadId, turnId: resolvedTurnId }),
+        (value) => value,
+      )
+      if (result instanceof Error) return result
+      if (!record(result)) return malformed('turn/interrupt')
+      return { threadId, turnId: resolvedTurnId }
+    },
+    /**
+     * Answers one approval request. The first answer wins: a repeated or stale
+     * id is refused by name rather than forwarded, so a replayed answer cannot
+     * re-open a decision the runtime already made.
+     *
+     * `expectedDigest` is the `digest` of the request the caller actually read.
+     * An `accept` or `acceptForSession` must supply it, and every supplied digest
+     * must match the payload now under review, so a command swapped under the
+     * same id after the caller looked is refused instead of approved. `decline`
+     * and `cancel` may omit it because they move nothing.
+     */
+    answerApproval({ requestId, decision, expectedDigest }: { requestId: number; decision: CodexApprovalDecision; expectedDigest?: string }) {
+      if (approvals === undefined) {
+        return new ConfigError({ reason: 'This controller was started without an approval channel' })
+      }
+      // JSON-RPC ids are non-negative and codex numbers its first server request
+      // 0, so an id of 0 is a real approval, not a missing one.
+      if (!Number.isSafeInteger(requestId) || requestId < 0) return new ConfigError({ reason: 'Approval request id must be a non-negative integer' })
+      if (!isApprovalDecision(decision)) return new ConfigError({ reason: `Unknown approval decision ${String(decision)}` })
+      if (expectedDigest !== undefined && typeof expectedDigest !== 'string') {
+        return new ConfigError({ reason: 'Approval digest must be a string' })
+      }
+      return settleApproval(requestId, decision, expectedDigest)
+    },
+    close,
+  }
+}
+
+// Fallback text source when a completion arrives without delta notifications.
+function completedAgentText(turn: Record<string, unknown> | null): string {
+  if (!turn || !Array.isArray(turn.items)) return ''
+  for (let index = turn.items.length - 1; index >= 0; index--) {
+    const item = turn.items[index]
+    if (record(item) && item.type === 'agentMessage' && typeof item.text === 'string') return item.text
+  }
+  return ''
+}
+
+export function createCodexObserver({ hostId, endpointId, request }: { hostId: string; endpointId: string; request: Request }) {
+  const valid = sessionKeyId({ hostId, endpointId, backendKind: 'codex', nativeSessionId: 'validation' })
+  if (valid instanceof Error) return valid
+  const source = Object.freeze({ hostId, endpointId, backendKind: 'codex' as const })
+  const keyFor = (nativeSessionId: string): SessionKey => ({ ...source, nativeSessionId })
+  const call = (operation: 'thread/list' | 'thread/read', params: Record<string, unknown>) =>
+    Promise.resolve().then(() => request(operation, params)).catch((cause) => new CodexRuntimeError({ operation, cause }))
+  return {
+    capabilities: {
+      ...passiveCapabilities,
+      snapshot: { kind: 'supported' as const },
+      observe: { kind: 'unsupported' as const, reason: 'thread/read polls a live thread without blocking its writer, but no notification stream is offered and thread/resume takes the writer lock, so this is a poll-based read surface rather than an observe subscription' },
+      replay: { kind: 'unsupported' as const, reason: 'Metadata reads do not provide a durable event cursor' },
+      exclusiveControl: { kind: 'unsupported' as const, reason: 'No exclusive writer lease is established' },
+    },
+    async discover(input: { cursor?: string; limit?: number } = {}) {
+      const result = await call('thread/list', { ...input, useStateDbOnly: true })
+      if (result instanceof Error) return result
+      if (!record(result) || !Array.isArray(result.data) || !result.data.every(thread) || !(result.nextCursor === null || typeof result.nextCursor === 'string')) {
+        return new CodexRuntimeError({ operation: 'thread/list', cause: new Error('Malformed response') })
+      }
+      return { source, sessions: result.data.map((native) => ({ key: keyFor(native.id), native: { id: native.id } })), cursor: result.nextCursor }
+    },
+    async readSnapshot({ key }: { key: SessionKey }) {
+      const valid = sessionKeyId(key)
+      if (valid instanceof Error) return valid
+      if (key.hostId !== hostId || key.endpointId !== endpointId || key.backendKind !== 'codex') return new ConfigError({ reason: 'Session identity does not match this Codex endpoint' })
+      const scopedKey = Object.freeze({ hostId, endpointId, backendKind: 'codex' as const, nativeSessionId: key.nativeSessionId })
+      const result = await call('thread/read', { threadId: scopedKey.nativeSessionId, includeTurns: false })
+      if (result instanceof Error) return result
+      if (!record(result) || !thread(result.thread) || result.thread.id !== scopedKey.nativeSessionId) return new CodexRuntimeError({ operation: 'thread/read', cause: new Error('Malformed or mismatched thread identity') })
+      return { key: scopedKey, source, session: { id: result.thread.id } }
+    },
+  }
+}

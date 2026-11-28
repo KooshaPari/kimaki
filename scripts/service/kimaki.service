@@ -1,0 +1,38 @@
+# kimaki as a systemd unit, for a Linux host or a WSL 2 distro with systemd enabled.
+#
+# Install as root:
+#   install -m 0644 scripts/service/kimaki.service /etc/systemd/system/kimaki.service
+#   install -m 0600 /dev/null /etc/kimaki.env    # then add KIMAKI_BOT_TOKEN=...
+#   systemctl daemon-reload && systemctl enable --now kimaki
+#
+# The token lives in the environment file, never in ExecStart, because unit
+# arguments are visible in `ps` output.
+[Unit]
+Description=Kimaki agent operations bot
+Documentation=https://github.com/KooshaPari/kimaki
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kimaki
+Group=kimaki
+WorkingDirectory=/opt/kimaki
+EnvironmentFile=/etc/kimaki.env
+ExecStart=/usr/bin/node /opt/kimaki/dist/cli.js
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=120
+TimeoutStopSec=30
+# kimaki keeps its database and session state under the data dir.
+StateDirectory=kimaki
+Environment=KIMAKI_DATA_DIR=/var/lib/kimaki
+# Hardening that does not break a Discord bot with a local sqlite database.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/kimaki
+
+[Install]
+WantedBy=multi-user.target

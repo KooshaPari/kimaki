@@ -8,6 +8,8 @@ import { afterAll, beforeAll, expect, test } from 'vitest'
 
 import type { BotHandle } from './main.ts'
 import { sessionEventsFile } from './session-events.ts'
+import { shellQuote } from './lock-server.ts'
+import { removeTempDirs } from './test/cleanup.ts'
 import {
   OTHER_USER_ID,
   TEST_USER_ID,
@@ -93,7 +95,7 @@ afterAll(async () => {
   await bot?.stop()
   await twin?.stop()
   await server?.stop()
-  fs.rmSync(dataDir, { recursive: true, force: true })
+  await removeTempDirs([dataDir])
 })
 
 // Polls for 200ms that no new thread appears in the channel.
@@ -282,6 +284,10 @@ test('/session-id shows the session, thread and attach command; events are recor
   const redacted = content
     .replaceAll(binding!.session_id, 'ses_X')
     .replaceAll(helloThreadId, 'THREAD')
+    // The attach command shell-quotes the directory when it needs quoting: a Windows path has
+    // backslashes, so it is quoted and a POSIX path is not. Follow the product's quoting rule
+    // rather than the host, so the snapshot keeps asserting the whole command on both.
+    .replaceAll(shellQuote(server.projectDirectory), 'PROJECT')
     .replaceAll(server.projectDirectory, 'PROJECT')
   expect(redacted).toMatchInlineSnapshot(`
     "**Session ID:** \`ses_X\`

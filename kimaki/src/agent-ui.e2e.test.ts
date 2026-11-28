@@ -7,9 +7,23 @@ import { afterAll, beforeAll, expect, test } from 'vitest'
 import type { BotHandle } from './main.ts'
 import { TEST_USER_ID, seedProjectChannel, startOpencodeTestServer, startTestBot, startTwin, tempDataDir, waitFor, waitForFooter, warmUp, toolParts, textParts, type OpencodeTestServer, type TestTwin } from './test/harness.ts'
 import { send, shell } from './prompt.ts'
+import { removeTempDir } from './test/cleanup.ts'
 
 const exec = promisify(execFile)
 const dataDir = tempDataDir()
+// The shell tool hands its command to the shell as one argv element, so quotes do
+// not group a multi-word value: they arrive literal and the value splits on its
+// spaces. Button labels need none; the upload prompt does, so it uses a one-line
+// script. PowerShell (the shell here) skips the cwd: hence the `.\` prefix.
+const windows = process.platform === 'win32'
+const uploadScript = windows ? '.\\upload-logo.cmd' : 'sh upload-logo.sh'
+
+function writeUploadScript() {
+  const command = 'kimaki upload-request --prompt "Send the logo" --max-files 2'
+  const file = path.join(server.projectDirectory, windows ? 'upload-logo.cmd' : 'upload-logo.sh')
+  fs.writeFileSync(file, windows ? `@echo off\r\n${command}\r\n` : `#!/bin/sh\n${command}\n`)
+}
+
 let server: OpencodeTestServer
 let twin: TestTwin
 let bot: BotHandle
@@ -17,13 +31,14 @@ beforeAll(async () => {
   ;[server, twin] = await Promise.all([startOpencodeTestServer({ matchers: [
     { id: 'buttons', priority: 100, when: { latestUserTextIncludes: 'button-marker' }, then: { parts: [
       { type: 'text-start', id: 'intro' }, { type: 'text-delta', id: 'intro', delta: 'Choose the next action.' }, { type: 'text-end', id: 'intro' },
-      ...toolParts({ toolCallId: 'buttons-call', toolName: 'shell', input: { command: "kimaki buttons --button 'Proceed' --button 'Build:green'", description: 'Show choices', hasSideEffect: true } }),
+      ...toolParts({ toolCallId: 'buttons-call', toolName: 'shell', input: { command: 'kimaki buttons --button Proceed --button Build:green', description: 'Show choices', hasSideEffect: true } }),
     ] } },
     { id: 'buttons-done', priority: 110, when: { latestUserTextIncludes: 'button-marker', rawPromptIncludes: 'buttons-call' }, then: { parts: textParts('Buttons shown.') } },
     { id: 'click', priority: 200, when: { latestUserTextIncludes: 'User clicked: Proceed' }, then: { parts: textParts('Proceed accepted.') } },
-    { id: 'upload', priority: 100, when: { latestUserTextIncludes: 'upload-marker' }, then: { parts: toolParts({ toolCallId: 'upload-call', toolName: 'shell', input: { command: "kimaki upload-request --prompt 'Send the logo' --max-files 2", timeout: 600000, description: 'Request logo', hasSideEffect: true } }) } },
+    { id: 'upload', priority: 100, when: { latestUserTextIncludes: 'upload-marker' }, then: { parts: toolParts({ toolCallId: 'upload-call', toolName: 'shell', input: { command: uploadScript, timeout: 600000, description: 'Request logo', hasSideEffect: true } }) } },
     { id: 'upload-done', priority: 110, when: { latestUserTextIncludes: 'upload-marker', rawPromptIncludes: 'upload-call' }, then: { parts: textParts('Upload received.') } },
   ] }), startTwin()])
+  writeUploadScript()
   await seedProjectChannel({ dataDir, channelId: twin.channelId, guildId: twin.discord.guildId, directory: server.projectDirectory })
   bot = await startTestBot({ dataDir, twin, server })
   await warmUp({ server })
@@ -31,7 +46,7 @@ beforeAll(async () => {
 afterAll(async () => {
   await bot?.stop()
   await Promise.all([server?.stop(), twin?.stop()])
-  fs.rmSync(dataDir, { recursive: true, force: true })
+  await removeTempDir(dataDir)
 })
 async function start(prompt: string) {
   const result = await send(bot, { channelId: twin.channelId, prompt })

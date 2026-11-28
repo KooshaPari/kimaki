@@ -12,6 +12,7 @@ import type { DeterministicMatcher } from 'opencode-deterministic-provider'
 import { afterAll, beforeAll, expect, onTestFinished, test } from 'vitest'
 
 import type { BotHandle } from './main.ts'
+import { removeTempDir } from './test/cleanup.ts'
 import {
   TEST_USER_ID,
   seedProjectChannel,
@@ -35,6 +36,16 @@ const matchers: DeterministicMatcher[] = [
   { id: 'openai', priority: 500, when: { latestUserTextIncludes: 'voice-openai' }, then: { parts: textParts('openai voice ok') } },
 ]
 
+// libSQL keeps its file handles until its prepared statements are garbage
+// collected (vitest.config.ts passes --expose-gc on Windows). The bot and the
+// credential fixture both write SQLite files in dataDir, so let go of those
+// handles before teardown removes it; a real removal failure still throws.
+async function releaseLibsqlHandles(): Promise<void> {
+  global.gc?.()
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  global.gc?.()
+}
+
 let server: OpencodeTestServer
 let twin: TestTwin
 let bot: BotHandle
@@ -45,6 +56,9 @@ let dataDir: string
 // Created by the ChatGPT test: the tests before it run with no credential.
 let opencodeDbFile: string
 
+// startOpencodeTestServer retries its 60s registration window once, and the bot
+// start plus a CLI subprocess follow: the default 60s hook budget cannot cover
+// that on a busy machine. Teardown stops five servers and a bot.
 beforeAll(async () => {
   dataDir = tempDataDir()
   opencodeDbFile = path.join(dataDir, 'opencode.db')
@@ -61,7 +75,7 @@ beforeAll(async () => {
   // Stored with the CLI, like a user would.
   const { stdout } = await promisify(execFile)(process.execPath, ['--import', 'tsx', path.resolve('src/cli.ts'), 'bot', 'keys', 'set', '--openai', 'sk-test-openai-key', '--data-dir', dataDir])
   expect(stdout).toBe('Saved OpenAI API key\n')
-})
+}, 180_000)
 
 afterAll(async () => {
   await bot?.stop()
@@ -70,8 +84,9 @@ afterAll(async () => {
   await openai?.stop()
   await chatgpt?.stop()
   await whisper?.stop()
-  fs.rmSync(dataDir, { recursive: true, force: true })
-})
+  await releaseLibsqlHandles()
+  await removeTempDir(dataDir)
+}, 120_000)
 
 const ogg = fs.readFileSync(path.join(import.meta.dirname, 'fixtures', 'voice.ogg'))
 

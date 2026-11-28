@@ -11,6 +11,7 @@ import type { DeterministicMatcher } from 'opencode-deterministic-provider'
 import { afterAll, beforeAll, expect, test } from 'vitest'
 
 import type { BotHandle } from './main.ts'
+import { removeDataDir } from './test/cleanup.ts'
 import {
   TEST_USER_ID,
   seedProjectChannel,
@@ -20,6 +21,7 @@ import {
   startTwin,
   tempDataDir,
   textParts,
+  toolParts,
   waitForBotMessageContaining,
   waitForFooter,
   warmUp,
@@ -40,6 +42,31 @@ const matchers: DeterministicMatcher[] = [
   reply('idle-marker', 'idle ok'),
 ]
 
+// The CLI turn is held open on a file the test creates once the queue ack
+// shows the prompt. A cold `tsx` spawn of src/cli.ts takes about as long as a
+// `slowTextMatcher` delay, so with a timer the echo sometimes landed after the
+// answer (and once after the whole turn, with no ack at all). The gate makes
+// "busy when the CLI queues" a fact instead of a race.
+const windows = process.platform === 'win32'
+const gateCallID = 'gate-call'
+const gateFlagName = 'gate-open.flag'
+const gateScriptName = windows ? 'hold-gate.cmd' : 'hold-gate.sh'
+const gateHold = 'Hold while the CLI queues'
+const gateHeld = `_${gateHold}_`
+
+function writeGateScript(directory: string): string {
+  const flag = path.join(directory, gateFlagName)
+  const scriptPath = path.join(directory, gateScriptName)
+  const script = windows
+    ? `@echo off\r\n:wait\r\nif exist "${flag}" goto open\r\nping -n 2 127.0.0.1 >nul\r\ngoto wait\r\n:open\r\necho gate-open\r\n`
+    : `while [ ! -f "${flag}" ]; do sleep 0.1; done\necho gate-open\n`
+  fs.writeFileSync(scriptPath, script)
+  // The shell tool runs PowerShell on Windows, which does not look in the
+  // current directory for a bare name (`hold-gate.cmd` -> command not found),
+  // so it never held. Call the script by its absolute path instead.
+  return windows ? `cmd /c "${scriptPath}"` : `sh "${scriptPath}"`
+}
+
 let server: OpencodeTestServer
 let twin: TestTwin
 let bot: BotHandle
@@ -48,6 +75,24 @@ let dataDir: string
 beforeAll(async () => {
   dataDir = tempDataDir()
   ;[server, twin] = await Promise.all([startOpencodeTestServer({ matchers }), startTwin()])
+  // Pushed after start: the hold script lives in the project directory, which
+  // the server creates. `matchers` is the array the test model reads per request.
+  matchers.push(
+    {
+      id: gateCallID,
+      priority: 20,
+      when: { latestUserTextIncludes: 'gate-marker' },
+      then: { parts: toolParts({ toolCallId: gateCallID, toolName: 'shell', input: { command: writeGateScript(server.projectDirectory), description: gateHold, hasSideEffect: true } }) },
+    },
+    // The answer only after the held command returned: the queued CLI prompt
+    // has been acked by then, so the echo always precedes the answer text.
+    {
+      id: 'gate-done',
+      priority: 21,
+      when: { latestUserTextIncludes: 'gate-marker', rawPromptIncludes: gateCallID },
+      then: { parts: textParts('slow-done') },
+    },
+  )
   await seedProjectChannel({ dataDir, channelId: twin.channelId, guildId: twin.discord.guildId, directory: server.projectDirectory })
   await warmUp({ server })
   bot = await startTestBot({ dataDir, twin, server })
@@ -57,7 +102,7 @@ afterAll(async () => {
   await bot?.stop()
   await twin?.stop()
   await server?.stop()
-  fs.rmSync(dataDir, { recursive: true, force: true })
+  await removeDataDir(dataDir)
 })
 
 // Starts a slow turn in a new thread and waits until it runs (banner posted).
@@ -70,6 +115,22 @@ async function startSlowThread(content: string) {
   return thread
 }
 
+// A turn that stays busy until `openGate()`: a held shell command is running,
+// so a prompt sent now is queued, not raced against an answer.
+async function startGatedThread(content: string) {
+  const { discord, channelId } = twin
+  const before = new Set((await discord.channel(channelId).getThreads()).map((thread) => thread.id))
+  await discord.channel(channelId).user(TEST_USER_ID).sendMessage({ content: `${content} gate-marker` })
+  const thread = await discord.channel(channelId).waitForThread({ timeout: 8_000, predicate: (candidate) => !before.has(candidate.id) })
+  // The tool line means the command is running, so the thread is busy.
+  await waitForBotMessageContaining({ discord, threadId: thread.id, text: gateHeld })
+  return thread
+}
+
+function openGate() {
+  fs.writeFileSync(path.join(server.projectDirectory, gateFlagName), '')
+}
+
 function rootOf(threadId: string): string {
   const sessionID = bot.store.getState().roots[threadId]
   if (!sessionID) throw new Error(`thread ${threadId} has no session`)
@@ -77,19 +138,25 @@ function rootOf(threadId: string): string {
 }
 
 test('CLI . queue into a busy thread shows the full text, then replies to it when it runs', async () => {
-  const thread = await startSlowThread('CLI queue')
+  const thread = await startGatedThread('CLI queue')
   await exec(process.execPath, ['--import', 'tsx', path.resolve('src/cli.ts'), 'send', '--thread', thread.id, '--prompt', 'From the CLI queued-one\nsecond line. queue', '--data-dir', dataDir], {
     env: { ...process.env, KIMAKI_LOCK_PORT: String(bot.lock.port) },
   })
+  // The product's own signal that the CLI prompt reached the busy thread: the
+  // ack shows the prompt and its position. Only then does the held turn answer.
+  await waitForBotMessageContaining({ discord: twin.discord, threadId: thread.id, text: 'Queued at position 1' })
+  openGate()
   await waitForBotMessageContaining({ discord: twin.discord, threadId: thread.id, text: 'queued one ok' })
   await waitForFooter({ discord: twin.discord, threadId: thread.id, count: 2 })
   expect(await twin.discord.thread(thread.id).text({ showReplies: true })).toMatchInlineSnapshot(`
     "--- from: user (tommy)
-    CLI queue slow-marker
+    CLI queue gate-marker
     --- from: assistant (TestBot)
     -# *using deterministic-provider/deterministic-v2 ⋅ build*
+    -# ┣ shell _Hold while the CLI queues_
     -# » **CLI:** From the CLI queued-one
     -# second line
+
     slow-done
     -# *main ⋅ Ns ⋅ N% ⋅ deterministic-v2*
     [reply to TestBot: -# » **CLI:** From the CLI queued-one -#]

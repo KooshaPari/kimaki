@@ -2,12 +2,12 @@
 // message delete/edit and /clear-queue change the inbox. Other sources
 // (CLI, TUI, promotion) are in queue-sources.e2e.
 
-import fs from 'node:fs'
 import { setTimeout as sleep } from 'node:timers/promises'
 import type { DeterministicMatcher } from 'opencode-deterministic-provider'
 import { afterAll, beforeAll, expect, onTestFinished, test } from 'vitest'
 
 import type { BotHandle } from './main.ts'
+import { removeTempDir } from './test/cleanup.ts'
 import {
   TEST_USER_ID,
   seedProjectChannel,
@@ -59,7 +59,7 @@ afterAll(async () => {
   await bot?.stop()
   await twin?.stop()
   await server?.stop()
-  fs.rmSync(dataDir, { recursive: true, force: true })
+  await removeTempDir(dataDir)
 })
 
 // Starts a slow turn in a new thread and waits until it runs (banner posted).

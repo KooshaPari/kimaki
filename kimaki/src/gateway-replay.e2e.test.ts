@@ -1,11 +1,21 @@
 // gateway-proxy buffers message events while the bot is offline and replays
 // them right after READY. Those messages must start or continue sessions like
 // live ones, even though they arrive before OpenCode is connected.
+//
+// STILL ON OPENCODE. Replay itself is kimaki behaviour, but each replayed
+// message has to become a runtime prompt (ingress -> startSession ->
+// session.create/session.prompt) and come back as a rendered assistant turn
+// with the deterministic provider footer. The jcode bot seam
+// (backend/jcode-bot-backend.ts) is observe-only: it projects
+// session.text.ended and session.execution.succeeded from a record another
+// writer persisted, JcodeBotConnection.endpoint is null so session.create and
+// session.prompt have no Jcode path, and it never emits session.created. Both
+// tests below need that write path, so their assertions stay here unchanged.
 
-import fs from 'node:fs'
 import { afterAll, beforeAll, expect, test } from 'vitest'
 
 import type { BotHandle } from './main.ts'
+import { removeDataDir } from './test/cleanup.ts'
 import {
   TEST_USER_ID,
   seedProjectChannel,
@@ -40,7 +50,7 @@ afterAll(async () => {
   await bot?.stop()
   await twin?.stop()
   await server?.stop()
-  fs.rmSync(dataDir, { recursive: true, force: true })
+  await removeDataDir(dataDir)
 })
 
 test('messages sent while the bot is offline are handled after it reconnects', async () => {

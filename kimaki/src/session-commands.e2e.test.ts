@@ -7,6 +7,8 @@ import path from 'node:path'
 import type { DeterministicMatcher } from 'opencode-deterministic-provider'
 import { afterAll, beforeAll, expect, test } from 'vitest'
 
+import { removeDataDir } from './test/cleanup.ts'
+
 import type { BotHandle } from './main.ts'
 import {
   TEST_USER_ID,
@@ -77,7 +79,7 @@ afterAll(async () => {
   await bot?.stop()
   await twin?.stop()
   await server?.stop()
-  fs.rmSync(dataDir, { recursive: true, force: true })
+  await removeDataDir(dataDir)
 })
 
 function hide(text: string): string {

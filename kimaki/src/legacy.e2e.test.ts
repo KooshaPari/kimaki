@@ -3,6 +3,14 @@
 // to a session V1 created without metadata.kimaki. The bot start imports the
 // database, and a message in the old thread continues that same session,
 // which the bot adopts (marker + instructions entry).
+//
+// STILL ON OPENCODE. This file is about the identity kimaki adopts and then
+// reads back through the OpenCode SDK: session.get metadata.kimaki,
+// session.instructions.entry.list and message.list. The jcode bot seam
+// (backend/jcode-bot-backend.ts) reads only the messages of a persisted record
+// and refuses every endpoint call, and it names session.metadata.updated and
+// session.instructions.updated in JCODE_BOT_NOT_PROJECTED. Adoption has no
+// Jcode surface yet, so its assertions stay here unchanged.
 
 import fs from 'node:fs'
 import path from 'node:path'
@@ -13,6 +21,7 @@ import { afterAll, beforeAll, expect, test } from 'vitest'
 import type { BotHandle } from './main.ts'
 import { LEGACY_DB_FILE } from './migrations.ts'
 import { createApi } from './project.ts'
+import { removeDataDir } from './test/cleanup.ts'
 import {
   startOpencodeTestServer,
   startTestBot,
@@ -40,7 +49,7 @@ afterAll(async () => {
   await bot?.stop()
   await twin?.stop()
   await server?.stop()
-  fs.rmSync(dataDir, { recursive: true, force: true })
+  await removeDataDir(dataDir)
 })
 
 test('bot starts on a V1 database and answers in an old thread with the old session', async () => {

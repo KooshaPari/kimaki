@@ -6,7 +6,6 @@
 
 import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
-import { createRequire } from 'node:module'
 import path from 'node:path'
 import { API } from '@discordjs/core/http-only'
 import { ChannelType } from 'discord.js'
@@ -15,8 +14,11 @@ import { afterAll, beforeAll, expect, test } from 'vitest'
 import type { BotHandle } from './main.ts'
 import { shellQuote } from './lock-server.ts'
 import { runOnboarding } from './onboarding.ts'
+import { readSessionMarkdown } from './session-events.ts'
+import { removeDataDir } from './test/cleanup.ts'
 import {
   TEST_USER_ID,
+  isFooter,
   scriptedTurn,
   startOpencodeTestServer,
   startTestBot,
@@ -24,7 +26,6 @@ import {
   tempDataDir,
   textParts,
   waitFor,
-  waitForFooter,
   warmUp,
   type OpencodeTestServer,
   type TestTwin,
@@ -34,17 +35,38 @@ let server: OpencodeTestServer
 let twin: TestTwin
 let bot: BotHandle
 let dataDir: string
-let kimaki: string
 let otherProject: string
+let defaultProject: string
+
+// The Kimaki plugin puts the `kimaki` shim on the shell tool's PATH. A quoted value
+// in the tool's command string arrives literal on Windows (cmd.exe keeps the quotes
+// in argv), so the command is a one-line script written next to the session: the
+// script, not the command string, carries the quoted directory.
+//
+// The script runs from the project directory, which is the shell tool's cwd, so it
+// needs an explicit relative path: Windows PowerShell resolves a bare
+// `add-other-project.cmd` from PATH only, so the bare name exits 1 with "not
+// recognized" and the CLI never runs. Same pattern as coordinator.e2e.test.ts.
+function projectAddScript(directory: string): string {
+  const windows = process.platform === 'win32'
+  const file = path.join(defaultProject, `add-other-project.${windows ? 'cmd' : 'sh'}`)
+  const command = `kimaki project add ${windows ? `"${directory}"` : shellQuote(directory)}`
+  fs.writeFileSync(file, windows ? `@echo off\r\n${command}\r\n` : `#!/bin/sh\n${command}\n`)
+  return windows ? '.\\add-other-project.cmd' : 'sh add-other-project.sh'
+}
 
 beforeAll(async () => {
   dataDir = tempDataDir()
   twin = await startTwin({ gateway: true })
-  const require = createRequire(import.meta.url)
-  kimaki = [process.execPath, require.resolve('tsx/cli'), path.join(import.meta.dirname, 'cli.ts')].map(shellQuote).join(' ')
   otherProject = path.join(dataDir, 'other-project')
   fs.mkdirSync(otherProject)
-  execFileSync('git', ['init', '-q'], { cwd: otherProject })
+  execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: otherProject })
+  // Onboarding initialises the default project directory with a plain `git init`, so
+  // its branch follows this host's init.defaultBranch. Pin it here (like the test
+  // harness does) to keep the footer's branch out of the host's configuration.
+  defaultProject = path.join(dataDir, 'projects', 'kimaki')
+  fs.mkdirSync(defaultProject, { recursive: true })
+  execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: defaultProject })
   server = await startOpencodeTestServer({
     matchers: [
       {
@@ -59,7 +81,7 @@ beforeAll(async () => {
           {
             id: 'call-project-add',
             tool: 'shell',
-            input: { command: `${kimaki} project add ${otherProject}`, description: 'add project channel' },
+            input: { command: projectAddScript(otherProject), description: 'add project channel' },
           },
         ],
         finalText: 'Added the channel for other-project.',
@@ -68,14 +90,38 @@ beforeAll(async () => {
   })
   await warmUp({ server })
   bot = await startTestBot({ dataDir, twin, server })
-}, 120_000)
+}, 300_000)
 
 afterAll(async () => {
   await bot?.stop()
   await twin?.stop()
   await server?.stop()
-  fs.rmSync(dataDir, { recursive: true, force: true })
-})
+  await removeDataDir(dataDir)
+}, 300_000)
+
+// `waitForFooter` clamps every wait to 8-10s, which fits a quiet Linux runner but not
+// a turn that shells out to the real `kimaki` CLI: that child starts node plus the tsx
+// loader, seconds on this host before it does any work. The budget is sized for the
+// host; the assertion after the wait is unchanged.
+async function waitForFooterCount({
+  threadId,
+  count,
+  timeoutMs = 90_000,
+}: {
+  threadId: string
+  count: number
+  timeoutMs?: number
+}) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const footers = (await twin.discord.thread(threadId).getMessages()).filter(
+      (message) => message.author.id === twin.discord.botUserId && isFooter(message),
+    )
+    if (footers.length >= count) return footers[count - 1]
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+  throw new Error(`Timed out waiting for footer #${count} in thread ${threadId} after ${timeoutMs}ms`)
+}
 
 async function guildChannels() {
   const channels = await new API(bot.discord.rest).guilds.getChannels(twin.discord.guildId)
@@ -91,10 +137,21 @@ test('onboarding thread adds a project channel through the kimaki CLI, which ans
   const guild = bot.discord.guilds.cache.get(discord.guildId)!
   const onboarded = await runOnboarding({ bot, dataDir, guild, gateway: true, installerId: TEST_USER_ID, machine: 'test-machine' })
   if (!onboarded || onboarded instanceof Error) throw new Error(`onboarding failed: ${onboarded?.message}`, { cause: onboarded })
-  await waitForFooter({ discord, threadId: onboarded.threadId })
+  await waitForFooterCount({ threadId: onboarded.threadId, count: 1 })
 
   await discord.thread(onboarded.threadId).user(TEST_USER_ID).sendMessage({ content: 'yes, add-other-project' })
-  await waitForFooter({ discord, threadId: onboarded.threadId, count: 2 })
+  await waitForFooterCount({ threadId: onboarded.threadId, count: 2 })
+
+  // The turn's text above says the channel was added, so the channel set below is
+  // what proves it. When one of them is missing, name the cause here instead of
+  // leaving a snapshot diff: the shell run shows whether `kimaki project add` ran
+  // and what it printed (a bare script name exits 1 with "not recognized").
+  const onboardingSession = bot.store.getState().roots[onboarded.threadId]
+  if (!onboardingSession) throw new Error(`no session for onboarding thread ${onboarded.threadId}`)
+  const read = await readSessionMarkdown({ client: await server.client(), sessionId: onboardingSession, full: true, verbose: true })
+  if (read instanceof Error) throw read
+  const run = read.split('\n\n').find((block) => block.startsWith('tool shell') && block.includes('add project channel'))
+  expect(run).toContain('Added <#')
 
   expect(await discord.channel(onboarded.channelId).text()).toMatchInlineSnapshot(`
     "--- from: assistant (TestBot)
@@ -128,7 +185,8 @@ test('onboarding thread adds a project channel through the kimaki CLI, which ans
   `)
 
   const rows = await bot.db.query.channel_directories.findMany({ orderBy: { created_at: 'asc' } })
-  expect(rows.map((row) => path.relative(dataDir, row.directory))).toMatchInlineSnapshot(`
+  // The layout is what matters, not the path separator of the host.
+  expect(rows.map((row) => path.relative(dataDir, row.directory).split(path.sep).join('/'))).toMatchInlineSnapshot(`
     [
       "projects/kimaki",
       "other-project",
@@ -139,7 +197,7 @@ test('onboarding thread adds a project channel through the kimaki CLI, which ans
   const added = rows.find((row) => row.directory === otherProject)!
   await discord.channel(added.channel_id).user(TEST_USER_ID).sendMessage({ content: 'hello new channel' })
   const thread = await discord.channel(added.channel_id).waitForThread({ timeout: 8_000 })
-  await waitForFooter({ discord, threadId: thread.id })
+  await waitForFooterCount({ threadId: thread.id, count: 1 })
 
   // Second start: nothing is created again.
   expect(await runOnboarding({ bot, dataDir, guild, gateway: true, machine: 'test-machine' })).toBe(null)
@@ -153,9 +211,9 @@ test('onboarding thread adds a project channel through the kimaki CLI, which ans
   const retried = await runOnboarding({ bot, dataDir, guild, gateway: true, installerId: TEST_USER_ID, machine: 'test-machine' })
   if (retried instanceof Error || !retried) throw new Error(`expected a retried onboarding, got ${retried}`)
   expect(retried.channelId).toBe(defaultChannel.channel_id)
-  await waitForFooter({ discord, threadId: retried.threadId })
+  await waitForFooterCount({ threadId: retried.threadId, count: 1 })
   expect((await guildChannels()).length).toBe(6)
-}, 30_000)
+}, 300_000)
 
 test('an upgraded setup with project mappings skips onboarding without selecting a server', async () => {
   const before = await guildChannels()

@@ -10,12 +10,20 @@
 //   turn_completed      root session execution.succeeded    │ fed by the event
 //   tokens_used         every execution end, root and child ┘ loop
 //
-// tokens_used sums the durable session.step.ended usage of one execution, so
-// a bot restart never double counts. session.usage.updated is cumulative and
+// tokens_used sums the durable session.step.ended usage of one execution. Each
+// step is keyed by its durable log position (aggregateID:seq), so a reattach
+// that replays history replaces the same entries instead of adding to them, and
+// a retried attempt is counted once, for the attempt that billed it. A finished
+// execution stays in state with the positions it already reported, so a replay
+// of a completed turn emits nothing. session.usage.updated is cumulative and
 // live-only, so a delta needs a baseline the bot does not have after a restart.
 //
 // Off with --no-analytics or KIMAKI_STRADA_ENABLED=0, and under vitest unless
 // a test passes its own endpoint.
+//
+// Delivery is not fire-and-forget. A collector outage is a source-health
+// state: events that could not be delivered stay in a bounded in-order buffer
+// and are retried; counters keep `attempted = delivered + retained + dropped`.
 
 import crypto from 'node:crypto'
 import fs from 'node:fs'
@@ -49,24 +57,55 @@ export type AnalyticsEvent = { name: AnalyticsEventName; properties: AnalyticsPr
 
 // --- pure fold over OpenCode events of Kimaki sessions ---
 
-type ExecutionUsage = {
-  startedAt: number
-  steps: number
+// One billed step, keyed by the durable position of its terminal event.
+type StepUsage = {
   input: number
   output: number
   reasoning: number
   cacheRead: number
   cacheWrite: number
   cost: number
+}
+
+type ExecutionUsage = {
+  // Durable position of session.execution.started (null for an execution seen
+  // only through its steps). Identical when a reattach replays the entry.
+  executionId: string | null
+  startedAt: number
+  // false once the execution ended: later step events of it are history.
+  active: boolean
+  // Executions whose tokens_used was already reported, kept after they end so
+  // a replayed turn stays silent.
+  reported: readonly string[]
+  steps: ReadonlyMap<string, StepUsage>
   model: string | null
   provider: string | null
 }
 
 export type UsageState = Readonly<Record<string, ExecutionUsage>>
 
-function without(state: UsageState, sessionId: string): UsageState {
-  const { [sessionId]: _removed, ...rest } = state
-  return rest
+// The durable position of an event. A replayed history entry keeps its
+// aggregate and sequence, so this is what makes the fold idempotent.
+function eventKey(event: Extract<V2Event, { durable: { aggregateID: string } }>): string {
+  return `${event.durable.aggregateID}:${event.durable.seq}`
+}
+
+function totals(steps: ReadonlyMap<string, StepUsage>) {
+  let input = 0
+  let output = 0
+  let reasoning = 0
+  let cacheRead = 0
+  let cacheWrite = 0
+  let cost = 0
+  for (const step of steps.values()) {
+    input += step.input
+    output += step.output
+    reasoning += step.reasoning
+    cacheRead += step.cacheRead
+    cacheWrite += step.cacheWrite
+    cost += step.cost
+  }
+  return { input, output, reasoning, cacheRead, cacheWrite, cost }
 }
 
 export function foldAnalytics({
@@ -81,54 +120,82 @@ export function foldAnalytics({
 }): { state: UsageState; events: AnalyticsEvent[] } {
   switch (event.type) {
     case 'session.execution.started': {
-      const usage: ExecutionUsage = { startedAt: event.created, steps: 0, input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0, model: null, provider: null }
-      const next = { ...state, [event.data.sessionID]: usage }
-      return { state: next, events: isRoot ? [{ name: 'turn_started', properties: {} }] : [] }
+      const sessionID = event.data.sessionID
+      const executionId = eventKey(event)
+      const previous = state[sessionID]
+      // A reattach replays this entry. Rebuild over what is already folded so
+      // the accumulation survives, and do not announce the turn twice.
+      if (previous && previous.executionId === executionId) {
+        const usage: ExecutionUsage = { ...previous, active: true }
+        return { state: { ...state, [sessionID]: usage }, events: [] }
+      }
+      const usage: ExecutionUsage = {
+        executionId,
+        startedAt: event.created,
+        active: true,
+        reported: previous?.reported ?? [],
+        steps: new Map(),
+        model: null,
+        provider: null,
+      }
+      return { state: { ...state, [sessionID]: usage }, events: isRoot ? [{ name: 'turn_started', properties: {} }] : [] }
     }
     case 'session.step.started': {
       const current = state[event.data.sessionID]
-      if (!current) return { state, events: [] }
+      if (!current || !current.active) return { state, events: [] }
       const usage = { ...current, model: event.data.model.id, provider: event.data.model.providerID }
       return { state: { ...state, [event.data.sessionID]: usage }, events: [] }
     }
     // A failed step (abort, provider error) is billed too.
     case 'session.step.ended':
     case 'session.step.failed': {
-      const current = state[event.data.sessionID]
+      const sessionID = event.data.sessionID
+      const current = state[sessionID]
       const { tokens, cost = 0 } = event.data
-      if (!current || !tokens) return { state, events: [] }
+      if (!current || !current.active || !tokens) return { state, events: [] }
+      // Same durable step replayed: overwrite it, do not add it again. A retry
+      // is a new step at a new sequence, so it lands as its own entry.
+      const steps = new Map(current.steps)
+      steps.set(eventKey(event), {
+        input: tokens.input,
+        output: tokens.output,
+        reasoning: tokens.reasoning,
+        cacheRead: tokens.cache.read,
+        cacheWrite: tokens.cache.write,
+        cost,
+      })
       const usage: ExecutionUsage = {
         ...current,
-        steps: current.steps + 1,
-        input: current.input + tokens.input,
-        output: current.output + tokens.output,
-        reasoning: current.reasoning + tokens.reasoning,
-        cacheRead: current.cacheRead + tokens.cache.read,
-        cacheWrite: current.cacheWrite + tokens.cache.write,
-        cost: current.cost + cost,
+        steps,
       }
-      return { state: { ...state, [event.data.sessionID]: usage }, events: [] }
+      return { state: { ...state, [sessionID]: usage }, events: [] }
     }
     case 'session.execution.succeeded':
     case 'session.execution.failed':
     case 'session.execution.interrupted': {
-      const usage = state[event.data.sessionID]
-      const next = without(state, event.data.sessionID)
+      const sessionID = event.data.sessionID
+      const usage = state[sessionID]
+      if (!usage) return { state, events: [] }
+      const idle: ExecutionUsage = { ...usage, active: false }
+      const next = { ...state, [sessionID]: idle }
+      // Replay of a turn already reported: history, not new usage.
+      if (usage.executionId !== null && usage.reported.includes(usage.executionId)) return { state: next, events: [] }
       // Not seen from the start (bot restarted mid-run), or no model step (compaction).
-      if (!usage || usage.steps === 0) return { state: next, events: [] }
+      if (!usage.active || usage.steps.size === 0) return { state: next, events: [] }
+      const { input, output, reasoning, cacheRead, cacheWrite, cost } = totals(usage.steps)
       // OpenCode reports output without reasoning, but bills both.
-      const total = usage.input + usage.output + usage.reasoning + usage.cacheRead + usage.cacheWrite
+      const total = input + output + reasoning + cacheRead + cacheWrite
       const tokensUsed: AnalyticsEvent = {
         name: 'tokens_used',
         properties: {
-          tokens_input: usage.input,
-          tokens_output: usage.output,
-          tokens_reasoning: usage.reasoning,
-          tokens_cache_read: usage.cacheRead,
-          tokens_cache_write: usage.cacheWrite,
+          tokens_input: input,
+          tokens_output: output,
+          tokens_reasoning: reasoning,
+          tokens_cache_read: cacheRead,
+          tokens_cache_write: cacheWrite,
           tokens_total: total,
-          cost: usage.cost,
-          assistant_message_count: usage.steps,
+          cost,
+          assistant_message_count: usage.steps.size,
           is_subagent: !isRoot,
           ...(usage.model && { model: usage.model }),
           ...(usage.provider && { provider: usage.provider }),
@@ -139,7 +206,11 @@ export function foldAnalytics({
           ? [{ name: 'turn_completed', properties: { duration_sec: Math.round((event.created - usage.startedAt) / 1000) } }]
           : []
       // Zero-token executions are skipped, like V1.
-      return { state: next, events: [...(total > 0 || usage.cost > 0 ? [tokensUsed] : []), ...completed] }
+      const reported = usage.executionId === null ? usage.reported : [...usage.reported, usage.executionId]
+      return {
+        state: { ...state, [sessionID]: { ...idle, reported } },
+        events: [...(total > 0 || cost > 0 ? [tokensUsed] : []), ...completed],
+      }
     }
     default:
       return { state, events: [] }
@@ -155,6 +226,151 @@ export type Analytics = {
   // An OpenCode event of a Kimaki thread (event loop).
   observe: (event: V2Event, isRoot: boolean) => void
   flush: () => Promise<void>
+  // Collector reachability and the retention buffer, for `kimaki status` and
+  // tests. Always reachable/zero for disabledAnalytics.
+  health: () => SourceHealth
+  counters: () => SourceCounters
+}
+
+// --- source health and the outage buffer ---
+// Retention is bounded so an outage cannot grow without limit. 256 events is
+// hours of normal traffic (a busy turn emits about three) and stays near a
+// quarter of a megabyte. Past the cap the oldest event is dropped and counted:
+// a silent unbounded buffer would be a leak.
+export const RETAIN_CAP = 256
+
+export type SourceFailure =
+  | { kind: 'network'; message: string }
+  // The collector answered, but not 2xx: up and refusing, unlike 'network'.
+  | { kind: 'status'; status: number; message: string }
+
+export type SourceHealth = {
+  reachable: boolean // false from a failed pass until one succeeds
+  lastError: string | null
+  lastErrorKind: SourceFailure['kind'] | null
+  lastErrorStatus: number | null // HTTP status, null for a network failure
+  failedSends: number // passes that carried at least one failure
+  firstFailureAt: number | null // start of the current outage
+  lastSuccessAt: number | null
+}
+
+export type SourceCounters = {
+  // Distinct events the sink accepted; retrying a retained event is not a new
+  // attempt, which is what keeps the invariant adding up.
+  attempted: number
+  delivered: number
+  retained: number
+  dropped: number
+}
+
+export type CollectorTransport = {
+  // One pass over `events`, in order: undefined = accepted, else why not.
+  deliver: (events: readonly AnalyticsEvent[]) => Promise<readonly (SourceFailure | undefined)[]>
+}
+
+export type EventSink = {
+  emit: (event: AnalyticsEvent) => Promise<void>
+  flush: () => Promise<void>
+  health: () => SourceHealth
+  counters: () => SourceCounters
+  // The retained events, oldest first.
+  peek: () => readonly AnalyticsEvent[]
+}
+
+export function reachableHealth(): SourceHealth {
+  return { reachable: true, lastError: null, lastErrorKind: null, lastErrorStatus: null, failedSends: 0, firstFailureAt: null, lastSuccessAt: null }
+}
+
+export function emptyCounters(): SourceCounters {
+  return { attempted: 0, delivered: 0, retained: 0, dropped: 0 }
+}
+
+export function createEventSink({
+  deliver,
+  cap = RETAIN_CAP,
+  now = Date.now,
+}: {
+  deliver: CollectorTransport['deliver']
+  cap?: number
+  now?: () => number
+}): EventSink {
+  const limit = Math.max(1, cap)
+  let buffer: AnalyticsEvent[] = []
+  let attempted = 0
+  let delivered = 0
+  let dropped = 0
+  let health = reachableHealth()
+  // Passes are chained, never concurrent: each flush queues behind the last,
+  // so a burst of emits cannot send the same retained event twice, and every
+  // emit still gets a pass that sees it.
+  let tail: Promise<void> = Promise.resolve()
+
+  const recordFailure = (failure: SourceFailure) => {
+    const at = now()
+    health = {
+      reachable: false,
+      lastError: failure.message,
+      lastErrorKind: failure.kind,
+      lastErrorStatus: failure.kind === 'status' ? failure.status : null,
+      failedSends: health.failedSends + 1,
+      firstFailureAt: health.firstFailureAt ?? at,
+      lastSuccessAt: health.lastSuccessAt,
+    }
+  }
+
+  const pass = async () => {
+    if (buffer.length === 0) return
+    const batch = buffer
+    let outcomes: readonly (SourceFailure | undefined)[]
+    try {
+      outcomes = await deliver(batch)
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message : String(cause)
+      outcomes = batch.map(() => ({ kind: 'network' as const, message }))
+    }
+    const keep: AnalyticsEvent[] = []
+    let failure: SourceFailure | undefined // the last failure of the pass
+    for (let i = 0; i < batch.length; i += 1) {
+      const event = batch[i]
+      if (event === undefined) continue
+      // A short answer is a failure: silence must not look like acceptance.
+      const outcome = i < outcomes.length ? outcomes[i] : ({ kind: 'network', message: 'collector answered for no such event' } as const)
+      if (outcome) {
+        failure = outcome
+        keep.push(event)
+      } else {
+        delivered += 1
+      }
+    }
+    buffer = keep
+    if (failure) {
+      recordFailure(failure)
+      return
+    }
+    health = { ...health, reachable: true, lastError: null, lastErrorKind: null, lastErrorStatus: null, firstFailureAt: null, lastSuccessAt: now() }
+  }
+
+  const flush = () => {
+    const next = tail.then(() => pass()).catch(() => {})
+    tail = next
+    return next
+  }
+
+  return {
+    emit: async (event) => {
+      attempted += 1
+      if (buffer.length >= limit) {
+        buffer.shift()
+        dropped += 1
+      }
+      buffer.push(event)
+      await flush()
+    },
+    flush,
+    health: () => health,
+    counters: () => ({ attempted, delivered, retained: buffer.length, dropped }),
+    peek: () => buffer.slice(),
+  }
 }
 
 export const disabledAnalytics: Analytics = {
@@ -162,6 +378,8 @@ export const disabledAnalytics: Analytics = {
   track: () => {},
   observe: () => {},
   flush: async () => {},
+  health: reachableHealth,
+  counters: emptyCounters,
 }
 
 function readInstallId(dataDir: string): ConfigError | string {
@@ -184,6 +402,34 @@ function readInstallId(dataDir: string): ConfigError | string {
 function kimakiVersion(): string {
   const pkg = createRequire(import.meta.url)('../package.json') as { version: string }
   return pkg.version
+}
+
+// The SDK reports a refused batch as `Strada ingest <path> responded <status>`
+// and a transport problem as `... request failed`. That message is the only
+// status surface the SDK exposes, so the parsing lives here and nowhere else.
+function toSourceFailure(error: Error): SourceFailure {
+  const refused = /responded (\d{3})\b/.exec(error.message)
+  if (refused?.[1]) return { kind: 'status', status: Number(refused[1]), message: error.message }
+  return { kind: 'network', message: error.message }
+}
+
+// Deliver a pass through the SDK. track() only buffers; flush() is what talks
+// to the collector. The SDK does not say which record a failed batch rejected,
+// so a failed flush fails every event that track() did not already reject, and
+// a retry re-sends the whole retained pass (the SDK has no partial-batch view).
+function stradaDeliver(): CollectorTransport['deliver'] {
+  return async (events) => {
+    const outcomes = events.map((event): SourceFailure | undefined => {
+      const failed = track(event.name, event.properties)
+      return failed instanceof Error ? toSourceFailure(failed) : undefined
+    })
+    const flushed = await flush()
+    if (flushed instanceof Error) {
+      const failure = toSourceFailure(flushed)
+      return outcomes.map((outcome) => outcome ?? failure)
+    }
+    return outcomes
+  }
 }
 
 export function createAnalytics({
@@ -224,10 +470,11 @@ export function createAnalytics({
     return disabledAnalytics
   }
   const common = { install_id: installId, schema_version: SCHEMA_VERSION, bot_mode: botMode, platform: process.platform, arch: process.arch }
+  const sink = createEventSink({ deliver: stradaDeliver() })
   const send = (name: AnalyticsEventName, properties: AnalyticsProps = {}) => {
-    // Identity fields always win over caller props.
-    const failed = track(name, { ...properties, ...common })
-    if (failed instanceof Error) logger.warn(`track ${name}`, failed)
+    // Identity fields always win over caller props. emit() never rejects: a
+    // failure is recorded as source health instead of thrown at the caller.
+    void sink.emit({ name, properties: { ...properties, ...common } })
   }
   const usage: { state: UsageState } = { state: {} }
   return {
@@ -239,8 +486,13 @@ export function createAnalytics({
       for (const tracked of folded.events) send(tracked.name, tracked.properties)
     },
     flush: async () => {
-      const failed = await flush()
-      if (failed instanceof Error) logger.warn(`flush`, failed)
+      await sink.flush()
+      const health = sink.health()
+      // A flush that could not reach the collector is now a health state, but
+      // it is still worth one log line when it happens.
+      if (!health.reachable) logger.warn(`analytics collector unreachable`, health.lastError ?? 'unknown')
     },
+    health: sink.health,
+    counters: sink.counters,
   }
 }

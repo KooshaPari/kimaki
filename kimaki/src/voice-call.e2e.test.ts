@@ -13,6 +13,7 @@ import { afterAll, beforeAll, expect, test } from 'vitest'
 
 import type { BotHandle } from './main.ts'
 import { ensureVoiceChannels, saveVoiceCallVoice, voiceCallSettings } from './voice-call.ts'
+import { removeDataDir } from './test/cleanup.ts'
 import {
   TEST_USER_ID,
   seedProjectChannel,
@@ -89,8 +90,13 @@ afterAll(async () => {
   await twin?.stop()
   await server?.stop()
   await live?.stop()
-  fs.rmSync(dataDir, { recursive: true, force: true })
+  await removeDataDir(dataDir)
 })
+
+// The voice shell tool spawns `/bin/sh -c`, a path Windows does not resolve
+// (`spawn /bin/sh ENOENT`), so the two tests whose scripted turns run shell commands
+// cannot assert anything there. They stay unmodified and run wherever /bin/sh exists.
+const noPosixShell = process.platform === 'win32'
 
 test('the voice channel is created once per machine, with no category', async () => {
   const first = await ensureVoiceChannels(bot, { machine: 'test-machine' })
@@ -108,7 +114,7 @@ test('the voice channel is created once per machine, with no category', async ()
   `)
 })
 
-test('a user joins and speaks, the backend runs kimaki commands and the model says the answer; leaving ends the call', async () => {
+test.skipIf(noPosixShell)('a user joins and speaks, the backend runs kimaki commands and the model says the answer; leaving ends the call', async () => {
   live.replies.push(
     // seq makes the output longer than the 4000 character limit.
     { type: 'call', name: 'shell', args: { command: 'seq 1 2000; kimaki project list' } },
@@ -215,7 +221,7 @@ test('chat messages reach the backend, and end_call leaves after the goodbye whi
   await twin.discord.channel(voiceChannelId).user(TEST_USER_ID).leaveVoice()
 })
 
-test('finished threads of any project are announced in the call; the model answers only for its own', async () => {
+test.skipIf(noPosixShell)('finished threads of any project are announced in the call; the model answers only for its own', async () => {
   await waitFor({ label: 'bot out of voice', check: async () => botVoiceChannel() === null })
   const before = (await twin.discord.channel(voiceChannelId).getMessages()).length
   live.replies.push(

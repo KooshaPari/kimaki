@@ -79,8 +79,25 @@ export function installedOpencodeBinary(): string {
   return path.join(os.homedir(), '.opencode', 'bin', process.platform === 'win32' ? 'opencode.exe' : 'opencode')
 }
 
+// Node cannot spawn .cmd/.bat without a shell (spawn EINVAL), and npm installs
+// CLIs as .cmd shims on Windows, so the recommended `npm i -g @opencode/cli`
+// lands as opencode.cmd there. `call` takes the path as its own argument, so
+// spaces in the path need no quoting and nothing is interpolated into a shell.
+function versionInvocation(binary: string): { file: string; args: string[] } {
+  if (process.platform === 'win32' && /\.(?:bat|cmd)$/i.test(binary)) {
+    return { file: process.env['ComSpec'] || 'cmd.exe', args: ['/d', '/s', '/c', 'call', binary, '--version'] }
+  }
+  return { file: binary, args: ['--version'] }
+}
+
 async function opencodeVersion(binary: string): Promise<string | null> {
-  const result = await execFileAsync(binary, ['--version'], { timeout: 10_000 }).catch(() => null)
+  const invocation = versionInvocation(binary)
+  // The async wrapper turns the synchronous EINVAL of a non-spawnable candidate
+  // into a rejection, so it reads as "no version here" instead of escaping.
+  // The timeout is generous because the binary is large and a cold `--version`
+  // under an antivirus scan takes seconds: a timeout reads as "no version", so a
+  // tight one would silently pick a different candidate than the user's install.
+  const result = await (async () => execFileAsync(invocation.file, invocation.args, { timeout: 30_000 }))().catch(() => null)
   return result ? parseVersionOutput(result.stdout) : null
 }
 
@@ -307,7 +324,10 @@ export type ConnectContext = {
   signal: AbortSignal
 }
 
-export type OpencodeConnection = {
+// The connection contract every bot backend satisfies. watchOpencode returns this
+// shape for OpenCode; a Jcode backend satisfies the same members with kind 'jcode'.
+export interface Backend {
+  readonly kind: 'opencode' | 'jcode'
   readonly connected: boolean
   readonly endpoint: OpencodeEndpoint | null
   // Resolves on the first successful connect, or with the fatal error.
@@ -316,6 +336,10 @@ export type OpencodeConnection = {
   // (re)connect starts with server.connected. Returns the unsubscribe.
   subscribe: (listener: (event: V2Event) => void) => () => void
   stop: () => void
+}
+
+export type OpencodeConnection = Backend & {
+  readonly kind: 'opencode'
 }
 
 class StreamClosedError extends errore.createTaggedError({
@@ -445,6 +469,7 @@ export function watchOpencode({
   })()
 
   return {
+    kind: 'opencode',
     get connected() {
       return state.connected
     },

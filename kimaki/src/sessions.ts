@@ -27,6 +27,9 @@ import {
   type ModelChoice,
   type PromptFile,
 } from './bot.ts'
+import { bindThread } from './bind-thread.ts'
+import { jcodeConnectionRefusal, JcodeSurfaceUnavailableError, jcodeSurfaceRefusal } from './jcode-surfaces.ts'
+import { startJcodeCoordinator, startJcodeThread } from './jcode-thread.ts'
 import { ConfigError, DbError, DiscordError, OpenCodeError, OpenCodeUnavailableError } from './errors.ts'
 import { SILENT_MESSAGE_FLAGS } from './format-parts.ts'
 import { createLogger } from './logger.ts'
@@ -36,7 +39,7 @@ import { formatEcho } from './queue.ts'
 import type { Route } from './routes.ts'
 import * as schema from './schema.ts'
 import { disabledSkillRules } from './builtin-skills.ts'
-import { baseInstructions, INSTRUCTION_KEY, type ScheduledRun } from './system-prompt.ts'
+import { sessionInstruction, INSTRUCTION_KEY, type ScheduledRun } from './system-prompt.ts'
 import { createWorktree, isLinkedWorktree, resolveWorkingDirectory } from './worktrees.ts'
 
 const logger = createLogger('SESSIONS')
@@ -69,7 +72,7 @@ export function btwPrompt({
     `Parent session: ${parentSessionId} (thread <#${sourceThreadId}>)`,
     'Do NOT send messages to the parent session unless the user explicitly asks you to.',
     // The instructions entry is copied from the parent (prompt cache); these IDs win.
-    `This fork has its own IDs: OpenCode session ${sessionId}, Discord thread ${threadId}.`,
+    `This fork has its own IDs: agent session ${sessionId}, Discord thread ${threadId}.`,
     '',
     text,
   ].join('\n')
@@ -109,19 +112,6 @@ export async function sessionCwd(bot: Bot, { conversation, directory }: { conver
   return { requestedDirectory: destination }
 }
 
-async function bindThread(
-  bot: Bot,
-  { threadId, sessionId, channelId, directory, isNew }: { threadId: string; sessionId: string; channelId: string; directory: string; isNew: boolean },
-): Promise<DbError | void> {
-  const inserted = await bot.db
-    .insert(schema.thread_sessions)
-    .values({ thread_id: threadId, session_id: sessionId, source: 'kimaki' })
-    .catch((cause) => new DbError({ operation: 'insert thread_sessions', cause }))
-  if (inserted instanceof Error) return inserted
-  await bot.eventLoop.bind({ threadId, sessionId, channelId, directory, isNew })
-  logger.log(`session ${sessionId} bound to thread ${threadId}`)
-}
-
 // A cold (or evicted) location loads plugin and markdown agents a moment after
 // it answers. integration.list waits for that activation.
 // TODO: drop this once agent/command/skill.list wait too. https://github.com/anomalyco/opencode/issues/51282
@@ -133,6 +123,8 @@ export async function catalogReady(bot: Pick<Bot, 'opencode'>, directory: string
 // Agents a session may switch to (not subagents, not hidden ones). OpenCode lists
 // its default agent (`default_agent`, else build) first: core/src/agent.ts `list`.
 export async function primaryAgents(bot: Pick<Bot, 'opencode'>, directory: string) {
+  const refused = jcodeConnectionRefusal(bot, 'agent')
+  if (refused) return refused
   const ready = await catalogReady(bot, directory)
   if (ready instanceof Error) return ready
   const agents = await oc(bot, 'agent.list', (client) => client.agent.list({ location: { directory } }))
@@ -227,7 +219,7 @@ async function putInstructions(
   if (found instanceof Error) logger.warn(`agent list for instructions failed`, found)
   // The ID is what switchAgent and session.create take.
   const agents = found instanceof Error ? [] : found.map((agent) => ({ name: agent.id, description: agent.description ?? '' }))
-  const value = baseInstructions({
+  const value = sessionInstruction({
     sessionId,
     threadId: conversation.id,
     channelId: channel.id,
@@ -437,6 +429,28 @@ export async function startSession(
     run?: boolean
   },
 ): Promise<Error | { threadId: string; sessionId: string }> {
+  // A jcode thread's session is minted on bind, never at bot start (docs/opencode-removal.md
+  // Phase 1): creation is this path's job and it owns its own failures by name. The OpenCode
+  // path below is unchanged and still serves `--backend opencode`.
+  if (bot.backendKind === 'jcode') {
+    return startJcodeThread(bot, {
+      channelId,
+      directory: requestedDirectory,
+      route,
+      author,
+      messageId,
+      startMessageId,
+      showInput,
+      threadName: explicitName,
+      members,
+      files,
+      worktree,
+      baseBranch,
+      run,
+      parentSessionId,
+      task,
+    })
+  }
   const defaults = await bot.db.query.channel_directories
     .findFirst({ where: { channel_id: channelId }, with: { channel_model: true, channel_agent: true, channel_worktree: true } })
     .catch((cause) => new DbError({ operation: 'read channel defaults', cause }))
@@ -566,6 +580,12 @@ export async function startCoordinator(
     files?: readonly PromptFile[]
   },
 ): Promise<Error | { threadId: string; sessionId: string }> {
+  // Same rule as a thread: a coordinator channel is bound with the channel id and its
+  // session is created on bind, never at bot start. Coordinator mode is the default, so
+  // without this branch a plain channel message on a jcode bot creates nothing.
+  if (bot.backendKind === 'jcode') {
+    return startJcodeCoordinator(bot, { channel, route, author })
+  }
   const defaults = await bot.db.query.channel_directories
     .findFirst({ where: { channel_id: channel.id }, with: { channel_model: true, channel_agent: true } })
     .catch((cause) => new DbError({ operation: 'read channel defaults', cause }))
@@ -697,7 +717,7 @@ async function adoptSession(
           .delete(schema.thread_sessions)
           .where(orm.eq(schema.thread_sessions.session_id, sessionId))
           .returning({ threadId: schema.thread_sessions.thread_id }),
-        bot.db.insert(schema.thread_sessions).values({ thread_id: thread.id, session_id: sessionId, source: 'kimaki' }),
+        bot.db.insert(schema.thread_sessions).values({ thread_id: thread.id, session_id: sessionId, source: 'kimaki', backend: bot.backendKind }),
       ])
       .catch((cause) => new DbError({ operation: 'move thread_sessions', cause }))
     if (moved instanceof Error) return moved
@@ -715,6 +735,7 @@ async function adoptSession(
     sessionId,
     channelId: channel.id,
     directory: session.location.directory,
+    backend: bot.backendKind,
     isNew: false,
     first: [{ type: 'kimaki.replay', messages: prepared.history, note }],
   })
@@ -801,6 +822,8 @@ export async function fork(
     worktree?: { name: string; baseBranch?: string }
   },
 ) {
+  const refused = jcodeSurfaceRefusal(bot, source.id, 'fork')
+  if (refused) return refused
   const root = rootSession(bot, source.id)
   if (root instanceof Error) return root
   if (sessionId !== root) {
@@ -887,7 +910,9 @@ export async function forkBtw(
     parentSessionId?: string
     sender?: Sender
   },
-): Promise<ConfigError | OpenCodeUnavailableError | OpenCodeError | DiscordError | DbError | { threadId: string; sessionId: string }> {
+): Promise<ConfigError | OpenCodeUnavailableError | OpenCodeError | JcodeSurfaceUnavailableError | DiscordError | DbError | { threadId: string; sessionId: string }> {
+  const refused = jcodeSurfaceRefusal(bot, source.id, 'btw')
+  if (refused) return refused
   const sourceSessionId = rootSession(bot, source.id)
   if (sourceSessionId instanceof Error) return sourceSessionId
   const project = await conversationProject(bot, source)

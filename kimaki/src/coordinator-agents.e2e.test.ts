@@ -3,12 +3,12 @@
 // (workers pass --agent <current_agent>) keeps its agent and model, and `/<agent>-agent`
 // without a prompt switches the coordinator itself (last test: it changes the coordinator).
 
-import fs from 'node:fs'
 import type { DeterministicMatcher } from 'opencode-deterministic-provider'
 import { afterAll, beforeAll, expect, test } from 'vitest'
 
 import type { BotHandle } from './main.ts'
 import { send } from './prompt.ts'
+import { removeTempDir } from './test/cleanup.ts'
 import { TRANSCRIPTION_KEY_MODAL } from './voice.ts'
 import {
   TEST_USER_ID,
@@ -78,7 +78,7 @@ afterAll(async () => {
   await twin?.stop()
   await server?.stop()
   await gemini?.stop()
-  fs.rmSync(dataDir, { recursive: true, force: true })
+  await removeTempDir(dataDir)
 })
 
 async function coordinator() {

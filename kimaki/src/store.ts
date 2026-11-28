@@ -12,6 +12,10 @@ import type { ThreadView } from './thread-reducer.ts'
 export type State = {
   // threadId -> root session, from thread_sessions (SQLite) and new bindings.
   roots: Readonly<Record<string, string>>
+  // threadId -> the raw `thread_sessions.backend` value. Kept as recorded so an
+  // unknown name reaches the resolver as an error instead of being coerced
+  // (thread-backend.ts). A thread with no entry is a thread with no row.
+  threadBackends: Readonly<Record<string, string>>
   // sessionId (roots and their subagent children) -> threadId, for routing.
   sessionThreads: Readonly<Record<string, string>>
   // threadId -> view, created at bind or when a thread of an earlier run gets its first event.
@@ -23,7 +27,7 @@ export type State = {
 }
 
 export function createBotStore() {
-  return createStore<State>(() => ({ roots: {}, sessionThreads: {}, threads: {}, verbosity: {}, coordinator: {} }))
+  return createStore<State>(() => ({ roots: {}, threadBackends: {}, sessionThreads: {}, threads: {}, verbosity: {}, coordinator: {} }))
 }
 
 export type BotStore = ReturnType<typeof createBotStore>

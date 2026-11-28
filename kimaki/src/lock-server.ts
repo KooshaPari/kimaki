@@ -3,7 +3,8 @@
 //
 //   new bot ─GET /health─▶ old bot: { pid, wrapperPid }   (no answer: nothing to stop)
 //           ─SIGTERM wrapperPid ?? pid─▶ wait for pid to exit (20s) ─▶ SIGKILL both
-//           ─▶ bind the port
+//           ─▶ bind the port, retrying briefly while the kernel still reports
+//              the dead bot's socket (Windows closes it after the pid is gone)
 //
 // The wrapper (V2: the supervisor in cli/bot.ts) gets the signal, not the
 // bot: a killed bot alone looks like a crash. Both wrappers forward SIGTERM
@@ -81,6 +82,23 @@ function listen(server: http.Server, port: number): Promise<NodeJS.ErrnoExceptio
     server.once('listening', onListening)
     server.listen(port, '127.0.0.1')
   })
+}
+
+// After an eviction the pid is gone before its listening socket is: on Windows
+// the first bind can still return EADDRINUSE (measured 7/8 takeovers in a tight
+// loop, freeing in 1-3ms). Retry for a short, bounded window; a process that
+// really still holds the port ends in LockPortError all the same.
+const REBIND_WINDOW_MS = 2_000
+const REBIND_INTERVAL_MS = 50
+
+async function listenAfterEvict(server: http.Server, port: number): Promise<NodeJS.ErrnoException | void> {
+  const deadline = Date.now() + REBIND_WINDOW_MS
+  let bound = await listen(server, port)
+  while (bound instanceof Error && bound.code === 'EADDRINUSE' && Date.now() < deadline) {
+    await sleep(REBIND_INTERVAL_MS)
+    bound = await listen(server, port)
+  }
+  return bound
 }
 
 // PID of the supervisor while it is alive (IPC connected); an orphan bot reports none.
@@ -185,7 +203,7 @@ export async function startLockServer({ port, dataDir, supervised = false, evict
   // Before listening, not on EADDRINUSE: on macOS 127.0.0.1:port binds even
   // while a V1 bot holds 0.0.0.0:port (KIMAKI_INTERNET_REACHABLE_URL).
   if (evict) await evictRunningBot({ port })
-  const bound = await listen(server, port)
+  const bound = evict ? await listenAfterEvict(server, port) : await listen(server, port)
   if (bound instanceof Error) {
     const reason = bound.code === 'EADDRINUSE'
       ? 'port is in use and the process on it did not stop. Stop it or set KIMAKI_LOCK_PORT to a free port'
@@ -195,6 +213,10 @@ export async function startLockServer({ port, dataDir, supervised = false, evict
 
   logger.info(`lock server listening on 127.0.0.1:${port}`)
   const tokenFile = path.join(dataDir, 'lock-token')
+  // 0600 is the intent: the token must stay owner-only. Windows has no POSIX
+  // mode bits, so writeFile's mode and chmod are accepted there but leave the
+  // file at the ACL it inherits from the data directory (typically the user
+  // profile). Only a POSIX host gets the mode actually applied.
   const written = await fs.promises.mkdir(dataDir, { recursive: true, mode: 0o700 })
     .then(() => fs.promises.writeFile(tokenFile, token, { mode: 0o600 }))
     .then(() => fs.promises.chmod(tokenFile, 0o600))

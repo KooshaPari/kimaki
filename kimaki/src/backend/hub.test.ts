@@ -1,0 +1,961 @@
+import childProcess from 'node:child_process'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { describe, expect, it } from 'vitest'
+import { createAcpClient } from './acp/client.ts'
+import { createSessionHub, type HubBackend, type HubEvent } from './hub.ts'
+
+const wait = (ms = 0) => new Promise((resolve) => setTimeout(resolve, ms))
+
+// A managed child that records its own pid and dies non-zero before it can answer
+// any handshake. No stdout means no ACK frame ever arrives.
+const CRASH_SOURCE = String.raw`
+const fs = require('node:fs')
+fs.writeFileSync(process.argv[2], String(process.pid))
+process.exit(7)
+`
+
+const isAlive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
+const waitForDead = async (pid: number, timeoutMs = 3_000): Promise<boolean> => {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (!isAlive(pid)) return true
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+  return !isAlive(pid)
+}
+
+// Default backend completes a turn immediately. `blocking: true` holds the turn
+// open so tests can observe the busy state and cancellation.
+function fakeBackend({ blocking = false, overrides = {} }: { blocking?: boolean; overrides?: Partial<HubBackend> } = {}) {
+  let releaseTurn: (() => void) | undefined
+  const calls = { starts: 0, prompts: [] as string[], cancels: 0, closes: 0 }
+  const backend: HubBackend = {
+    async start(input) {
+      calls.starts += 1
+      return { sessionId: 'session-1', model: input?.model ?? null }
+    },
+    async prompt(text, onChunk) {
+      calls.prompts.push(text)
+      onChunk?.('ok')
+      if (blocking) {
+        await new Promise<void>((resolve) => {
+          releaseTurn = resolve
+        })
+      }
+      return { stopReason: 'end_turn', text: 'ok', updateCount: 1 }
+    },
+    async cancel() {
+      calls.cancels += 1
+      return undefined
+    },
+    async close() {
+      calls.closes += 1
+    },
+    ...overrides,
+  }
+  return { backend, calls, release: () => releaseTurn?.() }
+}
+
+describe('createSessionHub', () => {
+  it('drops a subscriber that throws without losing the turn for the others', async () => {
+    const { backend } = fakeBackend()
+    const hub = createSessionHub({ backend })
+    if (hub instanceof Error) throw hub
+    let brokenCalls = 0
+    const broken = hub.subscribe({ clientId: 'broken', onEvent: () => { brokenCalls += 1; throw new Error('consumer bug') } })
+    if (broken instanceof Error) throw broken
+    const healthy: HubEvent[] = []
+    const good = hub.subscribe({ clientId: 'healthy', onEvent: (event) => healthy.push(event) })
+    if (good instanceof Error) throw good
+
+    const result = await hub.submit('hello')
+    expect(result).not.toBeInstanceOf(Error)
+    // The healthy subscriber still saw the whole turn.
+    expect(healthy.map((event) => event.seq)).toEqual([1, 2, 3, 4])
+    // The thrower was detached on its first failure rather than retried per event.
+    expect(brokenCalls).toBe(1)
+    expect(hub.snapshot().subscribers).toBe(1)
+  })
+
+  it('fans one turn out to several subscribers in order', async () => {
+    const { backend } = fakeBackend()
+    const hub = createSessionHub({ backend, model: 'beam-free' })
+    if (hub instanceof Error) throw hub
+
+    const first: HubEvent[] = []
+    const second: HubEvent[] = []
+    const a = hub.subscribe({ onEvent: (event) => first.push(event) })
+    const b = hub.subscribe({ onEvent: (event) => second.push(event) })
+    if (a instanceof Error || b instanceof Error) throw new Error('subscribe failed')
+
+    const submitted = await hub.submit('hello')
+    expect(submitted).toMatchObject({ accepted: true, characters: 5 })
+    await wait(10)
+
+    const kinds = (events: HubEvent[]) => events.map((event) => event.type)
+    expect(kinds(first)).toEqual(['session.started', 'prompt.started', 'prompt.chunk', 'prompt.finished'])
+    expect(kinds(second)).toEqual(kinds(first))
+    expect(first.map((event) => event.seq)).toEqual([1, 2, 3, 4])
+    expect(second.map((event) => event.seq)).toEqual([1, 2, 3, 4])
+    const started = first[0]!
+    expect(started).toMatchObject({ type: 'session.started', sessionId: 'session-1', model: 'beam-free' })
+  })
+
+  it('replays buffered events to a late subscriber from its cursor', async () => {
+    const { backend } = fakeBackend()
+    const hub = createSessionHub({ backend })
+    if (hub instanceof Error) throw hub
+    hub.subscribe({ onEvent: () => {} })
+    await hub.submit('hello')
+    await wait(10)
+
+    const replayed: HubEvent[] = []
+    const late = hub.subscribe({ cursor: 0, onEvent: (event) => replayed.push(event) })
+    if (late instanceof Error) throw late
+    expect(late.clipped).toBe(false)
+    expect(replayed.map((event) => event.seq)).toEqual([1, 2, 3, 4])
+    expect(late.cursor).toBe(4)
+  })
+
+  it('resumes from a cursor without repeating earlier events', async () => {
+    const { backend } = fakeBackend()
+    const hub = createSessionHub({ backend })
+    if (hub instanceof Error) throw hub
+    await hub.submit('hello')
+    await wait(10)
+
+    const resumed: HubEvent[] = []
+    const subscription = hub.subscribe({ cursor: 3, onEvent: (event) => resumed.push(event) })
+    if (subscription instanceof Error) throw subscription
+    expect(resumed.map((event) => event.seq)).toEqual([4])
+  })
+
+  it('reports a cursor that predates the replay buffer as clipped', async () => {
+    const { backend } = fakeBackend()
+    const hub = createSessionHub({ backend, bufferLimit: 2 })
+    if (hub instanceof Error) throw hub
+    await hub.submit('hello')
+    await wait(10)
+
+    const seen: HubEvent[] = []
+    const subscription = hub.subscribe({ cursor: 0, onEvent: (event) => seen.push(event) })
+    if (subscription instanceof Error) throw subscription
+    expect(subscription.clipped).toBe(true)
+    expect(seen.map((event) => event.seq)).toEqual([3, 4])
+  })
+
+  it('refuses a second prompt while one turn is running', async () => {
+    const { backend } = fakeBackend({ blocking: true })
+    const hub = createSessionHub({ backend })
+    if (hub instanceof Error) throw hub
+    expect(await hub.submit('first')).toMatchObject({ accepted: true })
+    const second = await hub.submit('second')
+    expect(second).toBeInstanceOf(Error)
+    expect(hub.snapshot().busy).toBe(true)
+  })
+
+  it('reports the turn as no longer busy after it finishes', async () => {
+    const { backend, release } = fakeBackend({ blocking: true })
+    const hub = createSessionHub({ backend })
+    if (hub instanceof Error) throw hub
+    await hub.submit('hello')
+    release()
+    await wait(10)
+    expect(hub.snapshot().busy).toBe(false)
+  })
+
+  it('surfaces a failed turn as an event instead of throwing', async () => {
+    const { backend } = fakeBackend({
+      overrides: {
+        async prompt() {
+          return new Error('model access is disabled')
+        },
+      },
+    })
+    const hub = createSessionHub({ backend })
+    if (hub instanceof Error) throw hub
+    const events: HubEvent[] = []
+    hub.subscribe({ onEvent: (event) => events.push(event) })
+    await hub.submit('hello')
+    await wait(10)
+    expect(events.at(-1)).toMatchObject({ type: 'prompt.failed', reason: 'model access is disabled' })
+  })
+
+  it('cancels only while a turn is running', async () => {
+    const { backend, calls } = fakeBackend({ blocking: true })
+    const hub = createSessionHub({ backend })
+    if (hub instanceof Error) throw hub
+    expect(await hub.cancel()).toBeUndefined()
+    await hub.submit('hello')
+    expect(await hub.cancel()).toBeUndefined()
+    expect(calls.cancels).toBe(1)
+  })
+
+  it('closes once and refuses new work afterwards', async () => {
+    const { backend, calls } = fakeBackend()
+    const hub = createSessionHub({ backend })
+    if (hub instanceof Error) throw hub
+    await hub.close()
+    await hub.close()
+    expect(calls.closes).toBe(1)
+    expect(await hub.submit('hello')).toBeInstanceOf(Error)
+    expect(await hub.cancel()).toBeInstanceOf(Error)
+  })
+
+  it('rejects empty prompt text, negative cursors and a bad buffer size', async () => {
+    const { backend } = fakeBackend()
+    const hub = createSessionHub({ backend })
+    if (hub instanceof Error) throw hub
+    expect(await hub.submit('   ')).toBeInstanceOf(Error)
+    expect(hub.subscribe({ cursor: -1, onEvent: () => {} })).toBeInstanceOf(Error)
+    expect(hub.subscribe({ cursor: 99, onEvent: () => {} })).toBeInstanceOf(Error)
+    expect(createSessionHub({ backend, bufferLimit: 0 })).toBeInstanceOf(Error)
+    expect(createSessionHub({ backend, launchTimeoutMs: 0 })).toBeInstanceOf(Error)
+  })
+
+  it('drops a subscriber that throws without stopping the turn', async () => {
+    const { backend } = fakeBackend()
+    const hub = createSessionHub({ backend })
+    if (hub instanceof Error) throw hub
+    hub.subscribe({
+      onEvent: () => {
+        throw new Error('client went away')
+      },
+    })
+    const healthy: HubEvent[] = []
+    hub.subscribe({ onEvent: (event) => healthy.push(event) })
+    await hub.submit('hello')
+    await wait(10)
+    expect(healthy.map((event) => event.type)).toEqual([
+      'session.started',
+      'prompt.started',
+      'prompt.chunk',
+      'prompt.finished',
+    ])
+    expect(hub.snapshot().subscribers).toBe(1)
+  })
+
+  it('appends a durable log and restores sequence and session after restart', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-hub-log-'))
+    const logFile = path.join(dir, 'events.jsonl')
+    try {
+      const first = createSessionHub({ backend: fakeBackend().backend, logFile })
+      if (first instanceof Error) throw first
+      await first.submit('hello')
+      await wait(10)
+      expect(first.snapshot()).toMatchObject({ seq: 4, durable: true, sessionId: 'session-1' })
+      const lines = fs.readFileSync(logFile, 'utf8').trim().split('\n')
+      expect(lines).toHaveLength(4)
+      expect(JSON.parse(lines[3]!)).toMatchObject({ seq: 4, type: 'prompt.finished' })
+      await first.close()
+
+      // A second hub on the same log continues the sequence and keeps the session.
+      const second = createSessionHub({ backend: fakeBackend().backend, logFile })
+      if (second instanceof Error) throw second
+      expect(second.snapshot()).toMatchObject({ seq: 4, sessionId: 'session-1', model: null, durable: true })
+      const replayed: HubEvent[] = []
+      const subscription = second.subscribe({ cursor: 0, onEvent: (event) => replayed.push(event) })
+      if (subscription instanceof Error) throw subscription
+      expect(replayed.map((event) => event.seq)).toEqual([1, 2, 3, 4])
+      expect(subscription.clipped).toBe(false)
+      await second.close()
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('replays from the log when the cursor predates the buffer', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-hub-log-replay-'))
+    const logFile = path.join(dir, 'events.jsonl')
+    try {
+      const hub = createSessionHub({ backend: fakeBackend().backend, logFile, bufferLimit: 2 })
+      if (hub instanceof Error) throw hub
+      await hub.submit('hello')
+      await wait(10)
+      const seen: HubEvent[] = []
+      const subscription = hub.subscribe({ cursor: 0, onEvent: (event) => seen.push(event) })
+      if (subscription instanceof Error) throw subscription
+      expect(subscription.clipped).toBe(false)
+      expect(subscription.source).toBe('log')
+      expect(seen.map((event) => event.seq)).toEqual([1, 2, 3, 4])
+      await hub.close()
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('tolerates a corrupt log line instead of failing the replay', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-hub-log-corrupt-'))
+    const logFile = path.join(dir, 'events.jsonl')
+    try {
+      fs.writeFileSync(logFile, `${JSON.stringify({ seq: 1, type: 'prompt.started', characters: 5 })}\n{not json}\n`)
+      const hub = createSessionHub({ backend: fakeBackend().backend, logFile })
+      if (hub instanceof Error) throw hub
+      expect(hub.snapshot().seq).toBe(1)
+      const seen: HubEvent[] = []
+      hub.subscribe({ cursor: 0, onEvent: (event) => seen.push(event) })
+      expect(seen.map((event) => event.seq)).toEqual([1])
+      await hub.close()
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('refuses a second hub while the lease is held, then allows it after release', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-hub-lease-'))
+    const logFile = path.join(dir, 'events.jsonl')
+    try {
+      const first = createSessionHub({ backend: fakeBackend().backend, logFile })
+      if (first instanceof Error) throw first
+      const blocked = createSessionHub({ backend: fakeBackend().backend, logFile })
+      expect(blocked).toBeInstanceOf(Error)
+      await first.close()
+      const allowed = createSessionHub({ backend: fakeBackend().backend, logFile })
+      expect(allowed).not.toBeInstanceOf(Error)
+      if (allowed instanceof Error) throw allowed
+      await allowed.close()
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('refuses a lease whose pid is alive, even when that pid is not a hub', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-hub-pidreuse-'))
+    const logFile = path.join(dir, 'events.jsonl')
+    const leaseFile = `${logFile}.lock`
+    try {
+      // A reused pid looks exactly like a live holder: the safe answer is refuse,
+      // never steal a lease from a process that is currently running.
+      fs.writeFileSync(leaseFile, JSON.stringify({ pid: process.pid, startedAt: '2020-01-01T00:00:00.000Z' }))
+      const hub = createSessionHub({ backend: fakeBackend().backend, logFile })
+      expect(hub).toBeInstanceOf(Error)
+      expect((hub as Error).message).toMatch(/lease/i)
+      // The holder's lease file is left untouched.
+      expect(JSON.parse(fs.readFileSync(leaseFile, 'utf8'))).toMatchObject({ pid: process.pid })
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('takes over a lease left behind by a dead process', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-hub-stale-'))
+    const logFile = path.join(dir, 'events.jsonl')
+    const leaseFile = `${logFile}.lock`
+    try {
+      fs.writeFileSync(leaseFile, JSON.stringify({ pid: 999_999, startedAt: '2020-01-01T00:00:00.000Z' }))
+      const hub = createSessionHub({ backend: fakeBackend().backend, logFile })
+      expect(hub).not.toBeInstanceOf(Error)
+      if (hub instanceof Error) throw hub
+      expect(JSON.parse(fs.readFileSync(leaseFile, 'utf8'))).toMatchObject({ pid: process.pid })
+      await hub.close()
+      expect(fs.existsSync(leaseFile)).toBe(false)
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('lists attached clients with their acknowledged position', async () => {
+    const { backend } = fakeBackend()
+    const hub = createSessionHub({ backend })
+    if (hub instanceof Error) throw hub
+    const first = hub.subscribe({ clientId: 'cli', onEvent: () => {} })
+    const second = hub.subscribe({ clientId: 'discord', onEvent: () => {} })
+    if (first instanceof Error || second instanceof Error) throw new Error('subscribe failed')
+    expect(hub.snapshot().clients).toEqual([
+      { clientId: 'cli', acked: 0 },
+      { clientId: 'discord', acked: 0 },
+    ])
+    await hub.submit('hello')
+    await wait(10)
+    expect(hub.ack({ clientId: 'cli', seq: 4 })).toEqual({ acked: 4 })
+    expect(hub.snapshot().clients).toContainEqual({ clientId: 'cli', acked: 4 })
+    first.unsubscribe()
+    expect(hub.snapshot().clients.map((entry) => entry.clientId)).toEqual(['discord'])
+  })
+
+  it('keeps acknowledgements monotonic and refuses invalid ones', async () => {
+    const { backend } = fakeBackend()
+    const hub = createSessionHub({ backend })
+    if (hub instanceof Error) throw hub
+    const subscription = hub.subscribe({ clientId: 'cli', onEvent: () => {} })
+    if (subscription instanceof Error) throw subscription
+    await hub.submit('hello')
+    await wait(10)
+    expect(hub.ack({ clientId: 'cli', seq: 3 })).toEqual({ acked: 3 })
+    // A stale ack from a reconnecting client must not move the position back.
+    expect(hub.ack({ clientId: 'cli', seq: 1 })).toEqual({ acked: 3 })
+    expect(hub.ack({ clientId: 'cli', seq: 4 })).toEqual({ acked: 4 })
+    expect(hub.ack({ clientId: 'cli', seq: 5 })).toBeInstanceOf(Error)
+    expect(hub.ack({ clientId: 'ghost', seq: 1 })).toBeInstanceOf(Error)
+    expect(hub.ack({ clientId: '', seq: 1 })).toBeInstanceOf(Error)
+    expect(hub.ack({ clientId: 'cli', seq: -1 })).toBeInstanceOf(Error)
+  })
+
+  it('admits a repeated request id once and refers to the existing receipt', async () => {
+    const { backend, calls } = fakeBackend()
+    const hub = createSessionHub({ backend })
+    if (hub instanceof Error) throw hub
+    const first = await hub.submit('hello', { requestId: 'req-1' })
+    const repeat = await hub.submit('hello', { requestId: 'req-1' })
+    expect(first).toMatchObject({ accepted: true, duplicate: false })
+    expect(repeat).toMatchObject({ accepted: true, duplicate: true })
+    expect(calls.prompts).toHaveLength(1)
+    await wait(10)
+    // One turn means one started frame, not two.
+    const started = hub.snapshot().seq
+    expect(started).toBeGreaterThan(0)
+    expect(await hub.submit('different text', { requestId: 'req-1' })).toBeInstanceOf(Error)
+  })
+
+  it('refuses a duplicate client identity while it is attached', async () => {
+    const { backend } = fakeBackend()
+    const hub = createSessionHub({ backend })
+    if (hub instanceof Error) throw hub
+    const first = hub.subscribe({ clientId: 'cli', onEvent: () => {} })
+    if (first instanceof Error) throw first
+    expect(hub.subscribe({ clientId: 'cli', onEvent: () => {} })).toBeInstanceOf(Error)
+    first.unsubscribe()
+    const again = hub.subscribe({ clientId: 'cli', onEvent: () => {} })
+    expect(again).not.toBeInstanceOf(Error)
+  })
+
+  it('remembers an acknowledgement across a restart when the stream is durable', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-hub-acks-'))
+    const logFile = path.join(dir, 'events.jsonl')
+    try {
+      const first = createSessionHub({ backend: fakeBackend().backend, logFile })
+      if (first instanceof Error) throw first
+      const subscription = first.subscribe({ clientId: 'cli', onEvent: () => {} })
+      if (subscription instanceof Error) throw subscription
+      await first.submit('hello')
+      await wait(10)
+      expect(first.ack({ clientId: 'cli', seq: 4 })).toEqual({ acked: 4 })
+      await first.close()
+
+      const second = createSessionHub({ backend: fakeBackend().backend, logFile })
+      if (second instanceof Error) throw second
+      const resumed = second.subscribe({ clientId: 'cli', onEvent: () => {} })
+      if (resumed instanceof Error) throw resumed
+      expect(second.snapshot().clients).toContainEqual({ clientId: 'cli', acked: 4 })
+      await second.close()
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('does not pretend to remember acks without a durable stream', async () => {
+    const hub = createSessionHub({ backend: fakeBackend().backend })
+    if (hub instanceof Error) throw hub
+    const subscription = hub.subscribe({ clientId: 'cli', onEvent: () => {} })
+    if (subscription instanceof Error) throw subscription
+    await hub.submit('hello')
+    await wait(10)
+    expect(hub.ack({ clientId: 'cli', seq: 4 })).toEqual({ acked: 4 })
+    expect(hub.snapshot().durable).toBe(false)
+    const other = createSessionHub({ backend: fakeBackend().backend })
+    if (other instanceof Error) throw other
+    const fresh = other.subscribe({ clientId: 'cli', onEvent: () => {} })
+    if (fresh instanceof Error) throw fresh
+    expect(other.snapshot().clients).toContainEqual({ clientId: 'cli', acked: 0 })
+  })
+
+  // AC13: A gap between what a client has seen and what the hub can still replay
+  // must be explicit. The hub may not claim clipped:false while silently dropping
+  // events, and every replay must still leave the client able to resume forward.
+  describe('AC13 stream gap and overflow', () => {
+    const turnSeqs = (events: HubEvent[]) => events.map((event) => event.seq)
+
+    const expectContiguousFrom = (events: HubEvent[], requestedCursor: number) => {
+      const seqs = turnSeqs(events)
+      expect(seqs.length).toBeGreaterThan(0)
+      // Nothing at or below the requested cursor is re-delivered.
+      expect(seqs[0]!).toBeGreaterThan(requestedCursor)
+      // No hole inside what was delivered: it is a tail, not a sample.
+      for (let index = 1; index < seqs.length; index += 1) {
+        expect(seqs[index]!).toBe(seqs[index - 1]! + 1)
+      }
+    }
+
+    it('reports clipped with no log, delivers only the buffered tail, and leaves a forward cursor', async () => {
+      const { backend } = fakeBackend()
+      const hub = createSessionHub({ backend, bufferLimit: 2 })
+      if (hub instanceof Error) throw hub
+      await hub.submit('hello')
+      await wait(10)
+      expect(hub.snapshot().durable).toBe(false)
+
+      const seen: HubEvent[] = []
+      const subscription = hub.subscribe({ cursor: 0, onEvent: (event) => seen.push(event) })
+      if (subscription instanceof Error) throw subscription
+
+      // The gap is announced rather than hidden.
+      expect(subscription.clipped).toBe(true)
+      // There is no disk to fall back on, so the only replayable source is the
+      // in-memory tail; `clipped` is what carries the honesty about the gap.
+      expect(subscription.source).toBe('buffer')
+      // Only the buffered tail survived; events 1 and 2 are honestly gone.
+      expect(turnSeqs(seen)).toEqual([3, 4])
+      // The returned cursor is the latest sequence, so a client resumes forward
+      // instead of replaying the same gap forever.
+      expect(subscription.cursor).toBe(4)
+      expect(subscription.cursor).toBe(hub.snapshot().seq)
+    })
+
+    it('reports not clipped with a log, replaying every event from disk in order', async () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-hub-ac13-log-'))
+      const logFile = path.join(dir, 'events.jsonl')
+      try {
+        const hub = createSessionHub({ backend: fakeBackend().backend, logFile, bufferLimit: 2 })
+        if (hub instanceof Error) throw hub
+        await hub.submit('hello')
+        await wait(10)
+
+        const seen: HubEvent[] = []
+        const subscription = hub.subscribe({ cursor: 0, onEvent: (event) => seen.push(event) })
+        if (subscription instanceof Error) throw subscription
+
+        // The same cursor that is clipped without a log is complete with one.
+        expect(subscription.clipped).toBe(false)
+        expect(subscription.source).toBe('log')
+        expect(turnSeqs(seen)).toEqual([1, 2, 3, 4])
+        expect(subscription.cursor).toBe(4)
+        await hub.close()
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true })
+      }
+    })
+
+    it('resumes from a cursor inside the buffer without re-delivering older events', async () => {
+      const { backend } = fakeBackend()
+      const hub = createSessionHub({ backend, bufferLimit: 2 })
+      if (hub instanceof Error) throw hub
+      await hub.submit('hello')
+      await wait(10)
+
+      const seen: HubEvent[] = []
+      const subscription = hub.subscribe({ cursor: 3, onEvent: (event) => seen.push(event) })
+      if (subscription instanceof Error) throw subscription
+
+      // The cursor sits at the oldest buffered sequence, so this is a normal
+      // in-buffer resume rather than a gap.
+      expect(turnSeqs(seen)).toEqual([4])
+      expect(subscription.clipped).toBe(false)
+      expect(subscription.source).toBe('buffer')
+      expect(subscription.cursor).toBe(4)
+    })
+
+    it('never claims not clipped while dropping events in the no-log case', async () => {
+      const { backend } = fakeBackend()
+      const hub = createSessionHub({ backend, bufferLimit: 2 })
+      if (hub instanceof Error) throw hub
+      await hub.submit('hello')
+      await wait(10)
+
+      for (const requestedCursor of [0, 1]) {
+        const seen: HubEvent[] = []
+        const subscription = hub.subscribe({ cursor: requestedCursor, onEvent: (event) => seen.push(event) })
+        if (subscription instanceof Error) throw subscription
+
+        if (subscription.clipped) {
+          // A reported gap means the hub may only show the surviving tail, and
+          // that tail must be contiguous and start strictly after the cursor.
+          expectContiguousFrom(seen, requestedCursor)
+          expect(turnSeqs(seen)).toEqual([3, 4])
+        } else {
+          // If the hub hides nothing, it must truly have every event past the cursor.
+          expect(turnSeqs(seen)).toEqual([1, 2, 3, 4].filter((seq) => seq > requestedCursor))
+        }
+      }
+
+      // Clipped is a property of the request, not a lie about the stream: once the
+      // cursor reaches the oldest buffered sequence the hub is honest again.
+      const covered: HubEvent[] = []
+      const coveredSubscription = hub.subscribe({ cursor: 2, onEvent: (event) => covered.push(event) })
+      if (coveredSubscription instanceof Error) throw coveredSubscription
+      expect(coveredSubscription.clipped).toBe(false)
+      expect(turnSeqs(covered)).toEqual([3, 4])
+    })
+
+    it('delivers every live event to an attached subscriber even when the buffer overflows', async () => {
+      const { backend } = fakeBackend()
+      const hub = createSessionHub({ backend, bufferLimit: 1 })
+      if (hub instanceof Error) throw hub
+      const live: HubEvent[] = []
+      // Attach before the turn so these are live deliveries, not a replay.
+      const subscription = hub.subscribe({ onEvent: (event) => live.push(event) })
+      if (subscription instanceof Error) throw subscription
+      await hub.submit('hello')
+      await wait(10)
+      // The buffer holds one event, but a live subscriber saw the whole turn:
+      // overflow costs replay history, never live delivery.
+      expect(turnSeqs(live)).toEqual([1, 2, 3, 4])
+      expect(hub.snapshot().seq).toBe(4)
+    })
+
+    it('serves a clipped and a live subscriber at the same time without cross-talk', async () => {
+      const { backend } = fakeBackend()
+      const hub = createSessionHub({ backend, bufferLimit: 2 })
+      if (hub instanceof Error) throw hub
+      await hub.submit('first')
+      await wait(10)
+
+      const clipped: HubEvent[] = []
+      const live: HubEvent[] = []
+      const a = hub.subscribe({ cursor: 0, onEvent: (event) => clipped.push(event) })
+      const b = hub.subscribe({ cursor: 4, onEvent: (event) => live.push(event) })
+      if (a instanceof Error) throw a
+      if (b instanceof Error) throw b
+      expect(a.clipped).toBe(true)
+      expect(b.clipped).toBe(false)
+      expect(a.source).toBe('buffer')
+      expect(b.source).toBe('none')
+      expect(clipped.map((event) => event.seq)).toEqual([3, 4])
+      expect(live).toEqual([])
+
+      const second = await hub.submit('second')
+      expect(second).not.toBeInstanceOf(Error)
+      await wait(80)
+      // The first turn was session.started plus three turn events; this turn is
+      // prompt.started, one chunk and prompt.finished, so it ends at 7.
+      expect(hub.snapshot().seq).toBe(7)
+      // Both receive the whole second turn live; they differ only in replay history.
+      expect(clipped.map((event) => event.seq)).toEqual([3, 4, 5, 6, 7])
+      expect(live.map((event) => event.seq)).toEqual([5, 6, 7])
+      expect(hub.snapshot().subscribers).toBe(2)
+    })
+
+    it('replays the whole history from the log when the buffer is smaller than it', async () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-hub-ac13-tiny-'))
+      const logFile = path.join(dir, 'events.jsonl')
+      try {
+        const hub = createSessionHub({ backend: fakeBackend().backend, logFile, bufferLimit: 1 })
+        if (hub instanceof Error) throw hub
+        await hub.submit('hello')
+        await wait(10)
+        const seen: HubEvent[] = []
+        const subscription = hub.subscribe({ cursor: 0, onEvent: (event) => seen.push(event) })
+        if (subscription instanceof Error) throw subscription
+        // A one-event buffer is not a gap when the log covers the history.
+        expect(subscription.clipped).toBe(false)
+        expect(subscription.source).toBe('log')
+        expect(turnSeqs(seen)).toEqual([1, 2, 3, 4])
+        await hub.close()
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true })
+      }
+    })
+  })
+
+  it('restores a log that ends mid-turn and accepts a new turn afterwards', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-hub-midturn-'))
+    const logFile = path.join(dir, 'events.jsonl')
+    try {
+      // A crash during a turn leaves started and chunks but no finished event.
+      const partial = [
+        { seq: 1, type: 'prompt.started', characters: 5 },
+        { seq: 2, type: 'prompt.chunk', text: 'hal' },
+      ]
+      fs.writeFileSync(logFile, `${partial.map((event) => JSON.stringify(event)).join('\n')}\n`)
+      const hub = createSessionHub({ backend: fakeBackend().backend, logFile })
+      if (hub instanceof Error) throw hub
+      // The restored hub is not busy: nothing is in flight after a crash.
+      expect(hub.snapshot()).toMatchObject({ seq: 2, busy: false })
+      const replayed: HubEvent[] = []
+      const subscription = hub.subscribe({ cursor: 0, onEvent: (event) => replayed.push(event) })
+      if (subscription instanceof Error) throw subscription
+      expect(subscription.clipped).toBe(false)
+      expect(replayed.map((event) => event.seq)).toEqual([1, 2])
+      // A new turn continues the sequence instead of reusing the orphaned numbers.
+      const next = await hub.submit('hello')
+      expect(next).not.toBeInstanceOf(Error)
+      await wait(20)
+      expect(hub.snapshot().busy).toBe(false)
+      // The restored hub has no live backend session yet, so the next submit also
+      // publishes session.started: 3, then started, chunk and finished brings it to 6.
+      expect(hub.snapshot().seq).toBe(6)
+      await hub.close()
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('restores the valid prefix of a log whose last line was torn by a crash', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-hub-torn-'))
+    const logFile = path.join(dir, 'events.jsonl')
+    try {
+      const valid = [
+        { seq: 1, type: 'prompt.started', characters: 5 },
+        { seq: 2, type: 'prompt.chunk', text: 'hel' },
+        { seq: 3, type: 'prompt.finished', stopReason: 'end_turn', characters: 5 },
+      ]
+      // The trailing fragment is what a crash mid-write leaves behind.
+      fs.writeFileSync(logFile, `${valid.map((event) => JSON.stringify(event)).join('\n')}\n{"seq":4,"type":"prompt.`)
+      const hub = createSessionHub({ backend: fakeBackend().backend, logFile })
+      if (hub instanceof Error) throw hub
+      // The torn line is skipped, so the restored stream ends at the last whole event.
+      expect(hub.snapshot().seq).toBe(3)
+      const replayed: HubEvent[] = []
+      const subscription = hub.subscribe({ cursor: 0, onEvent: (event) => replayed.push(event) })
+      if (subscription instanceof Error) throw subscription
+      expect(subscription.clipped).toBe(false)
+      expect(replayed.map((event) => event.seq)).toEqual([1, 2, 3])
+      // A new turn continues after the recovered prefix rather than reusing its numbers.
+      await hub.submit('hello')
+      await wait(10)
+      expect(hub.snapshot().seq).toBe(7)
+      await hub.close()
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('clamps a stale ack file entry to the restored sequence', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-hub-acks-clamp-'))
+    const logFile = path.join(dir, 'events.jsonl')
+    const acksFile = `${logFile}.acks.json`
+    try {
+      fs.writeFileSync(logFile, `${JSON.stringify({ seq: 1, type: 'prompt.started', characters: 5 })}\n`)
+      fs.writeFileSync(acksFile, JSON.stringify({ cli: 99 }))
+      const hub = createSessionHub({ backend: fakeBackend().backend, logFile })
+      if (hub instanceof Error) throw hub
+      const subscription = hub.subscribe({ clientId: 'cli', onEvent: () => {} })
+      if (subscription instanceof Error) throw subscription
+      expect(hub.snapshot().clients).toContainEqual({ clientId: 'cli', acked: 1 })
+      await hub.close()
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  // AC15: a managed launch can die after the process is spawned but before the
+  // session is acknowledged. That must surface as a failed start, not as a live
+  // session, and it must never be turned into a turn or a sequence advance.
+  describe('AC15 crash after launch before ACK', () => {
+    const crash = () => new Error('managed launch exited before session/new acknowledged')
+    const kinds = (events: HubEvent[]) => events.map((event) => event.type)
+
+    it('surfaces a throwing launch, stays inert, then starts cleanly on retry', async () => {
+      let attempts = 0
+      const { backend, calls } = fakeBackend({
+        overrides: {
+          async start(input) {
+            attempts += 1
+            // The first two managed launches die before the ACK; the retry after
+            // the operator intervenes acknowledges properly.
+            if (attempts <= 2) throw crash()
+            return { sessionId: 'session-1', model: input?.model ?? null }
+          },
+        },
+      })
+      const hub = createSessionHub({ backend, model: 'beam-free' })
+      if (hub instanceof Error) throw hub
+      const events: HubEvent[] = []
+      hub.subscribe({ onEvent: (event) => events.push(event) })
+
+      const started = await hub.start()
+      expect(started).toBeInstanceOf(Error)
+      expect(started instanceof Error ? started.message : '').toBe('managed launch exited before session/new acknowledged')
+      // The crash is reported and no session is invented from it.
+      expect(hub.snapshot()).toMatchObject({ sessionId: null, model: null, busy: false, seq: 0 })
+      expect(kinds(events)).not.toContain('session.started')
+
+      // A submit during the crash fails closed: same error, no turn, no advance.
+      const submitted = await hub.submit('hello')
+      expect(submitted).toBeInstanceOf(Error)
+      expect(submitted instanceof Error ? submitted.message : '').toBe(
+        'managed launch exited before session/new acknowledged',
+      )
+      expect(calls.prompts).toEqual([])
+      expect(kinds(events)).not.toContain('prompt.started')
+      expect(hub.snapshot()).toMatchObject({ sessionId: null, busy: false, seq: 0 })
+
+      // The retry is a fresh launch, not a replay of the failed one.
+      const retried = await hub.start()
+      expect(retried).toMatchObject({ sessionId: 'session-1', model: 'beam-free' })
+      expect(attempts).toBe(3)
+      expect(kinds(events)).toEqual(['session.started'])
+      expect(hub.snapshot()).toMatchObject({ sessionId: 'session-1', model: 'beam-free', seq: 1 })
+
+      // A turn after recovery is a real turn continuing from the recovered head.
+      expect(await hub.submit('hello')).toMatchObject({ accepted: true, characters: 5 })
+      await wait(10)
+      expect(hub.snapshot().seq).toBe(4)
+      expect(kinds(events)).toEqual(['session.started', 'prompt.started', 'prompt.chunk', 'prompt.finished'])
+    })
+
+    it('stays inert when every launch reports the crash as an error result', async () => {
+      const { backend, calls } = fakeBackend({
+        overrides: {
+          async start() {
+            return crash()
+          },
+        },
+      })
+      const hub = createSessionHub({ backend })
+      if (hub instanceof Error) throw hub
+      const events: HubEvent[] = []
+      hub.subscribe({ onEvent: (event) => events.push(event) })
+
+      expect(await hub.start()).toBeInstanceOf(Error)
+      expect(await hub.start()).toBeInstanceOf(Error)
+      expect(await hub.submit('hello')).toBeInstanceOf(Error)
+      // Repeated failures still leave no session, no turn and no events.
+      expect(hub.snapshot()).toMatchObject({ sessionId: null, model: null, busy: false, seq: 0 })
+      expect(events).toEqual([])
+      expect(calls.prompts).toEqual([])
+    })
+
+    // The production surface: a real node process is the managed child, spoken to
+    // through the real ACP transport. It dies non-zero before it can answer
+    // session/new, so the ACK never arrives. Nothing here is a mock.
+    it('fails closed when a real managed child dies before the ACK over ACP', async () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-hub-real-crash-'))
+      const logFile = path.join(dir, 'events.jsonl')
+      const leaseFile = `${logFile}.lock`
+      const script = path.join(dir, 'crash.cjs')
+      const pidFile = path.join(dir, 'crash.pid')
+      fs.writeFileSync(script, CRASH_SOURCE)
+      let acp: ReturnType<typeof createAcpClient> | null = null
+      const backend: HubBackend = {
+        async start() {
+          acp ??= createAcpClient({ command: process.execPath, args: [script, pidFile], cwd: dir })
+          const initialized = await acp.initialize()
+          if (initialized instanceof Error) return initialized
+          const session = await acp.newSession({ cwd: dir })
+          if (session instanceof Error) return session
+          return { sessionId: session.sessionId, model: null }
+        },
+        async prompt() {
+          return new Error('a crashed launch must never reach a prompt')
+        },
+        async cancel() {
+          return undefined
+        },
+        async close() {
+          await acp?.close()
+        },
+      }
+      try {
+        const hub = createSessionHub({ backend, logFile })
+        if (hub instanceof Error) throw hub
+        const events: HubEvent[] = []
+        hub.subscribe({ onEvent: (event) => events.push(event) })
+
+        const started = await hub.start()
+        expect(started).toBeInstanceOf(Error)
+        // The crash is reported as the launch failure itself, naming the death.
+        expect((started as Error).message).toMatch(/exited before responding/i)
+        // No session is invented from a process that never acknowledged one.
+        expect(hub.snapshot()).toMatchObject({ sessionId: null, model: null, busy: false, seq: 0 })
+        expect(events.map((event) => event.type)).not.toContain('session.started')
+
+        // The real child is gone, not left running behind the hub.
+        const firstPid = Number(fs.readFileSync(pidFile, 'utf8'))
+        expect(Number.isInteger(firstPid) && firstPid > 0).toBe(true)
+        expect(await waitForDead(firstPid)).toBe(true)
+
+        // A later submit fails closed: same dead launch, no turn, no advance.
+        const submitted = await hub.submit('hello')
+        expect(submitted).toBeInstanceOf(Error)
+        expect(hub.snapshot()).toMatchObject({ sessionId: null, busy: false, seq: 0 })
+        expect(events.map((event) => event.type)).not.toContain('prompt.started')
+        const secondPid = Number(fs.readFileSync(pidFile, 'utf8'))
+        expect(await waitForDead(secondPid)).toBe(true)
+
+        // The lease still names the live hub, so no other hub can steal it.
+        expect(JSON.parse(fs.readFileSync(leaseFile, 'utf8'))).toMatchObject({ pid: process.pid })
+        expect(createSessionHub({ backend: fakeBackend().backend, logFile })).toBeInstanceOf(Error)
+
+        // Releasing the crashed hub frees the lease. A replacement takes the same
+        // log, starts at seq 0 and finds no session the crash never wrote.
+        await hub.close()
+        const replacement = createSessionHub({ backend: fakeBackend().backend, logFile })
+        expect(replacement).not.toBeInstanceOf(Error)
+        if (replacement instanceof Error) throw replacement
+        expect(replacement.snapshot()).toMatchObject({ seq: 0, sessionId: null })
+        const log = fs.existsSync(logFile) ? fs.readFileSync(logFile, 'utf8') : ''
+        expect(log).not.toContain('session.started')
+        await replacement.close()
+
+        // A holder file left by the dead managed pid is recoverable because that
+        // pid is dead: the next hub takes it over and rewrites it to itself.
+        fs.writeFileSync(leaseFile, JSON.stringify({ pid: firstPid, startedAt: new Date().toISOString() }))
+        const recovered = createSessionHub({ backend: fakeBackend().backend, logFile })
+        expect(recovered).not.toBeInstanceOf(Error)
+        if (recovered instanceof Error) throw recovered
+        expect(JSON.parse(fs.readFileSync(leaseFile, 'utf8'))).toMatchObject({ pid: process.pid })
+        await recovered.close()
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true })
+      }
+    })
+
+    // A managed child can die without its transport ever observing the exit (a
+    // trust-the-ACK read, or a descendant still holding the pipe). The hub must
+    // bound that wait instead of hanging the whole supervisor forever.
+    it('bounds a launch whose real child died without the exit being observed', async () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kimaki-hub-deaf-launch-'))
+      const script = path.join(dir, 'crash.cjs')
+      const pidFile = path.join(dir, 'crash.pid')
+      fs.writeFileSync(script, CRASH_SOURCE)
+      const backend: HubBackend = {
+        async start() {
+          const child = childProcess.spawn(process.execPath, [script, pidFile], {
+            cwd: dir,
+            stdio: ['ignore', 'pipe', 'ignore'],
+          })
+          // Wait only for an ACK line. The child exits, but this transport keeps
+          // waiting: that is the pre-ACK death the hub has to bound.
+          return await new Promise((resolve) => {
+            let seen = ''
+            child.stdout?.on('data', (chunk) => {
+              seen += String(chunk)
+              if (seen.includes('\n')) resolve({ sessionId: 'never-acked', model: null })
+            })
+          })
+        },
+        async prompt() {
+          return new Error('a crashed launch must never reach a prompt')
+        },
+        async cancel() {
+          return undefined
+        },
+        async close() {
+          // The child is already gone; nothing to stop.
+        },
+      }
+      try {
+        const hub = createSessionHub({ backend, launchTimeoutMs: 250 })
+        if (hub instanceof Error) throw hub
+        const events: HubEvent[] = []
+        hub.subscribe({ onEvent: (event) => events.push(event) })
+
+        const began = Date.now()
+        const started = await hub.start()
+        expect(Date.now() - began).toBeLessThan(5_000)
+        expect(started).toBeInstanceOf(Error)
+        expect((started as Error).message).toMatch(/did not acknowledge the session within 250ms/i)
+        expect(hub.snapshot()).toMatchObject({ sessionId: null, busy: false, seq: 0 })
+        expect(events.map((event) => event.type)).not.toContain('session.started')
+
+        const pid = Number(fs.readFileSync(pidFile, 'utf8'))
+        expect(await waitForDead(pid)).toBe(true)
+
+        expect(await hub.submit('hello')).toBeInstanceOf(Error)
+        expect(hub.snapshot()).toMatchObject({ sessionId: null, busy: false, seq: 0 })
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true })
+      }
+    })
+  })
+})

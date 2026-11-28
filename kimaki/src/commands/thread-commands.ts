@@ -29,6 +29,7 @@ import {
   type SessionTarget,
 } from '../interaction-context.ts'
 import { shellQuote } from '../lock-server.ts'
+import { jcodeSurfaceRefusal } from '../jcode-surfaces.ts'
 import { abort, clearQueue, dispatch, redo, undo } from '../prompt.ts'
 import type { Route } from '../routes.ts'
 import { formatDuration, type Message } from '../session-events.ts'
@@ -97,7 +98,9 @@ async function abortCommand(bot: Bot, interaction: ChatInputCommandInteraction, 
   const result = await abort(bot, { threadId: conversation.id })
   if (result instanceof Error) return replyError(interaction, result)
   const note = result.cleared > 0 ? `, cleared ${result.cleared} queued message${result.cleared > 1 ? 's' : ''}` : ''
-  await interaction.editReply({ content: `Request **aborted**${note}` })
+  // A routed surface says what it could not do instead of implying it did everything.
+  const skipped = 'note' in result && result.note ? ` - ${result.note}` : ''
+  await interaction.editReply({ content: `Request **aborted**${note}${skipped}` })
 }
 
 // Also with coordinator mode off: the channel keeps its binding until a reset.
@@ -188,7 +191,9 @@ async function btwAgentChoices(bot: Bot, interaction: AutocompleteInteraction) {
 
 // --- History
 
-async function compactCommand(bot: Bot, interaction: ChatInputCommandInteraction, { sessionId }: SessionTarget) {
+async function compactCommand(bot: Bot, interaction: ChatInputCommandInteraction, { conversation, sessionId }: SessionTarget) {
+  const refused = jcodeSurfaceRefusal(bot, conversation.id, 'compact')
+  if (refused) return replyError(interaction, refused)
   await interaction.deferReply()
   const result = await oc(bot, 'session.compact', (client) => client.session.compact({ sessionID: sessionId }))
   if (result instanceof Error) return replyError(interaction, result)
@@ -373,7 +378,7 @@ export const threadRoutes: InteractionRoutes = {
     'queue-command': {
       definition: new SlashCommandBuilder()
         .setName('queue-command')
-        .setDescription('Queue an OpenCode command to run after the current run finishes')
+        .setDescription('Queue an agent command to run after the current run finishes')
         .addStringOption((option) =>
           option.setName('command').setDescription('The command to run').setRequired(true).setAutocomplete(true),
         )

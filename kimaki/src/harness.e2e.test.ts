@@ -6,11 +6,13 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
 import { createRequire } from 'node:module'
+import { pathToFileURL } from 'node:url'
 import dedent from 'string-dedent'
 import { afterAll, beforeAll, expect, onTestFinished, test } from 'vitest'
 
 import { startLockServer } from './lock-server.ts'
 import type { BotHandle } from './main.ts'
+import { removeTempDir } from './test/cleanup.ts'
 import {
   startOpencodeTestServer,
   freePort,
@@ -40,7 +42,7 @@ afterAll(async () => {
   await bot?.stop()
   await twin?.stop()
   await server?.stop()
-  fs.rmSync(dataDir, { recursive: true, force: true })
+  await removeTempDir(dataDir)
 })
 
 test('bot answers /health and reaches the OpenCode service', async () => {
@@ -72,11 +74,15 @@ test('bot reconnects after the OpenCode service restarts with a new port', async
 
 test('the lock server creates a missing data dir (fresh install)', async () => {
   const root = tempDataDir()
-  onTestFinished(() => fs.rmSync(root, { recursive: true, force: true }))
+  onTestFinished(() => removeTempDir(root))
   const missing = path.join(root, 'not', 'created')
   const lock = await startLockServer({ port: await freePort(), dataDir: missing })
   if (lock instanceof Error) throw lock
-  expect(fs.statSync(path.join(missing, 'lock-token')).mode & 0o777).toBe(0o600)
+  const tokenFile = path.join(missing, 'lock-token')
+  // Windows has no POSIX mode bits: writeFile's mode and chmod are no-ops there,
+  // so 0600 is only observable where the mode exists.
+  if (process.platform === 'win32') expect(fs.statSync(tokenFile).isFile()).toBe(true)
+  else expect(fs.statSync(tokenFile).mode & 0o777).toBe(0o600)
   await lock.close()
 })
 
@@ -85,9 +91,9 @@ test('a second bot on the same lock port stops the running one and takes over', 
   const port = await freePort()
   await seedProjectChannel({ dataDir: otherData, channelId: twin.quietChannelId, guildId: twin.discord.guildId, directory: server.projectDirectory })
   const code = dedent`
-    import { startBot } from ${JSON.stringify(path.resolve('src/main.ts'))}
-    import { startLockServer } from ${JSON.stringify(path.resolve('src/lock-server.ts'))}
-    import { disabledAnalytics } from ${JSON.stringify(path.resolve('src/analytics.ts'))}
+    import { startBot } from ${JSON.stringify(pathToFileURL(path.resolve('src/main.ts')).href)}
+    import { startLockServer } from ${JSON.stringify(pathToFileURL(path.resolve('src/lock-server.ts')).href)}
+    import { disabledAnalytics } from ${JSON.stringify(pathToFileURL(path.resolve('src/analytics.ts')).href)}
     const lock = await startLockServer({ port: ${port}, dataDir: ${JSON.stringify(otherData)} })
     if (lock instanceof Error) throw lock
     const result = await startBot({ analytics: disabledAnalytics, lock, ...${JSON.stringify({ dataDir: otherData, token: twin.discord.botToken, appId: twin.discord.botUserId, discordRestUrl: twin.discord.restUrl, opencodeServiceFile: server.serviceFile, opencodeConfigDir: server.configDir, opencodeDbFile: server.dbFile, ensureOpencode: false, kimakiArgv: ['kimaki'] })} })
@@ -95,20 +101,28 @@ test('a second bot on the same lock port stops the running one and takes over', 
     process.send({ ready: true })
     process.once('SIGTERM', async () => { await result.stop(); process.exit(0) })
   `
-  const child = spawn(process.execPath, ['--import', createRequire(import.meta.url).resolve('tsx'), '--input-type=module', '--eval', code], { stdio: ['ignore', 'ignore', 'pipe', 'ipc'] })
+  const child = spawn(process.execPath, ['--import', pathToFileURL(createRequire(import.meta.url).resolve('tsx')).href, '--input-type=module', '--eval', code], { stdio: ['ignore', 'ignore', 'pipe', 'ipc'] })
+  // A child that exits before `ready` fails the test: its stderr says why.
+  let childStderr = ''
+  child.stderr?.on('data', (chunk: Buffer) => { childStderr += chunk.toString() })
   const exited = new Promise<void>((resolve) => child.once('exit', () => resolve()))
+  let replacement: BotHandle | undefined
+  // One teardown for both bots, in one order: the replacement must be stopped
+  // before its data dir is removed, or Windows keeps its sqlite file open.
   onTestFinished(async () => {
     if (child.exitCode === null && child.signalCode === null) { child.kill('SIGTERM'); await exited }
-    fs.rmSync(otherData, { recursive: true, force: true })
+    await replacement?.stop()
+    await removeTempDir(otherData)
   })
-  const ready = new Promise<void>((resolve, reject) => { child.once('message', () => resolve()); child.once('error', reject); child.once('exit', () => reject(new Error('Old bot exited before ready'))) })
+  const ready = new Promise<void>((resolve, reject) => { child.once('message', () => resolve()); child.once('error', reject); child.once('exit', () => reject(new Error(`Old bot exited before ready: ${childStderr.trim()}`))) })
   await ready
   expect(await fetch(`http://127.0.0.1:${port}/health`).then((response) => response.json())).toEqual({ status: 'ok', pid: child.pid, wrapperPid: null })
-  // The old bot gets SIGTERM, shuts down cleanly, then the new one binds the port.
-  const replacement = await startTestBot({ dataDir: otherData, twin, server, lockPort: port })
-  onTestFinished(() => replacement.stop())
+  // The replacement stops the old bot (SIGTERM) before it binds the port.
+  replacement = await startTestBot({ dataDir: otherData, twin, server, lockPort: port })
   await exited
-  expect(child.exitCode).toBe(0)
+  // Windows has no graceful SIGTERM: process.kill terminates the child, so the
+  // POSIX handler (result.stop()) never runs and the exit code is 1 there.
+  expect(child.exitCode).toBe(process.platform === 'win32' ? 1 : 0)
   expect(await fetch(`http://127.0.0.1:${port}/health`).then((response) => response.json())).toEqual({ status: 'ok', pid: process.pid, wrapperPid: null })
   await twin.discord.channel(twin.quietChannelId).user(TEST_USER_ID).sendMessage({ content: 'Lock takeover prompt' })
   const thread = await twin.discord.channel(twin.quietChannelId).waitForThread({ timeout: 8000 })
@@ -121,4 +135,10 @@ test('a second bot on the same lock port stops the running one and takes over', 
     ok
     -# *main ⋅ Ns ⋅ deterministic-v2*"
   `)
-})
+  // Real work, and its duration scales with machine load: a `node --import tsx`
+  // child compiles src/main.ts and its whole graph, then two bots, the twin and
+  // the takeover run. Measured on this host: 12.4s and 15.5s alone, 17.4s in a
+  // full suite run, and >30s (the suite default) when the other forks were
+  // slower still. 120s is ~7x the under-load figure, and a genuine hang still
+  // fires: every inner wait is bounded (waitFor 8-10s, lock eviction 25s).
+}, 120_000)

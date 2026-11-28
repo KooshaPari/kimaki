@@ -8,6 +8,10 @@ import { createRequire } from 'node:module'
 import { goke } from 'goke'
 
 import { registerBotCommands, registerLoginCommands, registerStartCommand, registerToolCommands } from './cli/bot.ts'
+import { registerOpsCommands } from './cli/ops.ts'
+import { registerExportCommands } from './cli/export.ts'
+import { registerAuthCommands } from './cli/auth.ts'
+import { registerAnalyticsCommands } from './cli/analytics.ts'
 import { registerAgentUiCommands, registerDiscordCommands } from './cli/discord.ts'
 import { registerChannelPreferenceCommands, registerChannelWorktreeCommand, registerProjectCommands, registerWorktreeCommands } from './cli/project.ts'
 import { registerScheduleCommands, registerSendCommand } from './cli/schedule.ts'
@@ -29,6 +33,12 @@ registerAgentUiCommands(cli)
 registerLoginCommands(cli)
 registerSendCommand(cli)
 registerSessionHistoryCommands(cli)
+
+cli.section('Agent operations')
+registerOpsCommands(cli)
+registerAnalyticsCommands(cli)
+registerExportCommands(cli)
+registerAuthCommands(cli)
 
 cli.section('Channel')
 registerChannelWorktreeCommand(cli)

@@ -1,7 +1,7 @@
 {
   "name": "kimaki",
   "version": "1.7.1",
-  "description": "A collaborative agent orchestrator for OpenCode, inside Discord",
+  "description": "A collaborative agent orchestrator, inside Discord",
   "repository": "https://github.com/remorses/kimaki",
   "type": "module",
   "bin": {
@@ -17,7 +17,8 @@
   "scripts": {
     "build": "tsc",
     "test": "vitest",
-    "generate": "tsx scripts/generate-schema-sql.ts"
+    "generate": "tsx scripts/generate-schema-sql.ts",
+    "acceptance:codex": "bun scripts/acceptance/codex-approvals.ts && bun scripts/acceptance/codex-parallel-approvals.ts"
   },
   "dependencies": {
     "@clack/prompts": "^1.7.0",

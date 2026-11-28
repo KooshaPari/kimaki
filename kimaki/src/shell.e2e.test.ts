@@ -3,10 +3,12 @@
 // run, their output shows in the thread and reaches the model context.
 
 import fs from 'node:fs'
+import path from 'node:path'
 import type { DeterministicMatcher } from 'opencode-deterministic-provider'
 import { afterAll, beforeAll, expect, test } from 'vitest'
 
 import type { BotHandle } from './main.ts'
+import { removeTempDir } from './test/cleanup.ts'
 import {
   TEST_USER_ID,
   seedProjectChannel,
@@ -41,12 +43,31 @@ let twin: TestTwin
 let bot: BotHandle
 let dataDir: string
 
+// `!cmd` runs through the same shell as the agent tool, which is PowerShell on
+// Windows: `exit 3` cannot sit inside an `&&` chain there and `;` is not a cmd
+// separator, so the command goes through a script, and the invocation carries an
+// explicit `.\` because PowerShell does not search the current directory for a
+// bare script name.
+const windows = process.platform === 'win32'
+const exitScript = windows ? '.\\exit-3.cmd' : 'sh exit-3.sh'
+const exitCommand = windows ? `${exitScript}; exit $LASTEXITCODE` : exitScript
+// PowerShell reports a native failure as exit 1, so the script's own status is
+// carried out with `exit $LASTEXITCODE`. `formatShellStarted` escapes backslashes
+// in the `$ …` line, so the snapshot uses the escaped form.
+const exitShown = exitCommand.replace(/\\/g, '\\\\')
+
+function writeExitScript() {
+  const file = path.join(server.projectDirectory, windows ? 'exit-3.cmd' : 'exit-3.sh')
+  fs.writeFileSync(file, windows ? '@echo off\r\necho from-the-channel\r\nexit 3\r\n' : '#!/bin/sh\necho from-the-channel\nexit 3\n')
+}
+
 beforeAll(async () => {
   dataDir = tempDataDir()
   ;[server, twin] = await Promise.all([
     startOpencodeTestServer({ matchers, commands: { review: { template: 'Review this change: $ARGUMENTS' } } }),
     startTwin(),
   ])
+  writeExitScript()
   await seedProjectChannel({
     dataDir,
     channelId: twin.channelId,
@@ -61,7 +82,7 @@ afterAll(async () => {
   await bot?.stop()
   await twin?.stop()
   await server?.stop()
-  fs.rmSync(dataDir, { recursive: true, force: true })
+  await removeTempDir(dataDir)
 })
 
 async function newThread(content: string) {
@@ -105,15 +126,15 @@ test('!cmd while busy runs at once, does not interrupt, and its output reaches t
 })
 
 test('!cmd in a channel creates a thread and runs there', async () => {
-  const thread = await newThread('!echo from-the-channel && exit 3')
+  const thread = await newThread(`!${exitCommand}`)
   // "-# exit 3" is the status under the output, not the "$ …" line.
   await waitForBotMessageContaining({ discord: twin.discord, threadId: thread.id, text: '-# exit 3' })
-  expect(thread.name).toBe('!echo from-the-channel && exit 3')
+  expect(thread.name).toBe(`!${exitCommand}`)
   expect(await twin.discord.thread(thread.id).text()).toMatchInlineSnapshot(`
     "--- from: user (tommy)
-    !echo from-the-channel && exit 3
+    !${exitCommand}
     --- from: assistant (TestBot)
-    -# $ echo from-the-channel && exit 3
+    -# $ ${exitShown}
     \`\`\`
     from-the-channel
     \`\`\`

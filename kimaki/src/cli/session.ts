@@ -11,6 +11,7 @@ import { wrapJsonSchema, type Goke } from 'goke'
 import { parseDuration } from '../duration.ts'
 import { OpenCodeError } from '../errors.ts'
 import { editorsForFile, loadFileEditEvents } from '../file-edit-log.ts'
+import { readSessionIdEnv } from '../session-id-env.ts'
 import { allMessages, allSessions, readSessionMarkdown, sessionEventsFile, syncTranscripts, transcriptsDir } from '../session-events.ts'
 import {
   action,
@@ -59,7 +60,7 @@ export function registerSessionQueryCommands(cli: Goke) {
       if (permissions instanceof Error) fail(permissions, errorCode)
       const waiting = new Set([...forms.data.map((form) => form.sessionID), ...permissions.data.map((permission) => permission.sessionID)])
       // an agent waiting for active sessions must not wait for itself
-      const self = options.active ? process.env['OPENCODE_SESSION_ID'] : undefined
+      const self = options.active ? readSessionIdEnv() : undefined
       const excluded = [...(options.exclude ?? []), ...(self ? [self] : [])]
       const rows = sessions
         .filter((session) => !excluded.includes(session.id) && (!options.active || session.id in active))
@@ -139,8 +140,8 @@ export function registerSessionQueryCommands(cli: Goke) {
     .option('--data-dir <path>', DATA_DIR_HELP)
     .option('-s, --session <id>', SESSION_HELP)
     .action(async (options) => {
-      const id = options.session ?? process.env['OPENCODE_SESSION_ID']
-      if (!id) fail(new Error('Use --session or run inside an OpenCode session'))
+      const id = options.session ?? readSessionIdEnv()
+      if (!id) fail(new Error('Use --session or run inside an agent session'))
       const client = await readClient()
       const { sessionId } = await resolveTarget(id, options.dataDir)
       const session = await client.session.get({ sessionID: sessionId }).catch((cause) => new OpenCodeError({ operation: 'session.get', cause }))
@@ -203,7 +204,7 @@ export function registerSessionActionCommands(cli: Goke) {
       .action(async (options) => action({ route: `queue.${name}`, dataDir: options.dataDir, input: targetOrEnv(options.session) }))
   }
 
-  cli.command('session command <name> [...args]', 'Run an OpenCode command, skill, or MCP prompt')
+  cli.command('session command <name> [...args]', 'Run an agent command, skill, or MCP prompt')
     .option('--data-dir <path>', DATA_DIR_HELP)
     .option('-s, --session <id>', SESSION_HELP)
     .option('--queue', 'Run after the current turn instead of interrupting')
@@ -216,7 +217,7 @@ export function registerSessionActionCommands(cli: Goke) {
     cli.command(`session ${name} <text>`, `Run ${name} through the shared session action`)
       .option('--data-dir <path>', DATA_DIR_HELP)
       .option('-s, --session <id>', SESSION_HELP)
-      .option('--queue', 'Queue an OpenCode command')
+      .option('--queue', 'Queue an agent command')
       .action(async (text, options) => action({ route: `session.${name}`, dataDir: options.dataDir, input: { ...targetOrEnv(options.session), text } }))
   }
 
@@ -234,7 +235,7 @@ export function registerSessionActionCommands(cli: Goke) {
 
 // events, read, cwd
 export function registerSessionHistoryCommands(cli: Goke) {
-  cli.command('session events <id>', 'Print the recorded OpenCode events of a thread as JSONL (root + subagents)')
+  cli.command('session events <id>', 'Print the recorded agent events of a thread as JSONL (root + subagents)')
     .option('--data-dir <path>', DATA_DIR_HELP)
     .example('kimaki session events ses_abc | jq -r .event.type | sort | uniq -c')
     .example(`kimaki session events ses_abc | jq 'select(.event.type == "session.retry.scheduled")'`)
@@ -251,7 +252,7 @@ export function registerSessionHistoryCommands(cli: Goke) {
     .option('--full', 'Every message with tool calls')
     .option('--thinking', 'Full output with reasoning')
     .option('--verbose', 'Full output with tool inputs and outputs')
-    .option('--json', 'Print raw OpenCode messages')
+    .option('--json', 'Print raw agent messages')
     .action(async (id, options) => {
       // Subagent sessions are not in SQLite: resolveTarget keeps their ID.
       const { sessionId } = await resolveTarget(id, options.dataDir)

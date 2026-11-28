@@ -2,12 +2,12 @@
 // OpenCode catalog: /<agent>-agent, /<cmd>-cmd, /<skill>-skill, and
 // /queue-command. MCP prompts get no slash command; they run as messages.
 
-import fs from 'node:fs'
 import path from 'node:path'
 import type { DeterministicMatcher } from 'opencode-deterministic-provider'
 import { afterAll, beforeAll, expect, test } from 'vitest'
 
 import type { BotHandle } from './main.ts'
+import { removeDataDir } from './test/cleanup.ts'
 import {
   TEST_USER_ID,
   seedProjectChannel,
@@ -65,7 +65,7 @@ afterAll(async () => {
   await bot?.stop()
   await twin?.stop()
   await server?.stop()
-  fs.rmSync(dataDir, { recursive: true, force: true })
+  await removeDataDir(dataDir)
 })
 
 test('the bot registers exactly the static and catalog commands in the guild', async () => {
@@ -77,7 +77,7 @@ test('the bot registers exactly the static and catalog commands in the guild', a
       "/btw: Ask something without polluting or blocking the current session",
       "/build-agent: The default agent. Executes tools based on configured permissions.",
       "/clear-queue: Remove queued messages",
-      "/command: Run any OpenCode command in this project",
+      "/command: Run any command in this project",
       "/compact: Compact the session context by summarizing the history",
       "/context-usage: Show token usage, context window percentage and whether the session is working",
       "/cwd: Show or change this session working directory",
@@ -86,24 +86,24 @@ test('the bot registers exactly the static and catalog commands in the guild', a
       "/fork-subagent: Fork a subagent task session into a new thread",
       "/hello-cmd: Say hello",
       "/later-cmd: Runs later",
-      "/login: Connect an OpenCode provider",
+      "/login: Connect a model provider",
       "/merge-worktree: Merge this worktree into a local branch",
       "/model: Set the model for this session, channel or all channels",
       "/model-variant: Change the thinking level of the current model",
-      "/new-session: Start a new OpenCode session",
+      "/new-session: Start a new agent session",
       "/new-worktree: Start an isolated Git worktree session; fork context when used in a thread",
       "/opencode-skill: Use this skill for any question about OpenCode itself, including how OpenCode works, using or config",
       "/plan-agent: Read-only agent for exploring the codebase and planning work before implementation.",
       "/queue: Send a message after the current run finishes",
-      "/queue-command: Queue an OpenCode command to run after the current run finishes",
+      "/queue-command: Queue an agent command to run after the current run finishes",
       "/redo: Redo the previously undone turn",
       "/report-skill: Use when the user wants to report an opencode issue or bug. Collect standard diagnostics, add user-s",
       "/reset-coordinator: Reset the context of this channel: the next message starts a fresh coordinator session",
-      "/resume: Resume an existing OpenCode session in a new thread",
+      "/resume: Resume an existing agent session in a new thread",
       "/review-cmd: review changes [commit|branch|pr], defaults to uncommitted",
       "/routines: List routines, run one now, or delete it",
       "/session-id: Show the OpenCode session ID of this thread and how to open it in OpenCode",
-      "/skill: Run any OpenCode skill in this project",
+      "/skill: Run any skill in this project",
       "/toggle-coordinator: Turn coordinator mode on or off: one long session in this channel that starts threads",
       "/transcription-key: Set the OpenAI or Gemini API key for voice transcription and speech",
       "/undo: Undo the last turn (file changes are kept)",

@@ -16,7 +16,8 @@ import type { KimakiDb } from './db.ts'
 import type { EffectsRunner } from './effects.ts'
 import { ConfigError, DbError, DiscordError, OpenCodeError, OpenCodeUnavailableError } from './errors.ts'
 import type { EventLoop } from './event-loop.ts'
-import type { OpenCodeClient, OpencodeConnection } from './opencode-server.ts'
+import type { JcodeBotConnection } from './backend/jcode-bot-backend.ts'
+import type { Backend, OpenCodeClient, OpencodeConnection } from './opencode-server.ts'
 import type { Route } from './routes.ts'
 import type { Clock } from './scheduler.ts'
 import type { PluginWait } from './sessions.ts'
@@ -46,11 +47,27 @@ export type BotFeatures = {
   voiceCalls: VoiceCalls
 }
 
+export type BotBackend = OpencodeConnection | JcodeBotConnection
+
 export type Bot = {
   discord: Client
   db: KimakiDb
   store: BotStore
-  opencode: OpencodeConnection
+  // The connection for the configured backend. Kept as the field every existing
+  // `oc(bot, ...)` call reaches, so a jcode start still reports its unsupported
+  // operations by name instead of silently reaching OpenCode.
+  opencode: BotBackend
+  // Every connection this bot started, indexed by the backend a thread's row names
+  // (thread-backend.ts). A backend with no connection is null, never another one.
+  backends: { readonly opencode: OpencodeConnection | null; readonly jcode: JcodeBotConnection | null }
+  // The configured backend (`--backend` / KIMAKI_BACKEND). Recorded on every row
+  // bindThread writes, so a new thread is served by the default.
+  backendKind: 'opencode' | 'jcode'
+  // The binary and home this bot's jcode connections were started with. A new thread's
+  // session must be minted in the same store the bot observes (jcode-thread.ts), so a
+  // bot started with an explicit binary/home never creates a session elsewhere. null:
+  // the seam's own default (JCODE_BIN, JCODE_HOME or ~/.jcode).
+  jcodeStore: { readonly binary: string | null; readonly home: string | null }
   eventLoop: EventLoop
   effects: EffectsRunner
   analytics: Analytics

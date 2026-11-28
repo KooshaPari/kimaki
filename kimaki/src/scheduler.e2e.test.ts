@@ -2,12 +2,12 @@
 // one-shot, cron, thread and pre-run routines against the twin and a real
 // OpenCode server. Time is a manual clock; nothing waits for real time.
 
-import fs from 'node:fs'
 import { git } from './worktrees.ts'
 import { afterAll, beforeAll, expect, test } from 'vitest'
 
 import type { BotHandle } from './main.ts'
 import { send } from './prompt.ts'
+import { removeTempDir } from './test/cleanup.ts'
 import {
   manualClock,
   schedulingKit,
@@ -27,6 +27,10 @@ import {
 
 const dataDir = tempDataDir()
 const clock = manualClock(Date.parse('2030-01-01T09:00:00Z'))
+// The pre-run runs through Node's exec(), i.e. cmd.exe here and sh elsewhere.
+// `;` and `exit 3` are POSIX-only: in cmd `;` is not a separator, so the whole
+// tail is echoed and the command exits 0. `&&` plus `exit /b 3` is the cmd form.
+const failingPreRun = process.platform === 'win32' ? 'echo nothing to do && exit /b 3' : 'echo nothing to do; exit 3'
 let server: OpencodeTestServer
 let twin: TestTwin
 let bot: BotHandle
@@ -45,7 +49,7 @@ beforeAll(async () => {
 afterAll(async () => {
   await bot?.stop()
   await Promise.all([server?.stop(), twin?.stop()])
-  fs.rmSync(dataDir, { recursive: true, force: true })
+  await removeTempDir(dataDir)
 })
 
 test('a one-shot routine starts a thread at its time, then is gone', async () => {
@@ -135,7 +139,7 @@ test('a routine for an existing thread prompts that thread, with or without . qu
 
 test('--pre-run: a failing command skips the run, output is appended to the prompt', async () => {
   clock.set(Date.parse('2030-01-01T15:00:00Z'))
-  const skipped = await schedule({ prompt: 'Skipped task', sendAt: '2030-01-01T16:00:00Z', preRun: 'echo nothing to do; exit 3' })
+  const skipped = await schedule({ prompt: 'Skipped task', sendAt: '2030-01-01T16:00:00Z', preRun: failingPreRun })
   const ran = await schedule({ prompt: 'Summarize the new issues', sendAt: '2030-01-01T16:00:00Z', preRun: 'echo issue 42 is new' })
   const created = await tick('2030-01-01T16:00:00Z')
   expect(created.length).toBe(1)

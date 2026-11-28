@@ -1,7 +1,7 @@
 // Phase 1: the thread <-> session binding lives in SQLite, so a restarted bot
 // continues the session of an existing thread.
 
-import fs from 'node:fs'
+import { removeDataDir } from './test/cleanup.ts'
 import { afterAll, beforeAll, expect, test } from 'vitest'
 
 import type { BotHandle } from './main.ts'
@@ -39,7 +39,7 @@ afterAll(async () => {
   await bot?.stop()
   await twin?.stop()
   await server?.stop()
-  fs.rmSync(dataDir, { recursive: true, force: true })
+  await removeDataDir(dataDir)
 })
 
 test('restarted bot continues the session of an existing thread', async () => {

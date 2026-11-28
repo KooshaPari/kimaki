@@ -5,6 +5,7 @@
 // discord.js are imported lazily too: loading them costs ~0.4s and ~250 MB per
 // CLI call, and most commands only talk to the bot over the lock port.
 
+import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import type { OpenCodeClient } from '@opencode/client'
@@ -15,16 +16,25 @@ import { canonicalPath } from '../file-edit-log.ts'
 import type { LockRouteInput, LockRouteName } from '../lock-routes.ts'
 import { callBot } from '../lock-server.ts'
 import { resolveOpencode } from '../opencode-server.ts'
+import { readSessionIdEnv } from '../session-id-env.ts'
 import { readSessionMarkdown, resolveSession, waitForSessions, type WaitStatus } from '../session-events.ts'
 
 export const DATA_DIR_HELP = 'Data directory (default: ~/.kimaki)'
-export const SESSION_HELP = 'Session ID, Discord thread ID or thread URL (default: OPENCODE_SESSION_ID)'
+export const SESSION_HELP = 'Session ID, Discord thread ID or thread URL (default: KIMAKI_SESSION_ID)'
 
 // Prints the error and its cause chain: "Discord login failed" alone hides why.
 export function fail(error: Error, code = 1): never {
   const lines = [error.message]
   for (let cause = error.cause; cause instanceof Error; cause = cause.cause) lines.push(`  caused by: ${cause.message}`)
-  process.stderr.write(`${lines.join('\n')}\n`)
+  const text = `${lines.join('\n')}\n`
+  // stderr to a pipe is asynchronous: exiting straight after the write can abort
+  // inside libuv on Windows (UV_HANDLE_CLOSING, exit 0xC0000409) before the text
+  // is flushed. Write synchronously, then exit with the intended code.
+  try {
+    fs.writeSync(2, text)
+  } catch {
+    process.stderr.write(text)
+  }
   process.exit(code)
 }
 
@@ -45,9 +55,9 @@ export function parseTarget(value: string): SessionTarget | Error {
   return new Error(`Not a session ID, Discord thread ID or thread URL: ${value}`)
 }
 
-// The target of a session command; inside an agent shell OPENCODE_SESSION_ID is the default.
+// The target of a session command; inside an agent shell KIMAKI_SESSION_ID is the default.
 export function targetOrEnv(value: string | undefined): SessionTarget | Record<string, never> {
-  const id = value ?? process.env['OPENCODE_SESSION_ID']
+  const id = value ?? readSessionIdEnv()
   if (!id) return {}
   const target = parseTarget(id)
   if (target instanceof Error) fail(target)

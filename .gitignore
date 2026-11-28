@@ -29,3 +29,6 @@ zig-out
 website/.wrangler/
 .wrangler
 betterstack
+
+# agent scratch left beside source
+*.tmp.mjs

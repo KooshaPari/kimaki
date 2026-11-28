@@ -9,12 +9,13 @@ import { wrapJsonSchema, type Goke } from 'goke'
 
 import dedent from 'string-dedent'
 
+import { readSessionIdEnv } from '../session-id-env.ts'
 import { callBot } from '../lock-server.ts'
 import { action, DATA_DIR_HELP, dataDirOrDefault, discordApi, fail, isThread, printRows, SESSION_HELP, targetOrEnv } from './shared.ts'
 
 // From an agent shell the bot waits for this shell's tool line, so the UI posts after it.
 function agentShell() {
-  return { fromShell: Boolean(process.env['OPENCODE_SESSION_ID']), toolCall: process.env['KIMAKI_TOOL_CALL'] }
+  return { fromShell: Boolean(readSessionIdEnv()), toolCall: process.env['KIMAKI_TOOL_CALL'] }
 }
 
 // The model reads this after `kimaki buttons`. Text planned before a tool call
@@ -111,7 +112,7 @@ export function registerDiscordCommands(cli: Goke) {
       const target = options.channel ? {} : targetOrEnv(options.session)
       // Voice call shells have no session: KIMAKI_CHANNEL_ID is the voice channel.
       const id = options.channel ?? target.sessionId ?? target.threadId ?? process.env['KIMAKI_CHANNEL_ID']
-      if (!id) fail(new Error('Use --session or --channel, or run inside an OpenCode session'))
+      if (!id) fail(new Error('Use --session or --channel, or run inside an agent session'))
       const input = { id, files: files.map((file) => ({ path: path.resolve(file), name: path.basename(file) })) }
       // Waits for Discord: big files and a busy thread take longer than the 30s default.
       await action({ route: 'upload', dataDir: options.dataDir, input, signal: AbortSignal.timeout(5 * 60_000) })

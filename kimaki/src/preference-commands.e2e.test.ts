@@ -2,7 +2,6 @@
 // switch the session in OpenCode (next step); in a channel they set the
 // default for new sessions.
 
-import fs from 'node:fs'
 import type { DeterministicMatcher } from 'opencode-deterministic-provider'
 import * as orm from 'drizzle-orm'
 import { ComponentType } from 'discord-api-types/v10'
@@ -11,6 +10,7 @@ import { afterAll, beforeAll, expect, onTestFinished, test } from 'vitest'
 import type { BotHandle } from './main.ts'
 import { send } from './prompt.ts'
 import * as schema from './schema.ts'
+import { removeDataDir } from './test/cleanup.ts'
 import {
   TEST_USER_ID,
   scriptedTurn,
@@ -66,7 +66,7 @@ afterAll(async () => {
   await bot?.stop()
   await twin?.stop()
   await server?.stop()
-  fs.rmSync(dataDir, { recursive: true, force: true })
+  await removeDataDir(dataDir)
 })
 
 async function newThread(channelId: string, content: string) {
@@ -433,6 +433,16 @@ test('/<agent>-agent variant: sets the thinking level with the agent, per sessio
     options: [{ name: 'variant', type: 3, value: 'fast' }],
   })
   await discord.channel(channelId).waitForInteractionAck({ interactionId: ack.id })
+  // The reply is visible before the channel preference is saved: a session started
+  // now could still pick up the defaults, so wait for the rows the session reads.
+  await waitFor({
+    label: 'channel agent and thinking level saved',
+    check: async () => {
+      const agent = await bot.db.query.channel_agents.findFirst({ where: { channel_id: channelId } })
+      const model = await bot.db.query.channel_models.findFirst({ where: { channel_id: channelId } })
+      return agent?.agent_name === 'build' && model?.variant === 'fast'
+    },
+  })
   const fresh = await newThread(channelId, 'Uses the channel variant')
   expect(await sessionModel(fresh.id)).toMatchInlineSnapshot(`
     {
@@ -444,8 +454,14 @@ test('/<agent>-agent variant: sets the thinking level with the agent, per sessio
       },
     }
   `)
-  const messages = await discord.channel(channelId).getMessages()
-  expect(messages.at(-2)?.content).toMatchInlineSnapshot(`
+  // The command defers its reply and the thread's starter message can land
+  // after it, so find the reply by content instead of by position.
+  const reply = await waitFor({
+    label: 'channel agent reply',
+    check: async () =>
+      (await discord.channel(channelId).getMessages()).filter((message) => message.content.includes('Thinking level:')).at(-1) ?? null,
+  })
+  expect(reply.content).toMatchInlineSnapshot(`
     "Switched to **build** agent for this channel
     Model: \`deterministic-provider/deterministic-v2 (fast)\`
     All new sessions will use this agent.

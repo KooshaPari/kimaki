@@ -27,14 +27,97 @@ const datetime = s.customType<{
   },
 })
 
+// Metadata only. These rows never authorize runtime control or transcript publication.
+export const ops_surface_bindings = s.sqliteTable('ops_surface_bindings', {
+  id: s.text('id').primaryKey().notNull(),
+  host_id: s.text('host_id').notNull(),
+  endpoint_id: s.text('endpoint_id').notNull(),
+  backend_kind: s.text('backend_kind').notNull(),
+  native_session_id: s.text('native_session_id').notNull(),
+  service_kind: s.text('service_kind').notNull(),
+  tenant_id: s.text('tenant_id').notNull(),
+  surface_id: s.text('surface_id').notNull(),
+  mode: s.text('mode', { enum: ['observe'] }).notNull().default('observe'),
+  publication_policy: s.text('publication_policy', { enum: ['none'] }).notNull().default('none'),
+  state: s.text('state', { enum: ['active', 'detached'] }).notNull().default('active'),
+  generation: s.integer('generation').notNull(),
+  idempotency_key: s.text('idempotency_key').notNull(),
+  created_at: s.integer('created_at').notNull(),
+}, (table) => [
+  s.uniqueIndex('ops_binding_request').on(table.service_kind, table.tenant_id, table.idempotency_key),
+  s.uniqueIndex('ops_binding_active_surface').on(table.service_kind, table.tenant_id, table.surface_id).where(orm.sql`${table.state} = 'active'`),
+])
+
+// AC22: a worker result whose write-back to the coordinating surface was not
+// acknowledged. Durable so a process restart keeps the pending record: `payload`
+// is the canonical JSON the digest attests, so a replay needs no worker rerun.
+export const ops_worker_sync_back = s.sqliteTable('ops_worker_sync_back', {
+  id: s.text('id').primaryKey().notNull(),
+  worker_id: s.text('worker_id').notNull(),
+  target: s.text('target').notNull(),
+  payload: s.text('payload').notNull(),
+  payload_digest: s.text('payload_digest').notNull(),
+  attempts: s.integer('attempts', { mode: 'number' }).notNull().default(0),
+  last_error: s.text('last_error'),
+  state: s.text('state', { enum: ['pending-sync', 'synced'] }).notNull().default('pending-sync'),
+  ack_id: s.text('ack_id'),
+  acknowledged_at: s.integer('acknowledged_at'),
+  created_at: s.integer('created_at').notNull(),
+  updated_at: s.integer('updated_at').notNull(),
+}, (table) => [
+  // One record per worker: a second result for the same worker is refused by
+  // name in sync-back.ts, and this index keeps that true across processes.
+  s.uniqueIndex('ops_worker_sync_back_worker').on(table.worker_id),
+  s.index('ops_worker_sync_back_state').on(table.state, table.created_at),
+])
+
+// AC16 (first half): the durable Paperclip launcher fence. One row per
+// (instance_id, run_id); the UNIQUE index is the cross-process exclusion
+// primitive, so two independent processes cannot both hold one claim. Metadata
+// only: it grants no dispatch, cancellation or remote write authority.
+export const ops_paperclip_launch_fence = s.sqliteTable('ops_paperclip_launch_fence', {
+  instance_id: s.text('instance_id').notNull(),
+  run_id: s.text('run_id').notNull(),
+  state: s.text('state', { enum: ['claimed', 'released'] }).notNull(),
+  launcher: s.text('launcher').notNull(),
+  generation: s.integer('generation', { mode: 'number' }).notNull(),
+  claim_seq: s.integer('claim_seq', { mode: 'number' }).notNull(),
+  acquired_at: s.text('acquired_at').notNull(),
+  heartbeat_at: s.text('heartbeat_at').notNull(),
+  expires_at: s.text('expires_at').notNull(),
+  digest: s.text('digest').notNull(),
+  updated_at: s.integer('updated_at', { mode: 'number' }).notNull(),
+}, (table) => [
+  // One claim per run. A second launcher that read "no claim" loses on insert.
+  s.uniqueIndex('ops_paperclip_launch_fence_run').on(table.instance_id, table.run_id),
+])
+
 export const thread_sessions = s.sqliteTable('thread_sessions', {
   thread_id: s.text('thread_id').primaryKey().notNull(),
   session_id: s.text('session_id').notNull(),
   source: s.text('source', { enum: ['kimaki', 'external_poll'] }).notNull().default('kimaki'),
+  backend: s.text('backend').notNull().default('opencode'),
   last_synced_name: s.text('last_synced_name'),
   parent_session_id: s.text('parent_session_id'),
   created_at: datetime('created_at').default(orm.sql`CURRENT_TIMESTAMP`),
   updated_at: datetime('updated_at').default(orm.sql`CURRENT_TIMESTAMP`).$onUpdate(() => new Date()),
+})
+
+// Phase 2 gate on deleting the OpenCode runtime: durable evidence that legacy
+// threads were exported or explicitly abandoned. One row per disposition kind,
+// keyed by `id`, so a second export/abandonment cannot overwrite the first proof.
+// The export row keeps the manifest path, its exported-at time and how many
+// thread rows it covered; the abandonment row keeps the count it made
+// unserviceable. DB_VERSION stays 1: migrations.ts applies this additive DDL
+// from schema.sql on every start (CREATE TABLE IF NOT EXISTS).
+export const opencode_thread_dispositions = s.sqliteTable('opencode_thread_dispositions', {
+  id: s.text('id').primaryKey().notNull(),
+  kind: s.text('kind', { enum: ['export', 'abandon'] }).notNull(),
+  manifest_path: s.text('manifest_path'),
+  source_db_file: s.text('source_db_file'),
+  exported_at: datetime('exported_at'),
+  thread_count: s.integer('thread_count', { mode: 'number' }).notNull(),
+  recorded_at: datetime('recorded_at').default(orm.sql`CURRENT_TIMESTAMP`),
 })
 
 export const bot_tokens = s.sqliteTable('bot_tokens', {
@@ -69,6 +152,20 @@ export const bot_api_keys = s.sqliteTable('bot_api_keys', {
   openai_api_key: s.text('openai_api_key'),
   xai_api_key: s.text('xai_api_key'),
   created_at: datetime('created_at').default(orm.sql`CURRENT_TIMESTAMP`),
+})
+
+// One-time handoff of the Codex OAuth credential OpenCode owns (docs/opencode-removal.md 1.4).
+// Kimaki never refreshes this token: refresh tokens rotate and a refresh here would log
+// OpenCode out. An expired row is skipped, not deleted, so the token can be replaced by a
+// later explicit import. DB_VERSION stays 1: migrations.ts applies the additive DDL from
+// schema.sql on every start (CREATE TABLE IF NOT EXISTS).
+export const codex_credentials = s.sqliteTable('codex_credentials', {
+  app_id: s.text('app_id').primaryKey().notNull().references(() => bot_tokens.app_id, { onUpdate: 'cascade' }),
+  access_token: s.text('access_token').notNull(),
+  account_id: s.text('account_id'),
+  token_expires_at: s.integer('token_expires_at', { mode: 'number' }),
+  imported_from: s.text('imported_from').notNull(),
+  imported_at: datetime('imported_at').default(orm.sql`CURRENT_TIMESTAMP`),
 })
 
 // Bot-wide settings that must survive restarts. Start flags like --voice write them.
@@ -172,9 +269,14 @@ export const session_sleeps = s.sqliteTable('session_sleeps', {
 ])
 
 export const relations = defineRelations({
+  ops_surface_bindings,
+  ops_worker_sync_back,
+  ops_paperclip_launch_fence,
   thread_sessions,
+  opencode_thread_dispositions,
   bot_tokens,
   bot_api_keys,
+  codex_credentials,
   bot_settings,
   channel_directories,
   guild_categories,
@@ -188,16 +290,24 @@ export const relations = defineRelations({
   scheduled_tasks,
   session_sleeps,
 }, (r) => ({
+  ops_surface_bindings: {},
+  ops_worker_sync_back: {},
+  ops_paperclip_launch_fence: {},
   thread_sessions: {
     scheduled_tasks: r.many.scheduled_tasks(),
   },
+  opencode_thread_dispositions: {},
   bot_tokens: {
     api_keys: r.one.bot_api_keys({ from: r.bot_tokens.app_id, to: r.bot_api_keys.app_id }),
+    codex_credential: r.one.codex_credentials({ from: r.bot_tokens.app_id, to: r.codex_credentials.app_id }),
     global_model: r.one.global_models({ from: r.bot_tokens.app_id, to: r.global_models.app_id }),
     settings: r.one.bot_settings({ from: r.bot_tokens.app_id, to: r.bot_settings.app_id }),
   },
   bot_api_keys: {
     bot: r.one.bot_tokens({ from: r.bot_api_keys.app_id, to: r.bot_tokens.app_id }),
+  },
+  codex_credentials: {
+    bot: r.one.bot_tokens({ from: r.codex_credentials.app_id, to: r.bot_tokens.app_id }),
   },
   bot_settings: {
     bot: r.one.bot_tokens({ from: r.bot_settings.app_id, to: r.bot_tokens.app_id }),

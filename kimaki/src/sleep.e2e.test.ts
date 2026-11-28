@@ -10,6 +10,7 @@ import type { DeterministicMatcher } from 'opencode-deterministic-provider'
 import { afterAll, beforeAll, expect, test } from 'vitest'
 
 import type { BotHandle } from './main.ts'
+import { removeTempDir } from './test/cleanup.ts'
 import {
   TEST_USER_ID,
   manualClock,
@@ -28,6 +29,21 @@ import {
 } from './test/harness.ts'
 
 const WARM_INTERVAL_MS = 200
+
+// The shell tool hands its command to the shell as one argv element: a `"` that
+// should group a multi-word value reaches the shell literally and the value splits
+// on its spaces, and POSIX `'` arrives literal there too, so `--reason 'waiting
+// for the deploy'` reached the CLI as `'waiting`. A one-line script passes the
+// real command line, grouping the quoted reason. PowerShell skips the current
+// directory for a bare script name, so the invocation carries an explicit `.\`.
+const windows = process.platform === 'win32'
+const sleepScript = windows ? '.\\sleep-30m.cmd' : 'sh sleep-30m.sh'
+
+function writeSleepScript() {
+  const command = 'kimaki sleep --duration 30m --reason "waiting for the deploy"'
+  const file = path.join(server.projectDirectory, windows ? 'sleep-30m.cmd' : 'sleep-30m.sh')
+  fs.writeFileSync(file, windows ? `@echo off\r\n${command}\r\n` : `#!/bin/sh\n${command}\n`)
+}
 
 function sleepTurn({ marker, command }: { marker: string; command: string }): DeterministicMatcher[] {
   const callId = `${marker}-call`
@@ -50,13 +66,14 @@ let bot: BotHandle
 beforeAll(async () => {
   ;[server, twin] = await Promise.all([
     startOpencodeTestServer({ plugins: [path.resolve('src/test/generate-log-plugin')], matchers: [
-      ...sleepTurn({ marker: 'sleep-marker', command: "kimaki sleep --duration 30m --reason 'waiting for the deploy'" }),
+      ...sleepTurn({ marker: 'sleep-marker', command: sleepScript }),
       ...sleepTurn({ marker: 'cancel-marker', command: 'kimaki sleep --until 2030-01-01T10:30:00Z' }),
       { id: 'wake', priority: 200, when: { latestUserTextIncludes: 'Woke after sleeping until' }, then: { parts: textParts('Awake, checking the deploy.') } },
       { id: 'never-mind', priority: 200, when: { latestUserTextIncludes: 'Never mind' }, then: { parts: textParts('Noted, no wake needed.') } },
     ] }),
     startTwin(),
   ])
+  writeSleepScript()
   await seedProjectChannel({ dataDir, channelId: twin.channelId, guildId: twin.discord.guildId, directory: server.projectDirectory })
   bot = await startTestBot({ dataDir, twin, server, clock, schedulerIntervalMs: null, warmupTimers: { intervalMs: WARM_INTERVAL_MS, maxMs: 60_000 } })
   await warmUp({ server })
@@ -65,7 +82,7 @@ beforeAll(async () => {
 afterAll(async () => {
   await bot?.stop()
   await Promise.all([server?.stop(), twin?.stop()])
-  fs.rmSync(dataDir, { recursive: true, force: true })
+  await removeTempDir(dataDir)
 })
 
 async function start(prompt: string) {

@@ -260,7 +260,7 @@ export const sessionRoutes: InteractionRoutes = {
     'new-session': {
       definition: new SlashCommandBuilder()
         .setName('new-session')
-        .setDescription('Start a new OpenCode session')
+        .setDescription('Start a new agent session')
         .addStringOption((option) =>
           option.setName('prompt').setDescription('Prompt content for the session; empty waits for the first message in the thread'),
         )
@@ -274,7 +274,7 @@ export const sessionRoutes: InteractionRoutes = {
     resume: {
       definition: new SlashCommandBuilder()
         .setName('resume')
-        .setDescription('Resume an existing OpenCode session in a new thread')
+        .setDescription('Resume an existing agent session in a new thread')
         .addStringOption((option) =>
           option.setName('session').setDescription('The session to resume').setRequired(true).setAutocomplete(true),
         ),

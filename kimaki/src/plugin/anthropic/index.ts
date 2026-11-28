@@ -158,7 +158,7 @@ const refresh = (credential: Credential.OAuth) =>
 // Anthropic bills subscription requests that carry OpenCode's exact environment
 // block as third-party usage ("Third-party apps now draw from your extra usage").
 // Changing its wrapper keeps every line for the model and avoids the fingerprint.
-const OPENCODE_ENV_BLOCK = /Here is some useful information about the environment you are running in:\n<env>\n([\s\S]*?)<\/env>/
+const JCODE_ENV_BLOCK = /Here is some useful information about the environment you are running in:\n<env>\n([\s\S]*?)<\/env>/
 
 // The body comes from OpenCode's Anthropic provider, so its shape is known.
 type MessagesBody = { system?: string | Array<{ type: string; text?: string }> }
@@ -169,7 +169,7 @@ export function rewriteSubscriptionRequest(body: string): string | null {
   const payload = errore.try(() => JSON.parse(body) as MessagesBody)
   if (payload instanceof Error) return null
   const blocks = typeof payload.system === 'string' ? [{ type: 'text', text: payload.system }] : (payload.system ?? [])
-  const rewrapped = blocks.map((block) => (block.text === undefined ? block : { ...block, text: block.text.replace(OPENCODE_ENV_BLOCK, '<environment>\n$1</environment>') }))
+  const rewrapped = blocks.map((block) => (block.text === undefined ? block : { ...block, text: block.text.replace(JCODE_ENV_BLOCK, '<environment>\n$1</environment>') }))
   const next = rewrapped[0]?.text === CLAUDE_CODE_IDENTITY ? rewrapped : [{ type: 'text', text: CLAUDE_CODE_IDENTITY }, ...rewrapped]
   if (JSON.stringify(next) === JSON.stringify(payload.system)) return null
   return JSON.stringify({ ...payload, system: next })

@@ -4,6 +4,7 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { afterAll, beforeAll, expect, test } from 'vitest'
 import type { BotHandle } from './main.ts'
+import { removeTempDir } from './test/cleanup.ts'
 import { seedProjectChannel, startOpencodeTestServer, startTestBot, startTwin, tempDataDir, waitForFooter, warmUp, type OpencodeTestServer, type TestTwin } from './test/harness.ts'
 
 const exec = promisify(execFile)
@@ -23,8 +24,8 @@ beforeAll(async () => {
 afterAll(async () => {
   await Promise.all([a?.stop(), b?.stop()])
   await Promise.all([server?.stop(), twin?.stop()])
-  fs.rmSync(dataA, { recursive: true, force: true })
-  fs.rmSync(dataB, { recursive: true, force: true })
+  await removeTempDir(dataA)
+  await removeTempDir(dataB)
 })
 function cli(args: string[]) {
   return exec(process.execPath, ['--import', 'tsx', path.resolve('src/cli.ts'), ...args, '--data-dir', dataA], { env: { ...process.env, KIMAKI_LOCK_PORT: String(a.lock.port) } })

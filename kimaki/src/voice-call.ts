@@ -409,7 +409,7 @@ export function createVoiceCalls({ opencodeConfigDir }: { opencodeConfigDir: str
   }
 
   function shellEnv(bot: Bot, call: Call) {
-    const { OPENCODE_SESSION_ID: _session, KIMAKI_TOOL_CALL: _toolCall, ...env } = process.env
+    const { KIMAKI_SESSION_ID: _newSession, OPENCODE_SESSION_ID: _oldSession, KIMAKI_TOOL_CALL: _toolCall, ...env } = process.env
     return {
       ...env,
       PATH: `${path.join(bot.dataDir, 'bin')}${path.delimiter}${env['PATH'] ?? ''}`,
