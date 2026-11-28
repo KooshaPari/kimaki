@@ -10,7 +10,7 @@ import { setTimeout as sleep } from 'node:timers/promises'
 import dedent from 'string-dedent'
 import { wrapJsonSchema, type Goke } from 'goke'
 
-import { BOT_BACKENDS, BOT_BACKEND_CHOICES, DEFAULT_BOT_BACKEND, legacyOpencodeCheckFailure, shouldCheckOpencode, type BotBackend } from '../backend-selection.ts'
+import { BOT_BACKENDS, BOT_BACKEND_CHOICES, DEFAULT_BOT_BACKEND, exportRequiredFailure, legacyOpencodeCheckFailure, shouldCheckOpencode, type BotBackend } from '../backend-selection.ts'
 import { backendPlan } from '../thread-backend.ts'
 export { BOT_BACKENDS, BOT_BACKEND_CHOICES, DEFAULT_BOT_BACKEND, shouldCheckOpencode, type BotBackend } from '../backend-selection.ts'
 import { distCliEntry, removeAutostartScript, stableNodePath, writeAutostartScript } from '../autostart.ts'
@@ -178,6 +178,26 @@ export function registerStartCommand(cli: Goke) {
       const backendChoice = resolveBotBackend({ backend: options.backend, argv: process.argv })
       if (backendChoice instanceof Error) fail(backendChoice)
       const backend = backendChoice.backend
+      // Phase 2 gate: before the lock, SQLite and Discord, a jcode start must
+      // prove that persisted OpenCode threads were exported or abandoned. The
+      // records live in kimaki's db, so reading them also migrates the additive
+      // table on this start; no record is ever written by startup itself.
+      const gate = await (async () => {
+        if (backend === 'opencode') return null
+        const { openDb } = await import('../db.ts')
+        const { abandonedNotice, startupOpencodeDisposition } = await import('../opencode-disposition.ts')
+        const opened = await openDb({ dataDir: dataDirOrDefault(options.dataDir), migrate: true })
+        if (opened instanceof Error) return opened
+        const disposition = await startupOpencodeDisposition({ db: opened.db, backend })
+        opened.close()
+        if (disposition instanceof Error) return disposition
+        if (disposition.kind === 'proceed' && disposition.reason === 'abandoned' && disposition.legacyThreadCount > 0) {
+          process.stderr.write(`${abandonedNotice(disposition.legacyThreadCount)}\n`)
+        }
+        return disposition
+      })()
+      if (gate instanceof Error) fail(gate)
+      if (gate?.kind === 'export-required') fail(exportRequiredFailure({ source: backendChoice.source, legacyThreadCount: gate.legacyThreadCount }))
       // The IPC check ignores a KIMAKI_SUPERVISED leaked into a shell by an older bot.
       if (process.env['KIMAKI_SUPERVISED'] !== '1' || !process.connected) return supervise()
       // OpenCode and agent shells inherit process.env: a bot started from a

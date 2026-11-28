@@ -69,3 +69,55 @@ export function legacyOpencodeCheckFailure({
     cause: error,
   })
 }
+
+// Phase 2 gate: a jcode start must not strand OpenCode threads silently. This is a
+// pure decision; the CLI reads the durable records and supplies `exported` and
+// `abandoned`, so no I/O or defaults hide here. The opencode backend and a jcode
+// start with no legacy threads are never gated.
+export type OpencodeThreadDisposition =
+  | { readonly kind: 'proceed'; readonly reason: 'no-legacy-threads' | 'exported' | 'abandoned'; readonly legacyThreadCount: number }
+  | { readonly kind: 'export-required'; readonly legacyThreadCount: number }
+
+export function opencodeThreadDisposition({
+  backend,
+  legacyThreadCount,
+  exported,
+  abandoned,
+}: {
+  backend: BotBackend
+  legacyThreadCount: number
+  exported: boolean
+  abandoned: boolean
+}): OpencodeThreadDisposition {
+  // The opencode backend is not gated: it can still serve those threads natively.
+  // This lane must not change that path, including its preflight.
+  if (backend === 'opencode') return { kind: 'proceed', reason: 'no-legacy-threads', legacyThreadCount }
+  if (legacyThreadCount <= 0) return { kind: 'proceed', reason: 'no-legacy-threads', legacyThreadCount }
+  // If both records exist, the export is the stronger evidence: it means the
+  // history can be restored rather than merely written off.
+  if (exported) return { kind: 'proceed', reason: 'exported', legacyThreadCount }
+  if (abandoned) return { kind: 'proceed', reason: 'abandoned', legacyThreadCount }
+  return { kind: 'export-required', legacyThreadCount }
+}
+
+export const EXPORT_REMEDY = 'kimaki export opencode --out <dir>'
+export const ABANDON_REMEDY = 'kimaki export abandon-opencode --data-dir <dir>'
+
+/** The start refusal. Both remedies are named verbatim, with no third implied path. */
+export function exportRequiredFailure({
+  source,
+  legacyThreadCount,
+  error,
+}: {
+  source: BotBackendSource
+  legacyThreadCount: number
+  error?: Error
+}): ConfigError {
+  const surface = backendSelectionSurface({ backend: 'jcode', source })
+  const threads = `${legacyThreadCount} legacy OpenCode thread${legacyThreadCount === 1 ? '' : 's'}`
+  const verb = legacyThreadCount === 1 ? 'has' : 'have'
+  return new ConfigError({
+    reason: `jcode backend (${surface}): ${threads} ${verb} not been exported or explicitly abandoned; starting would strand ${legacyThreadCount === 1 ? 'it' : 'them'}. Export with ${EXPORT_REMEDY} or abandon with ${ABANDON_REMEDY} before starting jcode.`,
+    ...(error && { cause: error }),
+  })
+}

@@ -103,6 +103,23 @@ export const thread_sessions = s.sqliteTable('thread_sessions', {
   updated_at: datetime('updated_at').default(orm.sql`CURRENT_TIMESTAMP`).$onUpdate(() => new Date()),
 })
 
+// Phase 2 gate on deleting the OpenCode runtime: durable evidence that legacy
+// threads were exported or explicitly abandoned. One row per disposition kind,
+// keyed by `id`, so a second export/abandonment cannot overwrite the first proof.
+// The export row keeps the manifest path, its exported-at time and how many
+// thread rows it covered; the abandonment row keeps the count it made
+// unserviceable. DB_VERSION stays 1: migrations.ts applies this additive DDL
+// from schema.sql on every start (CREATE TABLE IF NOT EXISTS).
+export const opencode_thread_dispositions = s.sqliteTable('opencode_thread_dispositions', {
+  id: s.text('id').primaryKey().notNull(),
+  kind: s.text('kind', { enum: ['export', 'abandon'] }).notNull(),
+  manifest_path: s.text('manifest_path'),
+  source_db_file: s.text('source_db_file'),
+  exported_at: datetime('exported_at'),
+  thread_count: s.integer('thread_count', { mode: 'number' }).notNull(),
+  recorded_at: datetime('recorded_at').default(orm.sql`CURRENT_TIMESTAMP`),
+})
+
 export const bot_tokens = s.sqliteTable('bot_tokens', {
   app_id: s.text('app_id').primaryKey().notNull(),
   token: s.text('token').notNull(),
@@ -256,6 +273,7 @@ export const relations = defineRelations({
   ops_worker_sync_back,
   ops_paperclip_launch_fence,
   thread_sessions,
+  opencode_thread_dispositions,
   bot_tokens,
   bot_api_keys,
   codex_credentials,
@@ -278,6 +296,7 @@ export const relations = defineRelations({
   thread_sessions: {
     scheduled_tasks: r.many.scheduled_tasks(),
   },
+  opencode_thread_dispositions: {},
   bot_tokens: {
     api_keys: r.one.bot_api_keys({ from: r.bot_tokens.app_id, to: r.bot_api_keys.app_id }),
     codex_credential: r.one.codex_credentials({ from: r.bot_tokens.app_id, to: r.codex_credentials.app_id }),
