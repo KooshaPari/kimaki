@@ -584,6 +584,27 @@ Only after every existing thread is either migrated or explicitly abandoned.
 | 2.5 Drop `@opencode/client`, `@opencode/plugin`, `@opencode/cli` deps | `kimaki/package.json:28,29,58` | Low once code is gone | `pnpm install && tsc --noEmit` |
 | 2.6 Rewrite `system-prompt.ts` prose and the `OPENCODE_SESSION_ID` env var (rename to `KIMAKI_SESSION_ID`, keep reading the old name for one release) | `src/system-prompt.ts:18,113,344,534,722,815,901`, `src/cli/shared.ts:22,57-59`, `src/lock-routes.ts:88`, `src/prompt.ts:60`, `src/cli/session.ts:62,142` | Medium: agents quoting the old name; dual-read avoids breakage | grep test asserting no `OPENCODE_` in shipped strings, plus agent-shell test |
 
+#### Step 2.0 landed 2026-11-28: the disposition gate that unblocks 2.1-2.5
+
+Deleting `ensureOpencode` removes the last automatic install path, so an install that still holds
+`backend = 'opencode'` threads would lose them silently. `bb90a26d` closes that hole before any
+deletion, and it is why 2.1 can now proceed.
+
+- A `jcode` start counts persisted OpenCode thread rows and reads one additive table,
+  `opencode_thread_dispositions` (schema stays at `DB_VERSION = 1`). With threads and no record it
+  refuses **before** lock, SQLite mutation and Discord, naming exactly two remedies:
+  `kimaki export opencode --out <dir>` and `kimaki export abandon-opencode --data-dir <dir>`.
+- Both records are written only by those explicit commands, never by startup, and both are
+  idempotent (`INSERT ... ON CONFLICT DO NOTHING`), so a repeated command cannot replace the first
+  evidence. When both exist the export wins, because it means the history can be restored rather
+  than merely written off.
+- Policy is pure and lives in `src/backend-selection.ts` (`opencodeThreadDisposition`); the durable
+  read is `startupOpencodeDisposition` in `src/opencode-disposition.ts`. The `opencode` backend is
+  never gated, since it can still serve those threads natively.
+- Measured: `src/backend-selection.test.ts` (28), `src/opencode-disposition.e2e.test.ts`,
+  `src/db.test.ts`, `src/export-opencode.e2e.test.ts` -> 45 passed, 1 skipped, re-run independently
+  by the coordinator with `JCODE_BIN` set. `tsc --noEmit` 0.
+
 ### Phase 3 — Delete dead substrate
 
 | Step | Files | Risk | Proof |
