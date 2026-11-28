@@ -244,20 +244,23 @@ async function steerJcode(
   }
   // The row is the authority: a stale in-memory session id never redirects a turn.
   if (input.sessionId !== sessionId) logger.warn(`thread ${input.threadId} routes ${input.sessionId} but its row records ${sessionId}; the row wins`)
+  // Channel context is optional prompt context, like the agent list in
+  // putInstructions: a failed lookup must not strand the conversation. Serve
+  // the turn with thread-only context when Discord cannot resolve the thread.
   const conversation = await textChannel(bot, input.threadId)
-  if (conversation instanceof Error) return conversation
-  const channelId = projectChannelOf(conversation) ?? input.threadId
+  if (conversation instanceof Error) logger.warn(`channel lookup for instructions failed on thread ${input.threadId}`, conversation)
+  const channelId = conversation instanceof Error ? input.threadId : projectChannelOf(conversation) ?? input.threadId
   const instruction = sessionInstruction({
     sessionId,
     threadId: input.threadId,
     channelId,
-    guildId: conversation.guildId ?? '',
+    guildId: conversation instanceof Error ? '' : conversation.guildId ?? '',
     userId: input.author.id,
     dataDir: bot.dataDir,
-    channelTopic: conversation.topic ?? null,
+    channelTopic: conversation instanceof Error ? null : conversation.topic ?? null,
     agents: [],
     parentSessionId: null,
-    coordinator: conversation.id === channelId,
+    coordinator: conversation instanceof Error ? false : conversation.id === channelId,
     disabled: bot.disabledPrompt,
   })
   const served = await serveJcodeTurn(bot, { threadId: input.threadId, sessionId, directory, text: input.text, instruction })
