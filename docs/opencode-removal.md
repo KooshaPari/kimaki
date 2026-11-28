@@ -41,6 +41,28 @@ its first OpenCode call, a jcode start also starts the OpenCode connection when 
 `opencode` and starts none when no row does, and new bindings record the configured backend.
 See "Step 1.1 landed" under Phase 1 for proof, the two open product decisions, and the test.
 
+Status measured 2026-11-28 (branch `feat/passive-session-bindings`, HEAD `e8ccf439`):
+
+| Plan item | State | Evidence |
+| --- | --- | --- |
+| 1.2 export tool | **Landed** | `kimaki/src/cli/export.ts` + `src/ops/export-opencode.ts`, commit `26a7875a`; `kimaki export opencode --out <dir>` requires an explicit destination and `export verify` re-reads the manifest |
+| 1.3 `thread_sessions.backend` | **Landed** | `src/schema.ts:99` (default `'opencode'`), `src/migrations.ts:217` guarded on `table_info` so a second start is a no-op, `DB_VERSION` stays 1; commit `cfad02a9` |
+| 1.5 onboarding preference | **Landed** | `shouldCheckOpencode({backend, legacyThreadCount})` in `src/backend-selection.ts`; the preflight runs only for the OpenCode backend or when a legacy thread exists; commit `4456393` |
+| Surfaces a jcode thread cannot serve | **Landed** | `src/jcode-surfaces.ts` + 24 unit cases: `/model`, `/compact`, queue, shell and command refuse by name (a `JcodeSurfaceUnavailable` naming the surface) instead of the generic "OpenCode service not reachable"; abort is routed through `session/cancel`; commit `e8ccf439` |
+| 1.1 residual: fresh install | **Open, measured** | A `--backend jcode` start on an empty data dir + empty jcode home refuses: `JcodeBotBackendError`, stage `session`, "no persisted session under `<home>/sessions`", raised by `resolveSession` (`src/backend/jcode-bot-backend.ts:253-266`) from `createJcodeBotBackend` (`:494`) via `startBotConnections` (`src/main.ts:147-181`). Phase 1's exit criterion is therefore not met yet. |
+| 1.4 credential handoff | **Open** | nothing reads the Codex OAuth row into a kimaki-owned store yet; `src/voice.ts:527` can ATTACH `opencode.db` read-only, which is the intended reader |
+| Phase 2 (2.1-2.6) | **Blocked on 1.1 residual and 1.4** | `ensureOpencode` still called from `src/cli/bot.ts:189`; `@opencode/client`, `@opencode/plugin` and `@opencode/cli` still in `package.json:28,29,58`; `OPENCODE_SESSION_ID` still read at `src/prompt.ts:63` |
+
+Host caveat measured 2026-11-28 (does not affect Linux CI, does affect local runs on this node):
+four unit tests cannot pass here because the bundled `@opencode/cli/bin/opencode.exe` is a Windows
+binary that Linux refuses to execute, so `spawn` fails `ENOENT` and the OpenCode test server never
+starts (`src/ingest-injection.test.ts`, `src/observe-restart-witness.test.ts` "AC35",
+`src/opencode-server.test.ts` "supported binary wins over OpenCode 1"). A fourth,
+`src/ops/runtime/codex-app-server.test.ts` "streams a completed turn", is a timing flake: it passes
+in isolation and failed in a full-suite run. Baseline proof: a detached worktree of `0f188987` with
+none of the six surface files present fails the same four.
+
+
 ## 0. Method and measured facts
 
 Counts were produced with ripgrep, case-insensitive, from `kimaki/`:
